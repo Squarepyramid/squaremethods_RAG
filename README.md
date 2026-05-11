@@ -197,3 +197,114 @@ aws ecr batch-delete-image --repository-name fastapi-backend --region ca-central
 
 aws ecr list-images --repository-name fastapi-backend --region ca-central-1  --query 'imageIds[*]' --output json | \
 aws ecr batch-delete-image --repository-name fastapi-backend --region ca-central-1  --image-ids file:///dev/stdin
+
+
+# expose with Lambda Function URL 
+aws lambda create-function-url-config \
+  --function-name squaremethods_API \
+  --auth-type NONE \
+  --region ca-central-1
+
+
+  https://dyxguxncdvevbjssa6jnoszhgu0qeduy.lambda-url.ca-central-1.on.aws/
+
+
+  #  Create trigger 
+  Option 1: Quick Setup via AWS Console
+
+Go to API Gateway Console
+Create API → REST API → Build
+API Name: fastapi-backend-api
+Create API
+Create Resource:
+
+Actions → Create Resource
+Resource Name: {proxy+}
+Resource Path: {proxy+}
+✅ Enable API Gateway CORS
+Create Resource
+
+Create Method:
+
+Select the {proxy+} resource
+Actions → Create Method → ANY
+Integration type: Lambda Function Proxy
+Lambda Function: squaremethods_API
+✅ Use Lambda Proxy integration
+Save
+
+
+Deploy API:
+
+Actions → Deploy API
+Deployment stage: [New Stage]
+Stage name: prod
+Deploy
+
+
+
+# Get ACM certificates
+aws acm request-certificate \
+  --domain-name chatapi.squaremethods.com \
+  --validation-method DNS \
+  --region ca-central-1
+
+  # Now get the DNS validation record to add to Route 53:
+  aws acm describe-certificate \
+  --certificate-arn arn:aws:acm:ca-central-1:032621928874:certificate/31d8d927-a4e9-4d88-8bfb-09cdd3c450ea \
+  --region ca-central-1 \
+  --query "Certificate.DomainValidationOptions"
+
+# Add the validation record to Route 53:
+  aws route53 change-resource-record-sets \
+  --hosted-zone-id Z0328387Z4P8H93AL7U0 \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "_4dde17a94d8aa77b944368b80c43a04c.chatapi.squaremethods.com.",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{
+          "Value": "_f3d13c1e90cf2f0645d6695123b32fa1.jkddzztszm.acm-validations.aws."
+        }]
+      }
+    }]
+  }'
+
+  # ACM to validate. Check status with:
+  aws acm describe-certificate \
+  --certificate-arn arn:aws:acm:ca-central-1:032621928874:certificate/31d8d927-a4e9-4d88-8bfb-09cdd3c450ea \
+  --region ca-central-1 \
+  --query "Certificate.Status"
+
+  # Now create the custom domain in API Gateway:
+  aws apigateway create-domain-name \
+  --domain-name chatapi.squaremethods.com \
+  --regional-certificate-arn arn:aws:acm:ca-central-1:032621928874:certificate/31d8d927-a4e9-4d88-8bfb-09cdd3c450ea \
+  --endpoint-configuration types=REGIONAL \
+  --region ca-central-1
+
+  # Now map the API to the custom domain:
+  aws apigateway create-base-path-mapping \
+  --domain-name chatapi.squaremethods.com \
+  --rest-api-id hkbyrp82t3 \
+  --stage prod \
+  --region ca-central-1
+
+  # update route 53
+  aws route53 change-resource-record-sets \
+  --hosted-zone-id Z0328387Z4P8H93AL7U0 \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "chatapi.squaremethods.com.",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{
+          "Value": "d-a757r0vu5g.execute-api.ca-central-1.amazonaws.com"
+        }]
+      }
+    }]
+  }'

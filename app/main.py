@@ -240,4 +240,4 @@ def chat(request: ChatRequest):
         print(f"Error in chat endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-handler = Mangum(app, lifespan="off", api_gateway_base_path=None)
+handler = Mangum(app, lifespan="off")
