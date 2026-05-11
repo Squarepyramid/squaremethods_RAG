@@ -71,3 +71,46 @@ aws ecr create-repository --repository-name fastapi-backend
 
 # downlaod docker and confirm version running
 docker --version
+
+# login to docker online
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 730xxxxxx.dkr.ecr.us-east-1.amazonaws.com
+
+
+# create Dockerfile
+
+
+# Build and push:
+docker build -t fastapi-backend .
+
+
+# Docker tag
+docker tag fastapi-backend:latest 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest
+# Docker Push
+docker push 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest
+# Check the image architecture
+docker inspect fastapi-backend | grep Architecture
+
+
+# describe image
+ aws ecr describe-images --repository-name fastapi-backend --region ca-central-1
+# Build
+
+
+
+ # Test Locally with Lambda Runtime Interface Emulator
+
+# Pull the image from ECR (if you haven't already)
+docker pull 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest
+
+# Run the container locally on port 9000
+docker run -p 9000:8080 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest
+
+
+
+
+ # Clean the current image
+aws ecr batch-delete-image --repository-name fastapi-backend --region ca-central-1  --image-ids imageTag=latest
+
+
+aws ecr list-images --repository-name fastapi-backend --region ca-central-1  --query 'imageIds[*]' --output json | \
+aws ecr batch-delete-image --repository-name fastapi-backend --region ca-central-1  --image-ids file:///dev/stdin
