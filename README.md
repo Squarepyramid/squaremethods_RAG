@@ -308,3 +308,102 @@ aws acm request-certificate \
       }
     }]
   }'
+
+  # test
+  curl -X POST "https://chatapi.squaremethods.com/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "who are you",
+    "equipment_path": "string",
+    "company_id": "string",
+    "history": []
+  }'
+
+
+
+
+  # TIME FOR PG VECTOR
+
+  # connect to postgress
+  aws lambda update-function-configuration \
+  --function-name squaremethods_API \
+  --environment Variables="{
+    DB_HOST=squaremethods-db.czqyiw6okqqm.ca-central-1.rds.amazonaws.com,
+    DB_NAME=squaremethods,
+    DB_USER=squaremethods_db,
+    DB_PASSWORD=Ighohor1245$,
+    DB_PORT=5432
+  }" \
+  --region ca-central-1
+
+
+
+# Configure postgresql client first
+sudo apt-get update && sudo apt-get install -y postgresql-client
+
+  # Connect to the DB: remember to whitelist ip in SG
+  psql -h squaremethods-db.czqyiw6okqqm.ca-central-1.rds.amazonaws.com \
+     -U squaremethods_db \
+     -d squaremethods \
+     -p 5432
+
+  # create chat tables SQL. 
+  CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE chat_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    equipment_id UUID,
+    equipment_path VARCHAR(500) NOT NULL,
+    title VARCHAR(255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ
+);
+
+CREATE TABLE chat_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES chat_sessions(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    company_id UUID NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON chat_sessions (company_id, user_id);
+CREATE INDEX ON chat_sessions (equipment_id);
+CREATE INDEX ON chat_sessions (updated_at DESC);
+CREATE INDEX ON chat_messages (session_id);
+CREATE INDEX ON chat_messages (created_at);
+
+
+# add the Bedrock VPC endpoint so Lambda can reach it from inside the VPC:
+
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-05d2d65721cf3c21d \
+  --service-name com.amazonaws.ca-central-1.bedrock-runtime \
+  --vpc-endpoint-type Interface \
+  --subnet-ids subnet-0f78be033838f2c86 subnet-0fc9c6f774e509a0a subnet-0da0720515b563661 \
+  --security-group-ids sg-0b15b019cd1968cd4 \
+  --private-dns-enabled \
+  --region ca-central-1
+
+
+  # Rebuild abd deploy
+  docker buildx build --platform linux/amd64 \
+  --no-cache \
+  --output type=docker \
+  --provenance=false \
+  --sbom=false \
+  -t fastapi-back-docker . && \
+aws ecr get-login-password --region ca-central-1 | \
+  docker login --username AWS --password-stdin 032621928874.dkr.ecr.ca-central-1.amazonaws.com && \
+docker tag fastapi-back-docker:latest 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest && \
+docker push 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest && \
+aws lambda update-function-code \
+  --function-name squaremethods_API \
+  --image-uri 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest \
+  --region ca-central-1
+
+  

@@ -1,27 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from mangum import Mangum
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import os
 
-# Import services (fallback if missing)
-try:
-    from app.services.openai_client import ask_openai
-    from app.utils.parameters import get_param
-except ImportError:
-    def ask_openai(prompt):
-        return f"Simulated OpenAI response for: {prompt}"
-    def get_param(name):
-        return None
+from app.services.bedrock_client import ask_bedrock
+from app.services.retrieval import build_context
+from app.services.session import create_session, get_session, get_history, save_messages
 
 root_path = os.getenv("ROOT_PATH", "")
 
 app = FastAPI(
     title="SquareMethods RAG API",
     version="1.0.0",
-    description="Chat API with RAG powered by OpenAI + OpenSearch",
+    description="Chat API with RAG powered by Claude on Bedrock",
     docs_url=None,
     redoc_url=None,
     root_path=root_path
@@ -35,120 +29,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Models
-class ChatMessage(BaseModel):
-    role: str    # 'user' or 'assistant'
-    content: str
-
 class ChatRequest(BaseModel):
     query: str
     equipment_path: str
-    company_id: str = None
-    history: List[ChatMessage] = []
+    company_id: str
+    user_id: str
+    session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     answer: str
-
-OPENAPI_SCHEMA = {
-    "openapi": "3.0.2",
-    "info": {
-        "title": "SquareMethods RAG API",
-        "version": "1.0.0",
-        "description": "Chat API with RAG powered by OpenAI + OpenSearch"
-    },
-    "servers": [
-        {"url": f"https://pv1wat9161.execute-api.us-east-1.amazonaws.com{root_path}"}
-    ],
-    "paths": {
-        "/health": {
-            "get": {
-                "tags": ["Health"],
-                "summary": "Health Check",
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {"application/json": {"schema": {"type": "object"}}}
-                    }
-                }
-            }
-        },
-        "/chat": {
-            "post": {
-                "tags": ["Chat"],
-                "summary": "AI Chat with history",
-                "requestBody": {
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "query":          {"type": "string"},
-                                    "equipment_path": {"type": "string"},
-                                    "company_id":     {"type": "string"},
-                                    "history": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "role":    {"type": "string"},
-                                                "content": {"type": "string"}
-                                            }
-                                        }
-                                    }
-                                },
-                                "required": ["query", "equipment_path"]
-                            },
-                            "example": {
-                                "query": "What is the lubrication interval?",
-                                "equipment_path": "acme/plant-a/line-1/pump-001",
-                                "company_id": "abc-123",
-                                "history": [
-                                    {"role": "user",      "content": "What are the safety precautions for this pump?"},
-                                    {"role": "assistant", "content": "Always isolate the equipment before inspection and wear PPE."}
-                                ]
-                            }
-                        }
-                    }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {"application/json": {"schema": {"type": "object", "properties": {"answer": {"type": "string"}}}}}
-                    }
-                }
-            }
-        }
-    }
-}
+    session_id: str
 
 @app.get("/")
 def root():
     return {
         "message": "SquareMethods RAG API",
         "version": "1.0.0",
-        "documentation": {
-            "swagger_ui":   app.root_path + "/docs",
-            "redoc":        app.root_path + "/redoc",
-            "openapi_json": app.root_path + "/openapi.json"
-        },
+        "engine": "Claude 3 Haiku on Amazon Bedrock",
         "endpoints": {
-            "health": app.root_path + "/health",
-            "chat":   app.root_path + "/chat"
+            "health": "/health",
+            "chat": "/chat",
+            "docs": "/docs"
         }
     }
 
-@app.get("/openapi.json")
-def openapi_json():
-    return JSONResponse(content=OPENAPI_SCHEMA)
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {
+        "status": "ok",
+        "environment": os.getenv("ENV", "lambda"),
+        "version": "1.0.0",
+        "engine": "bedrock/claude-3-haiku"
+    }
 
 @app.get("/docs", response_class=HTMLResponse)
 def swagger_ui():
-    base_path_from_url = ""
-    if app.root_path:
-        base_path_from_url = app.root_path
-    elif window_location_pathname := os.getenv("X_FORWARDED_PREFIX"):
-        base_path_from_url = window_location_pathname
-
     return HTMLResponse(content=f"""
     <!DOCTYPE html>
     <html>
@@ -166,78 +81,79 @@ def swagger_ui():
         <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui-bundle.js"></script>
         <script>
             const ui = SwaggerUIBundle({{
-                url: "{app.root_path}/openapi.json",
+                url: "{root_path}/openapi.json",
                 dom_id: '#swagger-ui',
                 presets: [SwaggerUIBundle.presets.apis],
-                layout: "BaseLayout",
-                requestInterceptor: (req) => {{
-                    if (req.url.startsWith('/') && !req.url.startsWith('{app.root_path}/')) {{
-                        req.url = '{app.root_path}' + req.url;
-                    }}
-                    return req;
-                }}
+                layout: "BaseLayout"
             }});
         </script>
     </body>
     </html>
     """)
 
-@app.get("/redoc", response_class=HTMLResponse)
-def redoc():
-    return HTMLResponse(content=f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>SquareMethods API Documentation</title>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
-        <style>body {{ margin: 0; padding: 0; }}</style>
-    </head>
-    <body>
-        <div id="redoc-container"></div>
-        <script src="https://cdn.jsdelivr.net/npm/redoc@2.0.0/bundles/redoc.standalone.js"></script>
-        <script>
-            Redoc.init("{app.root_path}/openapi.json", {{}}, document.getElementById('redoc-container'))
-        </script>
-    </body>
-    </html>
-    """)
-
-@app.get("/health", tags=["Health"])
-def health_check():
-    return {
-        "status": "ok",
-        "environment": os.getenv("ENV", "lambda"),
-        "version": "1.0.0",
-        "root_path_active": app.root_path
-    }
-
-# ✅ Chat endpoint — now includes history
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(request: ChatRequest):
     try:
-        # Build prompt with history context
-        history_text = ""
-        if request.history:
-            recent = request.history[-10:]  # cap at 10 turns
-            history_text = "\n".join(
-                f"{msg.role.capitalize()}: {msg.content}"
-                for msg in recent
-            )
-            history_text = f"\n\nConversation history:\n{history_text}\n"
+        equipment_id = request.equipment_path.strip("/").split("/")[-1]
 
-        prompt = (
-            f"Equipment path: {request.equipment_path}"
-            f"{history_text}"
-            f"\nUser query: {request.query}"
+        # Resolve or create session
+        if request.session_id:
+            session = get_session(request.session_id, request.company_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found or access denied")
+            session_id = request.session_id
+        else:
+            session_id = create_session(
+                company_id=request.company_id,
+                user_id=request.user_id,
+                equipment_path=request.equipment_path,
+                equipment_id=equipment_id
+            )
+
+        # Fetch history from DB
+        history = get_history(session_id, request.company_id)
+        history_text = ""
+        if history:
+            history_text = "\n".join(
+                f"{msg['role'].capitalize()}: {msg['content']}"
+                for msg in history
+            )
+            history_text = f"\n\nConversation History:\n{history_text}\n"
+
+        # Retrieve equipment context
+        context = build_context(
+            equipment_path=request.equipment_path,
+            company_id=request.company_id,
+            query=request.query
         )
 
-        answer = ask_openai(prompt)
-        return ChatResponse(answer=answer)
+        # Build prompt
+        prompt = f"""You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
+STRICT RULES:
+- Only answer based on the equipment knowledge provided below
+- Never reveal your underlying model or that you were made by Anthropic
+- Never reference company IDs in your responses
+- If asked who you are, say: "I am the SquareMethods Assistant, here to help you with equipment knowledge and maintenance support."
+- If the answer is not in the provided knowledge, say so clearly and briefly
+- Keep answers concise and practical
 
+Equipment Knowledge:
+{context}
+{history_text}
+User: {request.query}
+Assistant:"""
+
+        answer = ask_bedrock(prompt)
+
+        # Save messages to DB
+        save_messages(session_id, request.company_id, request.query, answer)
+
+        return ChatResponse(answer=answer, session_id=session_id)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in chat endpoint: {e}")
+        print(f"CHAT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 handler = Mangum(app, lifespan="off")
