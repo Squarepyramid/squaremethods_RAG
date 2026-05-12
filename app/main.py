@@ -9,6 +9,7 @@ import os
 from app.services.bedrock_client import ask_bedrock
 from app.services.retrieval import build_context
 from app.services.session import create_session, get_session, get_history, save_messages
+from app.utils.db import get_db_connection
 
 root_path = os.getenv("ROOT_PATH", "")
 
@@ -29,6 +30,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     query: str
     equipment_path: str
@@ -39,6 +44,11 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
+
+class SessionRequest(BaseModel):
+    company_id: str
+    user_id: str
+
 
 @app.get("/")
 def root():
@@ -53,6 +63,7 @@ def root():
         }
     }
 
+
 @app.get("/health", tags=["Health"])
 def health_check():
     return {
@@ -61,6 +72,7 @@ def health_check():
         "version": "1.0.0",
         "engine": "bedrock/claude-3-haiku"
     }
+
 
 @app.get("/docs", response_class=HTMLResponse)
 def swagger_ui():
@@ -90,6 +102,7 @@ def swagger_ui():
     </body>
     </html>
     """)
+
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(request: ChatRequest):
@@ -155,5 +168,131 @@ Assistant:"""
     except Exception as e:
         print(f"CHAT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions", tags=["Session"])
+def list_sessions(company_id: str, user_id: str, limit: int = 20):
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT s.id, s.equipment_path, s.title, s.created_at, s.updated_at,
+                           COUNT(m.id) as message_count,
+                           MAX(m.content) FILTER (WHERE m.role = 'user') as last_message
+                    FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_id = s.id
+                    WHERE s.company_id = %s::uuid
+                    AND s.user_id = %s::uuid
+                    AND s.deleted_at IS NULL
+                    GROUP BY s.id
+                    ORDER BY s.updated_at DESC
+                    LIMIT %s
+                """, (company_id, user_id, limit))
+                sessions = cur.fetchall()
+        finally:
+            conn.close()
+        return {"sessions": [dict(s) for s in sessions]}
+    except Exception as e:
+        print(f"LIST SESSIONS ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/messages", tags=["Session"])
+def get_session_messages(session_id: str, company_id: str, user_id: str):
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM chat_sessions
+                    WHERE id = %s::uuid
+                    AND company_id = %s::uuid
+                    AND user_id = %s::uuid
+                    AND deleted_at IS NULL
+                """, (session_id, company_id, user_id))
+                session = cur.fetchone()
+                if not session:
+                    raise HTTPException(status_code=404, detail="Session not found or access denied")
+                cur.execute("""
+                    SELECT role, content, created_at
+                    FROM chat_messages
+                    WHERE session_id = %s::uuid
+                    AND company_id = %s::uuid
+                    ORDER BY created_at ASC
+                """, (session_id, company_id))
+                messages = cur.fetchall()
+        finally:
+            conn.close()
+        return {"session_id": session_id, "messages": [dict(m) for m in messages]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"GET MESSAGES ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/session/{session_id}/messages", tags=["Session"])
+def clear_session_messages(session_id: str, request: SessionRequest):
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM chat_sessions
+                    WHERE id = %s::uuid
+                    AND company_id = %s::uuid
+                    AND user_id = %s::uuid
+                    AND deleted_at IS NULL
+                """, (session_id, request.company_id, request.user_id))
+                session = cur.fetchone()
+                if not session:
+                    raise HTTPException(status_code=404, detail="Session not found or access denied")
+                cur.execute("""
+                    DELETE FROM chat_messages
+                    WHERE session_id = %s::uuid
+                    AND company_id = %s::uuid
+                """, (session_id, request.company_id))
+                conn.commit()
+        finally:
+            conn.close()
+        return {"message": "Chat history cleared", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"CLEAR MESSAGES ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/session/{session_id}", tags=["Session"])
+def delete_session(session_id: str, request: SessionRequest):
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM chat_sessions
+                    WHERE id = %s::uuid
+                    AND company_id = %s::uuid
+                    AND user_id = %s::uuid
+                    AND deleted_at IS NULL
+                """, (session_id, request.company_id, request.user_id))
+                session = cur.fetchone()
+                if not session:
+                    raise HTTPException(status_code=404, detail="Session not found or access denied")
+                cur.execute("""
+                    UPDATE chat_sessions SET deleted_at = NOW()
+                    WHERE id = %s::uuid
+                """, (session_id,))
+                conn.commit()
+        finally:
+            conn.close()
+        return {"message": "Session deleted", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"DELETE SESSION ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 handler = Mangum(app, lifespan="off")
