@@ -105,7 +105,7 @@ Return ONLY a valid JSON object with this exact structure. No markdown, no expla
 }}
 
 Rules:
-- type must be one of: "action", "inspection", "caution"
+- type must always be "procedure"
 - Write instructions for a competent technician who does not know this specific machine
 - Each step must be specific and actionable, not vague
 - Include safety precautions where relevant, empty array if none
@@ -170,7 +170,7 @@ def save_job_aid(company_id: str, equipment_id: str, created_by: str, generated:
                     step.get("title"),
                     step.get("step"),
                     step.get("instruction"),
-                    step.get("type", "action"),
+                    step.get("type", "procedure"),
                     step.get("precautions", []),
                 ))
 
