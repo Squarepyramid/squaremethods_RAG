@@ -1,127 +1,129 @@
 """
 SquareMethods Knowledge Indexer
 ================================
-Reads the JDE/CMMS import file and indexes component-level PM knowledge
-into the existing knowledge_embeddings table in RDS (pgvector).
+Indexes one embedding per component type into knowledge_embeddings.
 
-Each record is serialized into a rich content string and embedded using
-Amazon Titan Embed v2. Records are stored with source_type='squaremethods_import'
-and no company_id, making them shared across all companies for job aid generation.
+All 228 components from the dropdown are indexed regardless of whether
+they have tasks in the PM TASKS sheet. Components with no tasks get a
+minimal record so Claude can still generate a reasonable job aid from
+its general maintenance knowledge.
 
-These records are completely separate from company-specific records
-(source_type='job_aid', 'failure_mode') which are scoped by company_id
-and used only for chat.
+Records are stored with:
+  - source_type = 'squaremethods_import'
+  - company_id  = SHARED_COMPANY_ID (zero UUID)
+  - source_id   = unique UUID per component type
 
 Usage:
-    python squaremethods_indexer.py --file Import_File_A_for_JDE.xlsx
-    python squaremethods_indexer.py --file Import_File_A_for_JDE.xlsx --dry-run
-
-Requirements:
-    pip install pandas openpyxl psycopg2-binary boto3
+    PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx --dry-run
+    PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx
 """
 
-import os
-import re
-import json
 import uuid
 import argparse
 import logging
 
 import pandas as pd
-import boto3
-import psycopg2
 import psycopg2.extras
+
 from app.utils.db import get_db_connection
 from app.services.embeddings import get_embedding
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s"
 )
 log = logging.getLogger(__name__)
 
-SHEET_TASKS    = "PM TASKS"
-SHEET_DROPDOWN = "Dropdown options"
-SOURCE_TYPE    = "squaremethods_import"
-BATCH_SIZE     = 50
-
-# Fixed UUID representing SquareMethods shared knowledge (not a real company).
-# Used to satisfy the NOT NULL constraint on company_id while keeping
-# shared records distinguishable from real company records.
+SHEET_TASKS       = "PM TASKS"
+SHEET_DROPDOWN    = "Dropdown options"
+SOURCE_TYPE       = "squaremethods_import"
+BATCH_SIZE        = 50
 SHARED_COMPANY_ID = "00000000-0000-0000-0000-000000000000"
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_valid_components(filepath: str) -> set:
+def load_all_components(filepath: str) -> list:
+    """Load all 228 component types from the dropdown sheet."""
     df = pd.read_excel(filepath, sheet_name=SHEET_DROPDOWN)
-    return set(df["COMPONENT"].dropna().str.strip().tolist())
+    components = sorted(df["COMPONENT"].dropna().str.strip().unique().tolist())
+    log.info(f"Loaded {len(components)} component types from dropdown.")
+    return components
 
 
 def load_tasks(filepath: str, valid_components: set) -> pd.DataFrame:
+    """Load task records for components that have them."""
     df = pd.read_excel(filepath, sheet_name=SHEET_TASKS)
     df.columns = [str(c).strip() for c in df.columns]
-
-    # Keep only records whose component matches the controlled vocabulary
     df["Component"] = df["Component"].astype(str).str.strip()
     df = df[df["Component"].isin(valid_components)].copy()
-
-    # Drop rows with no task text
     df = df[df["TASK"].notna() & (df["TASK"].astype(str).str.strip() != "")].copy()
-
-    log.info(f"Loaded {len(df)} task records with valid component types.")
+    log.info(f"Loaded {len(df)} task records across {df['Component'].nunique()} component types.")
     return df
 
 
-def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For identical component + task + FM1 combinations,
-    keep the row with the most detailed procedure text.
-    """
-    df["_proc_len"] = df["DETAILED PROCEDURE"].fillna("").astype(str).str.len()
-    df_sorted = df.sort_values("_proc_len", ascending=False)
-    deduped = df_sorted.drop_duplicates(
-        subset=["Component", "TASK", "FAILURE MODE 1"],
-        keep="first"
-    ).drop(columns=["_proc_len"])
-    log.info(f"After deduplication: {len(deduped)} records.")
-    return deduped
+# ── Content builder ───────────────────────────────────────────────────────────
 
-
-def build_content(row: pd.Series) -> str:
+def build_component_content(component_type: str, rows: pd.DataFrame = None) -> str:
     """
-    Serialize a task row into a rich text string for embedding and retrieval.
-    This content string is what Claude reads during job aid generation.
+    Build a rich content string for a component type.
+    If rows is None or empty, build a minimal placeholder record
+    so Claude can still generate a job aid from general knowledge.
     """
-    failure_modes = [
-        str(row.get(col, "")).strip()
-        for col in ["FAILURE MODE 1", "FAILURE MODE 2", "FAILURE MODE 3"]
-        if pd.notna(row.get(col)) and str(row.get(col, "")).strip()
-    ]
-    fms_text  = ", ".join(failure_modes) if failure_modes else "General"
-    proc_text = str(row.get("DETAILED PROCEDURE", "") or "").strip() or "Not specified"
-    freq      = row.get("FREQUENCY")
-    freq_text = str(int(freq)) + " days" if pd.notna(freq) else "Not specified"
-    time_val  = row.get("TIME (HH)")
-    time_text = str(round(float(time_val), 2)) + " hrs" if pd.notna(time_val) else "Not specified"
+    lines = [f"Component: {component_type}"]
 
-    return (
-        f"Component: {str(row['Component']).strip()} | "
-        f"Failure Modes: {fms_text} | "
-        f"Task: {str(row['TASK']).strip()} | "
-        f"PM Type: {str(row.get('PM TYPE', '') or '').strip() or 'Not specified'} | "
-        f"Discipline: {str(row.get('DISCIPLINE', '') or '').strip() or 'Not specified'} | "
-        f"Frequency: {freq_text} | "
-        f"Estimated Time: {time_text} | "
-        f"Procedure: {proc_text}"
-    )
+    if rows is None or rows.empty:
+        lines.append("Failure Modes: Not yet documented")
+        lines.append("Tasks: Not yet documented")
+        return "\n".join(lines)
+
+    # Collect all unique failure modes across all tasks
+    all_failure_modes = set()
+    for col in ["FAILURE MODE 1", "FAILURE MODE 2", "FAILURE MODE 3"]:
+        if col in rows.columns:
+            fms = rows[col].dropna().str.strip().tolist()
+            all_failure_modes.update([f for f in fms if f])
+
+    if all_failure_modes:
+        lines.append(f"Failure Modes: {', '.join(sorted(all_failure_modes))}")
+    else:
+        lines.append("Failure Modes: Not yet documented")
+
+    # Add each unique task with its details
+    lines.append("Tasks:")
+    seen_tasks = set()
+    for _, row in rows.iterrows():
+        task = str(row["TASK"]).strip()
+        if task in seen_tasks:
+            continue
+        seen_tasks.add(task)
+
+        task_fms = [
+            str(row.get(col, "")).strip()
+            for col in ["FAILURE MODE 1", "FAILURE MODE 2", "FAILURE MODE 3"]
+            if pd.notna(row.get(col)) and str(row.get(col, "")).strip()
+        ]
+        task_line = f"  - Task: {task}"
+        if task_fms:
+            task_line += f" | Failure Modes: {', '.join(task_fms)}"
+        if pd.notna(row.get("PM TYPE")) and str(row.get("PM TYPE", "")).strip():
+            task_line += f" | PM Type: {str(row['PM TYPE']).strip()}"
+        if pd.notna(row.get("DISCIPLINE")) and str(row.get("DISCIPLINE", "")).strip():
+            task_line += f" | Discipline: {str(row['DISCIPLINE']).strip()}"
+        if pd.notna(row.get("FREQUENCY")):
+            task_line += f" | Frequency: {int(row['FREQUENCY'])} days"
+        if pd.notna(row.get("DETAILED PROCEDURE")) and str(row.get("DETAILED PROCEDURE", "")).strip():
+            proc = str(row["DETAILED PROCEDURE"]).strip()[:300]
+            task_line += f" | Procedure: {proc}"
+
+        lines.append(task_line)
+
+    return "\n".join(lines)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def clear_existing(conn):
-    """Remove all previous squaremethods_import records for a clean re-index."""
     with conn.cursor() as cur:
         cur.execute("""
             DELETE FROM knowledge_embeddings
@@ -148,17 +150,29 @@ def flush_batch(conn, batch: list):
 def run_indexer(filepath: str, dry_run: bool = False):
     log.info("Starting SquareMethods knowledge indexer.")
 
-    valid_components = load_valid_components(filepath)
-    df               = load_tasks(filepath, valid_components)
-    df               = deduplicate(df)
+    all_components = load_all_components(filepath)
+    valid_set      = set(all_components)
+    df_tasks       = load_tasks(filepath, valid_set)
 
-    log.info(f"Prepared {len(df)} records for indexing.")
+    # Group tasks by component for quick lookup
+    grouped = {
+        component: rows
+        for component, rows in df_tasks.groupby("Component")
+    }
+
+    components_with_tasks    = len(grouped)
+    components_without_tasks = len(all_components) - components_with_tasks
+    log.info(f"Components with tasks: {components_with_tasks} | Without tasks: {components_without_tasks}")
 
     if dry_run:
         log.info("Dry run mode. Sample content strings:")
-        for _, row in df.head(3).iterrows():
-            print(build_content(row))
-            print()
+        samples = all_components[:2] + [c for c in all_components if c not in grouped][:1]
+        for component_type in samples:
+            rows    = grouped.get(component_type)
+            content = build_component_content(component_type, rows)
+            print(f"\n{'='*60}")
+            print(content)
+        log.info(f"Total records that would be indexed: {len(all_components)}")
         return
 
     conn = get_db_connection()
@@ -167,35 +181,36 @@ def run_indexer(filepath: str, dry_run: bool = False):
     batch   = []
     indexed = 0
 
-    for _, row in df.iterrows():
-        content    = build_content(row)
-        embedding  = get_embedding(content)
-        emb_str    = "[" + ",".join(map(str, embedding)) + "]"
-        record_id  = str(uuid.uuid4())
+    for component_type in all_components:
+        rows      = grouped.get(component_type)
+        content   = build_component_content(component_type, rows)
+        embedding = get_embedding(content)
+        emb_str   = "[" + ",".join(map(str, embedding)) + "]"
+        record_id = str(uuid.uuid4())
 
         batch.append((
-            record_id,          # id
-            SHARED_COMPANY_ID,  # company_id - fixed UUID for shared knowledge
-            SOURCE_TYPE,        # source_type
-            record_id,          # source_id - unique per record
-            content,            # content
-            emb_str,            # embedding
-            "NOW()",            # created_at
-            "NOW()",            # updated_at
+            record_id,
+            SHARED_COMPANY_ID,
+            SOURCE_TYPE,
+            record_id,
+            content,
+            emb_str,
+            "NOW()",
+            "NOW()",
         ))
 
         if len(batch) >= BATCH_SIZE:
             flush_batch(conn, batch)
             indexed += len(batch)
             batch    = []
-            log.info(f"Indexed {indexed} / {len(df)} records...")
+            log.info(f"Indexed {indexed} / {len(all_components)} component types...")
 
     if batch:
         flush_batch(conn, batch)
         indexed += len(batch)
 
     conn.close()
-    log.info(f"Indexing complete. {indexed} records inserted into knowledge_embeddings.")
+    log.info(f"Indexing complete. {indexed} component types inserted into knowledge_embeddings.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

@@ -420,3 +420,7 @@ PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --f
 
 full run
 PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx
+
+
+# Get code space ip address for whiteelisting
+curl ifconfig.me
