@@ -170,7 +170,7 @@ def save_job_aid(company_id: str, equipment_id: str, created_by: str, generated:
                     step.get("title"),
                     step.get("step"),
                     step.get("instruction"),
-                    step.get("type", "procedure"),
+                    "procedure",  # always force procedure type to match frontend
                     step.get("precautions", []),
                 ))
 
