@@ -10,6 +10,7 @@ from app.services.bedrock_client import ask_bedrock
 from app.services.retrieval import build_context
 from app.services.session import create_session, get_session, get_history, save_messages
 from app.utils.db import get_db_connection
+from app.services.generate_job_aid import generate as generate_job_aid_service
 
 root_path = os.getenv("ROOT_PATH", "")
 
@@ -49,6 +50,28 @@ class SessionRequest(BaseModel):
     company_id: str
     user_id: str
 
+class GenerateJobAidRequest(BaseModel):
+    component_type: str    # e.g. "Coupling" - the dropdown value selected
+    equipment_id:   str    # UUID of the component node
+    company_id:     str    # UUID of the company
+    created_by:     str    # UUID of the user clicking Generate
+
+class ProcedureOut(BaseModel):
+    step:        int
+    title:       Optional[str]
+    instruction: str
+    type:        str
+    precautions: Optional[List[str]]
+
+class JobAidOut(BaseModel):
+    id:                 str
+    title:              str
+    instruction:        Optional[str]
+    category:           Optional[str]
+    estimated_duration: Optional[int]
+    status:             str
+    procedures:         List[ProcedureOut]
+
 
 @app.get("/")
 def root():
@@ -59,6 +82,7 @@ def root():
         "endpoints": {
             "health": "/health",
             "chat": "/chat",
+            "generate_job_aid": "/job-aids/generate",
             "docs": "/docs"
         }
     }
@@ -167,6 +191,23 @@ Assistant:"""
         raise
     except Exception as e:
         print(f"CHAT ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/job-aids/generate", response_model=JobAidOut, status_code=201, tags=["Job Aid Generation"])
+def generate_job_aid(request: GenerateJobAidRequest):
+    try:
+        result = generate_job_aid_service(
+            component_type=request.component_type,
+            equipment_id=request.equipment_id,
+            company_id=request.company_id,
+            created_by=request.created_by,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        print(f"GENERATE JOB AID ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

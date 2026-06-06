@@ -347,6 +347,13 @@ sudo apt-get update && sudo apt-get install -y postgresql-client
      -d squaremethods \
      -p 5432
 
+
+  # To see thee tables on the DB
+SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' 
+ORDER BY table_name;
+
   # create chat tables SQL. 
   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -406,4 +413,10 @@ aws lambda update-function-code \
   --image-uri 032621928874.dkr.ecr.ca-central-1.amazonaws.com/fastapi-backend:latest \
   --region ca-central-1
 
-  
+  # the run the indexer
+
+dry run
+PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx --dry-run
+
+full run
+PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx
