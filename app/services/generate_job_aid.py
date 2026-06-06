@@ -19,6 +19,7 @@ IMPORTANT - Two separate knowledge sources:
 import json
 import uuid
 import logging
+import re
 from typing import Optional
 
 from app.utils.db import get_db_connection
@@ -115,8 +116,16 @@ Rules:
 
 # ── DB writes ─────────────────────────────────────────────────────────────────
 
+def make_slug(title: str, unique_id: str) -> str:
+    """Generate a URL-safe slug from title plus short unique suffix."""
+    base = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+    suffix = unique_id[:8]
+    return f"{base}-{suffix}"
+
+
 def save_job_aid(company_id: str, equipment_id: str, created_by: str, generated: dict) -> str:
     job_aid_id = str(uuid.uuid4())
+    slug       = make_slug(generated["title"], job_aid_id)
 
     conn = get_db_connection()
     try:
@@ -125,17 +134,18 @@ def save_job_aid(company_id: str, equipment_id: str, created_by: str, generated:
             # 1. Insert job aid
             cur.execute("""
                 INSERT INTO job_aids
-                    (id, company_id, title, instruction, status,
+                    (id, company_id, title, slug, instruction, status,
                      estimated_duration, category, created_by,
                      view_count, scan_count, created_at, updated_at)
                 VALUES
-                    (%s::uuid, %s::uuid, %s, %s, 'draft',
+                    (%s::uuid, %s::uuid, %s, %s, %s, 'draft',
                      %s, %s, %s::uuid,
                      0, 0, NOW(), NOW())
             """, (
                 job_aid_id,
                 company_id,
                 generated["title"],
+                slug,
                 generated.get("instruction"),
                 generated.get("estimated_duration"),
                 generated.get("category", "Preventive Maintenance"),

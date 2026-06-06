@@ -424,3 +424,7 @@ PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --f
 
 # Get code space ip address for whiteelisting
 curl ifconfig.me
+
+# equipment id
+1d3c6ad8-7795-4b3d-ad36-198e8a3620f7
+company_id=7d21ce25-510b-4add-97f3-b2517a314558
