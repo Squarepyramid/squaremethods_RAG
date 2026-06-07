@@ -34,10 +34,11 @@ TOP_K             = 10
 
 # ── Knowledge retrieval ───────────────────────────────────────────────────────
 
-def retrieve_knowledge(component_type: str) -> list:
+def retrieve_knowledge(component_type: str, equipment_id: str, company_id: str) -> tuple:
     """
-    Semantic search against squaremethods_import records only.
-    No company_id filter - these records are shared across all companies.
+    Retrieve two knowledge sources:
+    1. Generic component knowledge from squaremethods_import (shared)
+    2. Manual chunks for this specific equipment (company scoped)
     """
     embedding     = get_embedding(f"Component: {component_type} maintenance tasks and failure modes")
     embedding_str = "[" + ",".join(map(str, embedding)) + "]"
@@ -45,10 +46,11 @@ def retrieve_knowledge(component_type: str) -> list:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+
+            # 1. Generic component knowledge
             cur.execute("""
-                SELECT
-                    content,
-                    1 - (embedding <=> %s::vector) AS similarity
+                SELECT content,
+                       1 - (embedding <=> %s::vector) AS similarity
                 FROM knowledge_embeddings
                 WHERE source_type = %s
                 AND company_id = %s::uuid
@@ -63,28 +65,57 @@ def retrieve_knowledge(component_type: str) -> list:
                 embedding_str,
                 TOP_K
             ))
-            rows = cur.fetchall()
-        return [dict(r) for r in rows]
+            component_knowledge = [dict(r) for r in cur.fetchall()]
+
+            # 2. Manual chunks for this specific equipment
+            cur.execute("""
+                SELECT content,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM knowledge_embeddings
+                WHERE source_type = 'manual'
+                AND company_id = %s::uuid
+                AND source_id = %s::uuid
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (
+                embedding_str,
+                company_id,
+                equipment_id,
+                embedding_str,
+                TOP_K
+            ))
+            manual_knowledge = [dict(r) for r in cur.fetchall()]
+
+        return component_knowledge, manual_knowledge
     finally:
         conn.close()
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
-def build_prompt(component_type: str, knowledge: list) -> str:
-    knowledge_text = "\n".join(
+def build_prompt(component_type: str, component_knowledge: list, manual_knowledge: list) -> str:
+    component_text = "\n".join(
         f"Record {i}: {k['content']}"
-        for i, k in enumerate(knowledge, 1)
+        for i, k in enumerate(component_knowledge, 1)
     )
+
+    manual_text = ""
+    if manual_knowledge:
+        manual_text = "\n\nEquipment Manual Knowledge (use this to make the job aid machine-specific):\n"
+        manual_text += "\n".join(
+            f"Manual {i}: {k['content']}"
+            for i, k in enumerate(manual_knowledge, 1)
+        )
 
     return f"""You are a maintenance engineering expert generating a structured job aid for a manufacturing plant technician.
 
 Component Type: {component_type}
 
-Knowledge base records for this component:
-{knowledge_text}
+Generic Component Knowledge:
+{component_text}
+{manual_text}
 
-Generate a single comprehensive job aid for this component that covers all the key failure modes and maintenance tasks identified above.
+Generate a single comprehensive job aid for this component. Prioritise any specific procedures, intervals, or specifications from the equipment manual where available. Use the generic component knowledge to fill any gaps.
 
 Return ONLY a valid JSON object with this exact structure. No markdown, no explanation, no extra text:
 
@@ -98,7 +129,7 @@ Return ONLY a valid JSON object with this exact structure. No markdown, no expla
       "step": 1,
       "title": "Short step title",
       "instruction": "Clear work instruction a technician can follow without prior knowledge of this machine",
-      "type": "action",
+      "type": "procedure",
       "precautions": ["Safety or quality precaution if applicable"]
     }}
   ]
@@ -232,23 +263,23 @@ def fetch_job_aid(job_aid_id: str, company_id: str) -> dict:
 def generate(component_type: str, equipment_id: str, company_id: str, created_by: str) -> dict:
     """
     Full generation pipeline called from the main.py endpoint.
-    1. Retrieve knowledge
+    1. Retrieve generic component knowledge + manual chunks
     2. Build prompt and call Claude
     3. Parse response
     4. Save to DB
     5. Return saved job aid
     """
-    knowledge = retrieve_knowledge(component_type)
+    component_knowledge, manual_knowledge = retrieve_knowledge(component_type, equipment_id, company_id)
 
-    if not knowledge:
+    if not component_knowledge:
         raise ValueError(
             f"No knowledge records found for component type '{component_type}'. "
             f"Please run squaremethods_indexer.py first."
         )
 
-    log.info(f"Retrieved {len(knowledge)} records for '{component_type}'")
+    log.info(f"Retrieved {len(component_knowledge)} component records and {len(manual_knowledge)} manual chunks for '{component_type}'")
 
-    prompt   = build_prompt(component_type, knowledge)
+    prompt   = build_prompt(component_type, component_knowledge, manual_knowledge)
     raw_text = ask_bedrock(prompt)
 
     # Parse Claude response - strip markdown fences if present

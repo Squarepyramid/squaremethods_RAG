@@ -11,6 +11,7 @@ from app.services.retrieval import build_context
 from app.services.session import create_session, get_session, get_history, save_messages
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
+from app.services.ingest_document import ingest as ingest_document_service
 
 root_path = os.getenv("ROOT_PATH", "")
 
@@ -51,10 +52,23 @@ class SessionRequest(BaseModel):
     user_id: str
 
 class GenerateJobAidRequest(BaseModel):
-    component_type: str    # e.g. "Coupling" - the dropdown value selected
-    equipment_id:   str    # UUID of the component node
-    company_id:     str    # UUID of the company
-    created_by:     str    # UUID of the user clicking Generate
+    component_type: str
+    equipment_id:   str
+    company_id:     str
+    created_by:     str
+
+class IngestDocumentRequest(BaseModel):
+    file_url:     str   # S3 URL of the uploaded document
+    equipment_id: str   # UUID of the equipment or component node
+    company_id:   str   # UUID of the company
+
+class DeleteDocumentRequest(BaseModel):
+    file_url:   str     # S3 URL of the document to delete
+    company_id: str     # UUID of the company
+
+class DeleteNodeRequest(BaseModel):
+    equipment_id: str   # UUID of the node being deleted
+    company_id:   str   # UUID of the company
 
 class ProcedureOut(BaseModel):
     step:        int
@@ -208,6 +222,50 @@ def generate_job_aid(request: GenerateJobAidRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         print(f"GENERATE JOB AID ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/documents/ingest", status_code=201, tags=["Documents"])
+def ingest_document(request: IngestDocumentRequest):
+    try:
+        result = ingest_document_service(
+            file_url=request.file_url,
+            equipment_id=request.equipment_id,
+            company_id=request.company_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"INGEST DOCUMENT ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/delete", tags=["Documents"])
+def delete_document(request: DeleteDocumentRequest):
+    try:
+        from app.services.ingest_document import delete_document as delete_doc_service
+        result = delete_doc_service(
+            file_url=request.file_url,
+            company_id=request.company_id,
+        )
+        return result
+    except Exception as e:
+        print(f"DELETE DOCUMENT ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/nodes/delete", tags=["Documents"])
+def delete_node(request: DeleteNodeRequest):
+    try:
+        from app.services.ingest_document import delete_node as delete_node_service
+        result = delete_node_service(
+            equipment_id=request.equipment_id,
+            company_id=request.company_id,
+        )
+        return result
+    except Exception as e:
+        print(f"DELETE NODE ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
