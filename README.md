@@ -341,6 +341,8 @@ aws acm request-certificate \
 # Configure postgresql client first
 sudo apt-get update && sudo apt-get install -y postgresql-client
 
+# Get code space ip address for whiteelisting
+curl ifconfig.me
   # Connect to the DB: remember to whitelist ip in SG
   psql -h squaremethods-db.czqyiw6okqqm.ca-central-1.rds.amazonaws.com \
      -U squaremethods_db \
@@ -353,6 +355,13 @@ SELECT table_name
 FROM information_schema.tables 
 WHERE table_schema = 'public' 
 ORDER BY table_name;
+
+
+# to see all tables
+\dt
+# view what is in table
+SELECT * FROM equipment_type_defaults LIMIT 10;
+
 
   # create chat tables SQL. 
   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -422,8 +431,7 @@ full run
 PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx
 
 
-# Get code space ip address for whiteelisting
-curl ifconfig.me
+
 
 # equipment id
 1d3c6ad8-7795-4b3d-ad36-198e8a3620f7

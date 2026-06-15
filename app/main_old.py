@@ -1,6 +1,6 @@
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse
 from mangum import Mangum
 from pydantic import BaseModel
 from typing import List, Optional
@@ -12,13 +12,8 @@ from app.services.session import create_session, get_session, get_history, save_
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
 from app.services.ingest_document import ingest as ingest_document_service
-from app.utils.s3 import upload_image as s3_upload_image
-from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
-from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 
 root_path = os.getenv("ROOT_PATH", "")
-
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 app = FastAPI(
     title="SquareMethods RAG API",
@@ -36,9 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
     role: str
@@ -66,17 +58,17 @@ class GenerateJobAidRequest(BaseModel):
     created_by:     str
 
 class IngestDocumentRequest(BaseModel):
-    file_url:     str
-    equipment_id: str
-    company_id:   str
+    file_url:     str   # S3 URL of the uploaded document
+    equipment_id: str   # UUID of the equipment or component node
+    company_id:   str   # UUID of the company
 
 class DeleteDocumentRequest(BaseModel):
-    file_url:   str
-    company_id: str
+    file_url:   str     # S3 URL of the document to delete
+    company_id: str     # UUID of the company
 
 class DeleteNodeRequest(BaseModel):
-    equipment_id: str
-    company_id:   str
+    equipment_id: str   # UUID of the node being deleted
+    company_id:   str   # UUID of the company
 
 class ProcedureOut(BaseModel):
     step:        int
@@ -95,8 +87,6 @@ class JobAidOut(BaseModel):
     procedures:         List[ProcedureOut]
 
 
-# ── Root and health ───────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {
@@ -104,13 +94,10 @@ def root():
         "version": "1.0.0",
         "engine": "Claude 3 Haiku on Amazon Bedrock",
         "endpoints": {
-            "health":              "/health",
-            "chat":                "/chat",
-            "generate_job_aid":    "/job-aids/generate",
-            "generate_pm_strategy": "/pm-strategy/generate",
-            "import_pm_strategy":  "/pm-strategy/import",
-            "upload_image":        "/images/upload",
-            "docs":                "/docs"
+            "health": "/health",
+            "chat": "/chat",
+            "generate_job_aid": "/job-aids/generate",
+            "docs": "/docs"
         }
     }
 
@@ -118,10 +105,10 @@ def root():
 @app.get("/health", tags=["Health"])
 def health_check():
     return {
-        "status":      "ok",
+        "status": "ok",
         "environment": os.getenv("ENV", "lambda"),
-        "version":     "1.0.0",
-        "engine":      "bedrock/claude-3-haiku"
+        "version": "1.0.0",
+        "engine": "bedrock/claude-3-haiku"
     }
 
 
@@ -155,13 +142,12 @@ def swagger_ui():
     """)
 
 
-# ── Chat ──────────────────────────────────────────────────────────────────────
-
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(request: ChatRequest):
     try:
         equipment_id = request.equipment_path.strip("/").split("/")[-1]
 
+        # Resolve or create session
         if request.session_id:
             session = get_session(request.session_id, request.company_id)
             if not session:
@@ -175,6 +161,7 @@ def chat(request: ChatRequest):
                 equipment_id=equipment_id
             )
 
+        # Fetch history from DB
         history = get_history(session_id, request.company_id)
         history_text = ""
         if history:
@@ -184,12 +171,14 @@ def chat(request: ChatRequest):
             )
             history_text = f"\n\nConversation History:\n{history_text}\n"
 
+        # Retrieve equipment context
         context = build_context(
             equipment_path=request.equipment_path,
             company_id=request.company_id,
             query=request.query
         )
 
+        # Build prompt
         prompt = f"""You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
 STRICT RULES:
 - Only answer based on the equipment knowledge provided below
@@ -206,6 +195,8 @@ User: {request.query}
 Assistant:"""
 
         answer = ask_bedrock(prompt)
+
+        # Save messages to DB
         save_messages(session_id, request.company_id, request.query, answer)
 
         return ChatResponse(answer=answer, session_id=session_id)
@@ -216,8 +207,6 @@ Assistant:"""
         print(f"CHAT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Job aid generation ────────────────────────────────────────────────────────
 
 @app.post("/job-aids/generate", response_model=JobAidOut, status_code=201, tags=["Job Aid Generation"])
 def generate_job_aid(request: GenerateJobAidRequest):
@@ -235,8 +224,6 @@ def generate_job_aid(request: GenerateJobAidRequest):
         print(f"GENERATE JOB AID ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Documents ─────────────────────────────────────────────────────────────────
 
 @app.post("/documents/ingest", status_code=201, tags=["Documents"])
 def ingest_document(request: IngestDocumentRequest):
@@ -281,140 +268,6 @@ def delete_node(request: DeleteNodeRequest):
         print(f"DELETE NODE ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── PM Strategy ───────────────────────────────────────────────────────────────
-
-@app.post("/images/upload", tags=["PM Strategy"])
-async def upload_image(
-    file: UploadFile = File(...),
-):
-    """
-    Upload a step image to S3 and return its public URL.
-
-    Call this before filling the Image column in the PM strategy Excel.
-    Paste the returned URL into the Image column for the relevant step row.
-
-    NOTE: Send as multipart/form-data, not JSON.
-    Field: file (binary)
-    """
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Accepted: JPEG, PNG, WEBP, GIF"
-        )
-
-    file_bytes = await file.read()
-
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File exceeds 10 MB limit ({len(file_bytes) / 1024 / 1024:.1f} MB)"
-        )
-
-    try:
-        url = s3_upload_image(file_bytes, file.content_type, file.filename)
-    except Exception as e:
-        print(f"IMAGE UPLOAD ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="Image upload failed")
-
-    return {"url": url, "filename": file.filename}
-
-
-@app.post("/pm-strategy/generate", tags=["PM Strategy"])
-async def generate_pm_strategy(
-    equipment_id: str = Form(...),
-    company_id:   str = Form(...),
-):
-    """
-    Generate a PM strategy Excel file from the ingested equipment manual.
-
-    Pulls all manual chunks for the equipment node, runs nine parallel
-    Claude calls (one per PM type: PM1-PM9), and returns a structured
-    Excel file for the reviewer to fill gaps and add image URLs.
-
-    The equipment must have at least one document ingested via
-    POST /documents/ingest before calling this endpoint.
-
-    NOTE: Send as multipart/form-data, not JSON.
-    Fields: equipment_id (string), company_id (string)
-
-    Returns: .xlsx file download
-    """
-    try:
-        excel_bytes = await generate_pm_strategy_service(equipment_id, company_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        print(f"GENERATE PM STRATEGY ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    filename = f"pm_strategy_{equipment_id[:8]}.xlsx"
-
-    return Response(
-        content    = excel_bytes,
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers    = {"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-@app.post("/pm-strategy/import", status_code=201, tags=["PM Strategy"])
-async def import_pm_strategy(
-    file:         UploadFile = File(...),
-    equipment_id: str        = Form(...),
-    company_id:   str        = Form(...),
-    created_by:   str        = Form(...),
-):
-    """
-    Import an edited PM strategy Excel file and create job aids.
-
-    Parses the Excel file (output of /pm-strategy/generate after
-    reviewer edits). Creates one job aid per PM type block that
-    has data rows. Each job aid is linked to the equipment node.
-
-    Steps with a URL in the Image column get image_url stored.
-    Steps with a blank Image column get image_url = NULL.
-
-    NOTE: Send as multipart/form-data, not JSON.
-    Fields:
-      file         - the edited .xlsx file (binary)
-      equipment_id - UUID of the equipment node
-      company_id   - UUID of the company
-      created_by   - UUID of the user performing the import
-
-    Returns:
-      {
-        "equipment_id": "...",
-        "job_aids_created": 3,
-        "job_aids": [
-          { "job_aid_id": "...", "pm_code": "PM2", "pm_name": "Lubrication", "steps": 6 },
-          ...
-        ]
-      }
-    """
-    if not file.filename.endswith(".xlsx"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only .xlsx files are accepted"
-        )
-
-    file_bytes = await file.read()
-
-    try:
-        result = import_pm_strategy_service(
-            file_bytes   = file_bytes,
-            equipment_id = equipment_id,
-            company_id   = company_id,
-            created_by   = created_by,
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        print(f"IMPORT PM STRATEGY ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Sessions ──────────────────────────────────────────────────────────────────
 
 @app.get("/sessions", tags=["Session"])
 def list_sessions(company_id: str, user_id: str, limit: int = 20):
