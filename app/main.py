@@ -12,7 +12,7 @@ from app.services.session import create_session, get_session, get_history, save_
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
 from app.services.ingest_document import ingest as ingest_document_service
-from app.utils.s3 import upload_image as s3_upload_image
+#from app.utils.s3 import upload_image as s3_upload_image
 from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 
@@ -284,10 +284,13 @@ def delete_node(request: DeleteNodeRequest):
 
 # ── PM Strategy ───────────────────────────────────────────────────────────────
 
-@app.post("/images/upload", tags=["PM Strategy"])
-async def upload_image(
-    file: UploadFile = File(...),
-):
+
+#@app.post("/images/upload", tags=["PM Strategy"])
+#async def upload_image(
+#    file: UploadFile = File(...),
+#):
+
+ 
     """
     Upload a step image to S3 and return its public URL.
 
@@ -297,27 +300,28 @@ async def upload_image(
     NOTE: Send as multipart/form-data, not JSON.
     Field: file (binary)
     """
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Accepted: JPEG, PNG, WEBP, GIF"
-        )
+#    if file.content_type not in ALLOWED_IMAGE_TYPES:
+  #      raise HTTPException(
+  #          status_code=400,
+   #         detail=f"Unsupported file type: {file.content_type}. Accepted: JPEG, PNG, WEBP, GIF"
+    #    )
 
-    file_bytes = await file.read()
+    #file_bytes = await file.read()
 
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File exceeds 10 MB limit ({len(file_bytes) / 1024 / 1024:.1f} MB)"
-        )
+   # if len(file_bytes) > 10 * 1024 * 1024:
+   #     raise HTTPException(
+   #         status_code=400,
+    #        detail=f"File exceeds 10 MB limit ({len(file_bytes) / 1024 / 1024:.1f} MB)"
+   #     )
 
-    try:
-        url = s3_upload_image(file_bytes, file.content_type, file.filename)
-    except Exception as e:
-        print(f"IMAGE UPLOAD ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="Image upload failed")
+   # try:
+   #     url = s3_upload_image(file_bytes, file.content_type, file.filename)
+  #  except Exception as e:
+  #      print(f"IMAGE UPLOAD ERROR: {str(e)}")
+  #      raise HTTPException(status_code=500, detail="Image upload failed")
 
-    return {"url": url, "filename": file.filename}
+  #  return {"url": url, "filename": file.filename}
+
 
 
 @app.post("/pm-strategy/generate", tags=["PM Strategy"])
