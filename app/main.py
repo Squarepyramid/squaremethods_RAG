@@ -608,10 +608,13 @@ def delete_session(session_id: str, request: SessionRequest):
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
+
 _mangum_handler = Mangum(app, lifespan="off")
 
 
 def handler(event, context):
+    import asyncio
+
     # SQS trigger for background PM strategy jobs
     try:
         records = event.get("Records", [])
@@ -625,6 +628,15 @@ def handler(event, context):
             return {"status": "done"}
     except (KeyError, json.JSONDecodeError) as e:
         print(f"SQS ROUTING ERROR: {e}")
+
+    # Reset event loop before handing to Mangum
+    # Prevents "Event loop is closed" if a previous SQS invocation closed it
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            asyncio.set_event_loop(asyncio.new_event_loop())
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     # Normal API Gateway traffic
     return _mangum_handler(event, context)
