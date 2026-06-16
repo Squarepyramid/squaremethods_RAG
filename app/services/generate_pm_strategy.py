@@ -84,6 +84,7 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
     Fetch ALL manual chunks for this equipment node and concatenate
     them into a single text block for Claude to reason over.
     No vector search -- full recall by equipment_id prefix match.
+    Handles both old and new content prefix formats.
     """
     conn = get_db_connection()
     try:
@@ -106,11 +107,22 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
             "Please upload and ingest a document for this node first."
         )
 
-    # Strip the equipment_id prefix added by ingest_document.py
-    prefix  = f"equipment_id:{equipment_id} | "
-    chunks  = [r["content"].removeprefix(prefix) for r in rows]
-    full_text = "\n\n".join(chunks)
-    log.info(f"Fetched {len(chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
+    clean_chunks = []
+    for r in rows:
+        content = r["content"]
+        # Split on " | " to strip prefixes
+        # Old format: "equipment_id:{id} | actual content"
+        # New format: "equipment_id:{id} | doc_id:{uuid} | actual content"
+        parts = content.split(" | ", 2)
+        if len(parts) == 3:
+            clean_chunks.append(parts[2])   # new format
+        elif len(parts) == 2:
+            clean_chunks.append(parts[1])   # old format
+        else:
+            clean_chunks.append(content)    # fallback
+
+    full_text = "\n\n".join(clean_chunks)
+    log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
     return full_text
 
 
@@ -214,7 +226,8 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     Format matches PM_strategy.xlsx exactly.
 
     pm_results: list of (pm_code, pm_name, steps_list) tuples in PM1-PM9 order.
-    Only PM types with at least one step are written.
+    All PM types are written -- empty ones show the header and column row
+    with no data rows, ready for the reviewer to fill in manually.
     """
     wb   = Workbook()
     ws   = wb.active
@@ -227,8 +240,6 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     current_row = 1
 
     for pm_code, pm_name, steps in pm_results:
-        if not steps:
-            continue
 
         # PM type header row (e.g. "PM2 - Lubrication")
         header_cell = ws.cell(row=current_row, column=1, value=f"{pm_code} - {pm_name}")
@@ -251,7 +262,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
         ws.row_dimensions[current_row].height = 30
         current_row += 1
 
-        # Data rows
+        # Data rows -- skipped naturally if steps is empty
         for step in steps:
             row_values = [
                 step.get("operation", ""),
@@ -294,6 +305,7 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     1. Fetch all manual chunks for the equipment
     2. Run nine parallel Claude calls (one per PM type)
     3. Build and return the Excel file as bytes
+       -- always returns a valid file even if all PM types are empty
     """
     manual_text = fetch_all_manual_chunks(equipment_id, company_id)
 
@@ -306,16 +318,9 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
         ]
         results = await asyncio.gather(*tasks)
 
-    # Results come back in gather order which matches PM_TYPES order
     pm_results = list(results)
 
     populated = sum(1 for _, _, steps in pm_results if steps)
     log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
-
-    if populated == 0:
-        raise ValueError(
-            "No maintenance tasks could be extracted from the manual. "
-            "Check that the uploaded document contains maintenance procedures."
-        )
 
     return build_excel(equipment_id, pm_results)
