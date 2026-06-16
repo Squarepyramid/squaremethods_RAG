@@ -616,15 +616,9 @@ def delete_session(session_id: str, request: SessionRequest):
 _mangum_handler = Mangum(app, lifespan="off")
 
 
-def handler(event, context):
-    # Background PM strategy job triggered by async self-invoke
-    if event.get("task") == "pm_strategy_job":
-        run_pm_strategy_job(
-            job_id       = event["job_id"],
-            equipment_id = event["equipment_id"],
-            company_id   = event["company_id"],
-        )
-        return {"status": "done"}
 
-    # Normal API Gateway traffic via Mangum
+def handler(event, context):
+    if event.get("task") == "pm_strategy_job":  # this should catch it
+        ...
     return _mangum_handler(event, context)
+
