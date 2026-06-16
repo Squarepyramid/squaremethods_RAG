@@ -5,8 +5,7 @@ from mangum import Mangum
 from pydantic import BaseModel
 from typing import List, Optional
 import os
-import threading
-import asyncio
+import json
 import boto3
 
 from app.services.bedrock_client import ask_bedrock
@@ -290,10 +289,12 @@ def delete_node(request: DeleteNodeRequest):
 
 def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
     """
-    Runs in a background thread.
+    Called directly by the async Lambda self-invoke.
     Generates the PM strategy Excel and uploads it to S3.
-    Updates the job status in pm_strategy_jobs when done.
+    Updates pm_strategy_jobs when done.
     """
+    import asyncio
+
     try:
         excel_bytes = asyncio.run(generate_pm_strategy_service(equipment_id, company_id))
 
@@ -317,6 +318,8 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
             conn.commit()
         finally:
             conn.close()
+
+        print(f"PM STRATEGY JOB COMPLETE [{job_id}]")
 
     except Exception as e:
         print(f"PM STRATEGY JOB ERROR [{job_id}]: {str(e)}")
@@ -342,8 +345,9 @@ async def generate_pm_strategy(
     Kick off async PM strategy generation.
 
     Creates a background job and returns immediately with a job_id.
-    Poll GET /pm-strategy/status/{job_id} every 3 seconds until
-    status is 'ready', then use the download_url to auto-download the file.
+    Poll GET /pm-strategy/status/{job_id}?company_id={company_id}
+    every 3 seconds until status is 'ready', then use the
+    download_url to auto-download the Excel file.
 
     NOTE: Send as multipart/form-data, not JSON.
     Fields: equipment_id (string), company_id (string)
@@ -366,12 +370,18 @@ async def generate_pm_strategy(
     finally:
         conn.close()
 
-    thread = threading.Thread(
-        target=run_pm_strategy_job,
-        args=(job_id, equipment_id, company_id),
-        daemon=True
+    # Invoke this same Lambda asynchronously -- fire and forget
+    lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+    lambda_client.invoke(
+        FunctionName   = os.environ["AWS_LAMBDA_FUNCTION_NAME"],
+        InvocationType = "Event",  # async, does not wait
+        Payload        = json.dumps({
+            "task":         "pm_strategy_job",
+            "job_id":       job_id,
+            "equipment_id": equipment_id,
+            "company_id":   company_id,
+        }).encode()
     )
-    thread.start()
 
     return {"job_id": job_id, "status": "pending"}
 
@@ -379,11 +389,11 @@ async def generate_pm_strategy(
 @app.get("/pm-strategy/status/{job_id}", tags=["PM Strategy"])
 def pm_strategy_status(job_id: str, company_id: str):
     """
-    Poll this endpoint after calling POST /pm-strategy/generate.
+    Poll this after calling POST /pm-strategy/generate.
 
     Returns:
       { status: "pending" }
-      { status: "ready", download_url: "https://..." }   -- presigned S3 URL, valid 5 min
+      { status: "ready", download_url: "https://..." }   presigned URL valid 5 min
       { status: "failed", error: "..." }
     """
     conn = get_db_connection()
@@ -601,4 +611,20 @@ def delete_session(session_id: str, request: SessionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-handler = Mangum(app, lifespan="off")
+# ── Lambda handler ────────────────────────────────────────────────────────────
+
+_mangum_handler = Mangum(app, lifespan="off")
+
+
+def handler(event, context):
+    # Background PM strategy job triggered by async self-invoke
+    if event.get("task") == "pm_strategy_job":
+        run_pm_strategy_job(
+            job_id       = event["job_id"],
+            equipment_id = event["equipment_id"],
+            company_id   = event["company_id"],
+        )
+        return {"status": "done"}
+
+    # Normal API Gateway traffic via Mangum
+    return _mangum_handler(event, context)
