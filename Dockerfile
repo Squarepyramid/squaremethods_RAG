@@ -12,8 +12,8 @@ COPY app ./app
 RUN chmod -R 755 ./app
 
 # ✅ CORRECT: Lambda handler format
-# CMD ["app.main.handler"]
-CMD ["main.lambda_handler"]
+CMD ["app.main.handler"]
+
 
 # ❌ WRONG: Do NOT use these in Lambda
 # CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
