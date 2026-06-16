@@ -288,16 +288,21 @@ def delete_node(request: DeleteNodeRequest):
 
 # ── PM Strategy ───────────────────────────────────────────────────────────────
 
+
+
 def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
-    """
-    Called when Lambda is triggered by SQS.
-    Generates the PM strategy Excel and uploads it to S3.
-    Updates pm_strategy_jobs when done.
-    """
     import asyncio
 
     try:
-        excel_bytes = asyncio.run(generate_pm_strategy_service(equipment_id, company_id))
+        # Create a new event loop explicitly for this thread/invocation
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            excel_bytes = loop.run_until_complete(
+                generate_pm_strategy_service(equipment_id, company_id)
+            )
+        finally:
+            loop.close()
 
         s3_key = f"pm-strategy/{company_id}/{job_id}.xlsx"
         s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -335,7 +340,6 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
             conn.commit()
         finally:
             conn.close()
-
 
 @app.post("/pm-strategy/generate", status_code=202, tags=["PM Strategy"])
 async def generate_pm_strategy(
@@ -617,15 +621,18 @@ _mangum_handler = Mangum(app, lifespan="off")
 
 def handler(event, context):
     # SQS trigger for background PM strategy jobs
-    if "Records" in event and event["Records"][0].get("eventSource") == "aws:sqs":
-        record = event["Records"][0]
-        body   = json.loads(record["body"])
-        run_pm_strategy_job(
-            job_id       = body["job_id"],
-            equipment_id = body["equipment_id"],
-            company_id   = body["company_id"],
-        )
-        return {"status": "done"}
+    try:
+        records = event.get("Records", [])
+        if records and records[0].get("eventSource") == "aws:sqs":
+            body = json.loads(records[0]["body"])
+            run_pm_strategy_job(
+                job_id       = body["job_id"],
+                equipment_id = body["equipment_id"],
+                company_id   = body["company_id"],
+            )
+            return {"status": "done"}
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"SQS ROUTING ERROR: {e}")
 
     # Normal API Gateway traffic
     return _mangum_handler(event, context)
