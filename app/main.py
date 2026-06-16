@@ -294,15 +294,7 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
     import asyncio
 
     try:
-        # Create a new event loop explicitly for this thread/invocation
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            excel_bytes = loop.run_until_complete(
-                generate_pm_strategy_service(equipment_id, company_id)
-            )
-        finally:
-            loop.close()
+        excel_bytes = asyncio.run(generate_pm_strategy_service(equipment_id, company_id))
 
         s3_key = f"pm-strategy/{company_id}/{job_id}.xlsx"
         s3 = boto3.client("s3", region_name=AWS_REGION)
