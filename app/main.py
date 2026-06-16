@@ -5,6 +5,9 @@ from mangum import Mangum
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import threading
+import asyncio
+import boto3
 
 from app.services.bedrock_client import ask_bedrock
 from app.services.retrieval import build_context
@@ -12,13 +15,14 @@ from app.services.session import create_session, get_session, get_history, save_
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
 from app.services.ingest_document import ingest as ingest_document_service
-#from app.utils.s3 import upload_image as s3_upload_image
 from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 
 root_path = os.getenv("ROOT_PATH", "")
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+S3_BUCKET           = os.getenv("S3_BUCKET", "squaremethods")
+AWS_REGION          = os.getenv("AWS_REGION", "ca-central-1")
 
 app = FastAPI(
     title="SquareMethods RAG API",
@@ -104,13 +108,13 @@ def root():
         "version": "1.0.0",
         "engine": "Claude 3 Haiku on Amazon Bedrock",
         "endpoints": {
-            "health":              "/health",
-            "chat":                "/chat",
-            "generate_job_aid":    "/job-aids/generate",
+            "health":               "/health",
+            "chat":                 "/chat",
+            "generate_job_aid":     "/job-aids/generate",
             "generate_pm_strategy": "/pm-strategy/generate",
-            "import_pm_strategy":  "/pm-strategy/import",
-            "upload_image":        "/images/upload",
-            "docs":                "/docs"
+            "pm_strategy_status":   "/pm-strategy/status/{job_id}",
+            "import_pm_strategy":   "/pm-strategy/import",
+            "docs":                 "/docs"
         }
     }
 
@@ -284,81 +288,133 @@ def delete_node(request: DeleteNodeRequest):
 
 # ── PM Strategy ───────────────────────────────────────────────────────────────
 
-
-#@app.post("/images/upload", tags=["PM Strategy"])
-#async def upload_image(
-#    file: UploadFile = File(...),
-#):
-
- 
+def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
     """
-    Upload a step image to S3 and return its public URL.
-
-    Call this before filling the Image column in the PM strategy Excel.
-    Paste the returned URL into the Image column for the relevant step row.
-
-    NOTE: Send as multipart/form-data, not JSON.
-    Field: file (binary)
+    Runs in a background thread.
+    Generates the PM strategy Excel and uploads it to S3.
+    Updates the job status in pm_strategy_jobs when done.
     """
-#    if file.content_type not in ALLOWED_IMAGE_TYPES:
-  #      raise HTTPException(
-  #          status_code=400,
-   #         detail=f"Unsupported file type: {file.content_type}. Accepted: JPEG, PNG, WEBP, GIF"
-    #    )
+    try:
+        excel_bytes = asyncio.run(generate_pm_strategy_service(equipment_id, company_id))
 
-    #file_bytes = await file.read()
+        s3_key = f"pm-strategy/{company_id}/{job_id}.xlsx"
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=excel_bytes,
+            ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-   # if len(file_bytes) > 10 * 1024 * 1024:
-   #     raise HTTPException(
-   #         status_code=400,
-    #        detail=f"File exceeds 10 MB limit ({len(file_bytes) / 1024 / 1024:.1f} MB)"
-   #     )
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'ready', s3_key = %s, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (s3_key, job_id))
+            conn.commit()
+        finally:
+            conn.close()
 
-   # try:
-   #     url = s3_upload_image(file_bytes, file.content_type, file.filename)
-  #  except Exception as e:
-  #      print(f"IMAGE UPLOAD ERROR: {str(e)}")
-  #      raise HTTPException(status_code=500, detail="Image upload failed")
+    except Exception as e:
+        print(f"PM STRATEGY JOB ERROR [{job_id}]: {str(e)}")
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'failed', error = %s, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (str(e), job_id))
+            conn.commit()
+        finally:
+            conn.close()
 
-  #  return {"url": url, "filename": file.filename}
 
-
-
-@app.post("/pm-strategy/generate", tags=["PM Strategy"])
+@app.post("/pm-strategy/generate", status_code=202, tags=["PM Strategy"])
 async def generate_pm_strategy(
     equipment_id: str = Form(...),
     company_id:   str = Form(...),
 ):
     """
-    Generate a PM strategy Excel file from the ingested equipment manual.
+    Kick off async PM strategy generation.
 
-    Pulls all manual chunks for the equipment node, runs nine parallel
-    Claude calls (one per PM type: PM1-PM9), and returns a structured
-    Excel file for the reviewer to fill gaps and add image URLs.
-
-    The equipment must have at least one document ingested via
-    POST /documents/ingest before calling this endpoint.
+    Creates a background job and returns immediately with a job_id.
+    Poll GET /pm-strategy/status/{job_id} every 3 seconds until
+    status is 'ready', then use the download_url to auto-download the file.
 
     NOTE: Send as multipart/form-data, not JSON.
     Fields: equipment_id (string), company_id (string)
 
-    Returns: .xlsx file download
+    Returns: { job_id: string, status: "pending" }
     """
+    conn = get_db_connection()
     try:
-        excel_bytes = await generate_pm_strategy_service(equipment_id, company_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pm_strategy_jobs (equipment_id, company_id, status)
+                VALUES (%s::uuid, %s::uuid, 'pending')
+                RETURNING id
+            """, (equipment_id, company_id))
+            job_id = str(cur.fetchone()["id"])
+        conn.commit()
     except Exception as e:
-        print(f"GENERATE PM STRATEGY ERROR: {str(e)}")
+        print(f"PM STRATEGY JOB CREATE ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
-    filename = f"pm_strategy_{equipment_id[:8]}.xlsx"
-
-    return Response(
-        content    = excel_bytes,
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers    = {"Content-Disposition": f'attachment; filename="{filename}"'},
+    thread = threading.Thread(
+        target=run_pm_strategy_job,
+        args=(job_id, equipment_id, company_id),
+        daemon=True
     )
+    thread.start()
+
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/pm-strategy/status/{job_id}", tags=["PM Strategy"])
+def pm_strategy_status(job_id: str, company_id: str):
+    """
+    Poll this endpoint after calling POST /pm-strategy/generate.
+
+    Returns:
+      { status: "pending" }
+      { status: "ready", download_url: "https://..." }   -- presigned S3 URL, valid 5 min
+      { status: "failed", error: "..." }
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, s3_key, error
+                FROM pm_strategy_jobs
+                WHERE id = %s::uuid
+                AND company_id = %s::uuid
+            """, (job_id, company_id))
+            job = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] == "ready":
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        download_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": job["s3_key"]},
+            ExpiresIn=300
+        )
+        return {"status": "ready", "download_url": download_url}
+
+    if job["status"] == "failed":
+        return {"status": "failed", "error": job["error"]}
+
+    return {"status": "pending"}
 
 
 @app.post("/pm-strategy/import", status_code=201, tags=["PM Strategy"])
