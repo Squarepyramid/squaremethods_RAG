@@ -362,6 +362,14 @@ ORDER BY table_name;
 # view what is in table
 SELECT * FROM equipment_type_defaults LIMIT 10;
 
+SELECT COUNT(*) FROM knowledge_embeddings;
+
+
+SELECT * FROM  knowledge_embeddings LIMIT 10;
+
+SELECT * FROM knowledge_embeddings WHERE source_type = 'manual' LIMIT 10;
+SELECT * FROM knowledge_embeddings WHERE created_at = '2026-06-06 21:40:08.268308+00 ' LIMIT 10;
+SELECT * FROM knowledge_embeddings  WHERE source_id = '3f158238-431e-4b11-89c1-4770627ed484';
 
   # create chat tables SQL. 
   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
