@@ -19,9 +19,10 @@ from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 
 root_path = os.getenv("ROOT_PATH", "")
 
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-S3_BUCKET           = os.getenv("S3_BUCKET", "squaremethods")
-AWS_REGION          = os.getenv("AWS_REGION", "ca-central-1")
+ALLOWED_IMAGE_TYPES  = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+S3_BUCKET            = os.getenv("S3_BUCKET", "squaremethods")
+AWS_REGION           = os.getenv("AWS_REGION", "ca-central-1")
+SQS_PM_STRATEGY_URL  = os.getenv("SQS_PM_STRATEGY_URL", "")
 
 app = FastAPI(
     title="SquareMethods RAG API",
@@ -289,7 +290,7 @@ def delete_node(request: DeleteNodeRequest):
 
 def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
     """
-    Called directly by the async Lambda self-invoke.
+    Called when Lambda is triggered by SQS.
     Generates the PM strategy Excel and uploads it to S3.
     Updates pm_strategy_jobs when done.
     """
@@ -370,17 +371,15 @@ async def generate_pm_strategy(
     finally:
         conn.close()
 
-    # Invoke this same Lambda asynchronously -- fire and forget
-    lambda_client = boto3.client("lambda", region_name=AWS_REGION)
-    lambda_client.invoke(
-        FunctionName   = os.environ["AWS_LAMBDA_FUNCTION_NAME"],
-        InvocationType = "Event",  # async, does not wait
-        Payload        = json.dumps({
-            "task":         "pm_strategy_job",
+    # Push to SQS -- Lambda will be triggered automatically
+    sqs = boto3.client("sqs", region_name=AWS_REGION)
+    sqs.send_message(
+        QueueUrl    = SQS_PM_STRATEGY_URL,
+        MessageBody = json.dumps({
             "job_id":       job_id,
             "equipment_id": equipment_id,
             "company_id":   company_id,
-        }).encode()
+        })
     )
 
     return {"job_id": job_id, "status": "pending"}
@@ -616,9 +615,17 @@ def delete_session(session_id: str, request: SessionRequest):
 _mangum_handler = Mangum(app, lifespan="off")
 
 
-
 def handler(event, context):
-    if event.get("task") == "pm_strategy_job":  # this should catch it
-        ...
-    return _mangum_handler(event, context)
+    # SQS trigger for background PM strategy jobs
+    if "Records" in event and event["Records"][0].get("eventSource") == "aws:sqs":
+        record = event["Records"][0]
+        body   = json.loads(record["body"])
+        run_pm_strategy_job(
+            job_id       = body["job_id"],
+            equipment_id = body["equipment_id"],
+            company_id   = body["company_id"],
+        )
+        return {"status": "done"}
 
+    # Normal API Gateway traffic
+    return _mangum_handler(event, context)
