@@ -8,8 +8,9 @@ generate_pm_strategy.py after reviewer edits) and creates
 job aids and procedure steps in the database.
 
 One job aid is created per PM type block that contains rows.
-Steps with an Image column value get that URL stored as image_url.
-Steps with a blank Image column get image_url = NULL.
+Steps with an Image column value get that URL stored in the
+procedures.image column. Steps with a blank Image column get
+image = NULL.
 
 PM type blocks are identified by header rows matching:
   "PM1 - Inspection", "PM2 - Lubrication", etc.
@@ -229,7 +230,7 @@ def save_block(
             cur.execute("""
                 INSERT INTO procedures
                     (id, company_id, job_aid_id, title, step,
-                     instruction, type, precautions, image_url,
+                     instruction, type, precautions, image,
                      created_at, updated_at)
                 VALUES
                     (%s::uuid, %s::uuid, %s::uuid, %s, %s,
@@ -243,7 +244,7 @@ def save_block(
                 step_num,
                 step["instruction"],
                 step["precautions"],
-                step["image"],
+                step["image_url"],
             ))
 
         # 3. Link job aid to equipment node
