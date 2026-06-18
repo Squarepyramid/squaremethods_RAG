@@ -1,352 +1,326 @@
 """
-SquareMethods - PM Strategy Import Service
-==========================================
-Place this file at: app/services/import_pm_strategy.py
+SquareMethods - PM Strategy Generation Service
+==============================================
+Place this file at: app/services/generate_pm_strategy.py
 
-Parses an edited PM strategy Excel file (the output of
-generate_pm_strategy.py after reviewer edits) and creates
-job aids and procedure steps in the database.
+Pulls all manual chunks for an equipment node, then runs nine
+parallel async Claude calls (one per PM type) to extract and
+structure maintenance tasks into a downloadable Excel file.
 
-One job aid is created per PM type block that contains rows.
-Job aid titles are prefixed with the equipment name so that
-job aids for different equipment are distinguishable, e.g.
-  "Wrapper 4 - PM2 - Lubrication"
+The Excel output matches the PM_strategy.xlsx format exactly so
+the reviewer can fill gaps, add image URLs, then upload it via
+the import endpoint.
 
-Steps with an Image column value get that URL stored in the
-procedures.image column. Steps with a blank Image column get
-image = NULL.
-
-PM type blocks are identified by header rows matching:
-  "PM1 - Inspection", "PM2 - Lubrication", etc.
+PM Types:
+  PM1 - Inspection
+  PM2 - Lubrication
+  PM3 - Calibration
+  PM4 - Replacements
+  PM5 - Overhaul
+  PM6 - Condition Monitoring
+  PM7 - Cleaning
+  PM8 - Safety Inspection
+  PM9 - Software Back-up
 """
 
 import io
-import re
-import uuid
+import json
 import logging
+import asyncio
 from typing import Optional
 
-from openpyxl import load_workbook
+import httpx
+import boto3
+import os
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.utils.db import get_db_connection
 
 log = logging.getLogger(__name__)
 
-PM_HEADER_PATTERN = re.compile(
-    r"^(PM[1-9])\s*[-–]\s*(.+)$", re.IGNORECASE
-)
+PM_TYPES = [
+    ("PM1", "Inspection"),
+    ("PM2", "Lubrication"),
+    ("PM3", "Calibration"),
+    ("PM4", "Replacements"),
+    ("PM5", "Overhaul"),
+    ("PM6", "Condition Monitoring"),
+    ("PM7", "Cleaning"),
+    ("PM8", "Safety Inspection"),
+    ("PM9", "Software Back-up"),
+]
 
-CATEGORY_MAP = {
-    "PM1": "Inspection",
-    "PM2": "Lubrication",
-    "PM3": "Calibration",
-    "PM4": "Replacements",
-    "PM5": "Overhaul",
-    "PM6": "Condition Monitoring",
-    "PM7": "Cleaning",
-    "PM8": "Safety Inspection",
-    "PM9": "Software Back-up",
-}
+BEDROCK_MODEL   = "anthropic.claude-3-haiku-20240307-v1:0"
+BEDROCK_REGION  = os.environ.get("AWS_REGION", "ca-central-1")
+MAX_TOKENS      = 4096
 
-# Column positions (1-indexed, matching the Excel template)
-COL_OPERATION   = 1
-COL_TITLE       = 2
-COL_FREQUENCY   = 3
-COL_HRS         = 4
-COL_COMPONENT   = 8
-COL_INSTRUCTION = 9
-COL_FAILURE     = 10
-COL_IMAGE       = 11
+COLUMNS = [
+    "Operation",
+    "Task List Description",
+    "Frequency",
+    "Hrs",
+    "Work Needed",
+    "System Condition",
+    "Material Number",
+    "Component",
+    "Long Text (Instruction)",
+    "Failure Modes",
+    "Image",
+]
+
+HEADER_FILL   = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
+HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+SUBHEAD_FILL  = PatternFill("solid", start_color="D6E4F0", end_color="D6E4F0")
+SUBHEAD_FONT  = Font(bold=True, name="Arial", size=10)
+DATA_FONT     = Font(name="Arial", size=10)
+WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top")
 
 
-# ── Excel parser ──────────────────────────────────────────────────────────────
+# ── Knowledge retrieval ───────────────────────────────────────────────────────
 
-def parse_excel(file_bytes: bytes) -> list[dict]:
+def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
     """
-    Parse the PM strategy Excel into a list of job aid blocks.
-
-    Returns a list of dicts:
-    {
-        "pm_code":   "PM2",
-        "pm_name":   "Lubrication",
-        "category":  "Lubrication",
-        "steps":     [ { step fields... }, ... ]
-    }
-
-    Skips PM type blocks that have no data rows.
-    Skips the column header row (identified by "Operation" in col 1).
+    Fetch ALL manual chunks for this equipment node and concatenate
+    them into a single text block for Claude to reason over.
+    No vector search -- full recall by equipment_id prefix match.
+    Handles both old and new content prefix formats.
     """
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    ws = wb.active
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT content
+                FROM knowledge_embeddings
+                WHERE source_type = 'manual'
+                AND company_id = %s::uuid
+                AND content LIKE %s
+                ORDER BY created_at
+            """, (company_id, f"equipment_id:{equipment_id}%"))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
-    blocks       = []
-    current_block = None
-
-    for row in ws.iter_rows(values_only=True):
-        # Skip completely empty rows
-        if not any(cell for cell in row if cell is not None):
-            continue
-
-        first_cell = str(row[0]).strip() if row[0] is not None else ""
-
-        # Detect PM type header row e.g. "PM2 - Lubrication"
-        match = PM_HEADER_PATTERN.match(first_cell)
-        if match:
-            if current_block and current_block["steps"]:
-                blocks.append(current_block)
-            pm_code      = match.group(1).upper()
-            pm_name      = CATEGORY_MAP.get(pm_code, match.group(2).strip())
-            current_block = {
-                "pm_code":  pm_code,
-                "pm_name":  pm_name,
-                "category": pm_name,
-                "steps":    [],
-            }
-            continue
-
-        # Skip column header row
-        if first_cell.lower().startswith("operation") and current_block is None:
-            continue
-        if first_cell == "Operation":
-            continue
-
-        # Skip rows that are column headers (second row in each block)
-        if first_cell in ("Operation", "Task List Description", "Frequency"):
-            continue
-
-        # Data row -- must be inside a block and have a step title
-        if current_block is None:
-            continue
-
-        title = str(row[COL_TITLE - 1]).strip() if row[COL_TITLE - 1] is not None else ""
-        if not title or title.lower() in ("none", "task list description"):
-            continue
-
-        # Parse hours -- may be blank or non-numeric
-        hrs_raw = row[COL_HRS - 1]
-        try:
-            hrs = float(hrs_raw) if hrs_raw is not None else None
-        except (ValueError, TypeError):
-            hrs = None
-
-        # Estimated duration in minutes for this step
-        duration_minutes = round(hrs * 60) if hrs else None
-
-        # Failure modes -- stored as precautions array
-        failure_raw  = row[COL_FAILURE - 1]
-        failure_text = str(failure_raw).strip() if failure_raw is not None else ""
-        precautions  = (
-            [f.strip() for f in failure_text.split(",") if f.strip()]
-            if failure_text and failure_text.lower() != "none"
-            else []
+    if not rows:
+        raise ValueError(
+            f"No manual chunks found for equipment {equipment_id}. "
+            "Please upload and ingest a document for this node first."
         )
 
-        # Image URL -- blank becomes None
-        image_raw = row[COL_IMAGE - 1]
-        image_url = str(image_raw).strip() if image_raw is not None else ""
-        image_url = image_url if image_url and image_url.lower() != "none" else None
+    clean_chunks = []
+    for r in rows:
+        content = r["content"]
+        # Split on " | " to strip prefixes
+        # Old format: "equipment_id:{id} | actual content"
+        # New format: "equipment_id:{id} | doc_id:{uuid} | actual content"
+        parts = content.split(" | ", 2)
+        if len(parts) == 3:
+            clean_chunks.append(parts[2])   # new format
+        elif len(parts) == 2:
+            clean_chunks.append(parts[1])   # old format
+        else:
+            clean_chunks.append(content)    # fallback
 
-        instruction_raw = row[COL_INSTRUCTION - 1]
-        instruction     = str(instruction_raw).strip() if instruction_raw is not None else ""
-        instruction     = instruction if instruction and instruction.lower() != "none" else ""
-
-        component_raw = row[COL_COMPONENT - 1]
-        component     = str(component_raw).strip() if component_raw is not None else ""
-
-        frequency_raw = row[COL_FREQUENCY - 1]
-        frequency     = str(frequency_raw).strip() if frequency_raw is not None else ""
-
-        current_block["steps"].append({
-            "title":            title,
-            "instruction":      instruction,
-            "component":        component,
-            "frequency":        frequency,
-            "hrs":              hrs,
-            "duration_minutes": duration_minutes,
-            "precautions":      precautions,
-            "image_url":        image_url,
-        })
-
-    # Flush last block
-    if current_block and current_block["steps"]:
-        blocks.append(current_block)
-
-    log.info(f"Parsed {len(blocks)} PM type blocks from Excel")
-    return blocks
+    full_text = "\n\n".join(clean_chunks)
+    log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
+    return full_text
 
 
-# ── Equipment lookup ──────────────────────────────────────────────────────────
+# ── Claude call ───────────────────────────────────────────────────────────────
 
-def fetch_equipment_name(conn, equipment_id: str, company_id: str) -> str:
+def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str) -> str:
+    return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
+
+Your task is to extract ALL maintenance tasks that fall under the category: {pm_code} - {pm_name}
+
+For each task you find, extract the following fields:
+- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
+- task_list_description: the step title following the component hierarchy pattern "Assembly - Subassembly - Component x[quantity]". Preserve quantities (x1, x2, x4 etc) as they indicate how many of that component exist.
+- frequency: how often this task should be done (e.g. "2W" for 2 weekly, "1M" for monthly, "1Y" for yearly). Leave blank if not specified.
+- hrs: estimated hours as a decimal number (e.g. 0.1, 0.5, 1.0). Leave blank if not specified.
+- work_needed: 1 if active work is required, 0 if observation only. Default to 1.
+- system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
+- material_number: SAP material number if mentioned, otherwise leave blank.
+- component: the specific component name only (without the assembly hierarchy), e.g. "Bearings x8"
+- instruction: step-by-step work instruction a technician can follow. Number each step. Be specific.
+- failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
+
+Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
+If no tasks of type {pm_name} are found in the manual, return an empty array: []
+
+Example format:
+[
+  {{
+    "operation": "Operation_010",
+    "task_list_description": "Main Drive assembly - Bearings x4",
+    "frequency": "2W",
+    "hrs": 0.1,
+    "work_needed": 1,
+    "system_condition": 0,
+    "material_number": "",
+    "component": "Bearings x4",
+    "instruction": "1. Isolate and lock out the drive. 2. Remove guard. 3. Apply 2 shots of grease per nipple using grease gun.",
+    "failure_modes": "Bearing seizure, overheating"
+  }}
+]
+
+EQUIPMENT MANUAL:
+{manual_text}"""
+
+
+async def call_claude_for_pm_type(
+    client: httpx.AsyncClient,
+    bedrock,
+    pm_code: str,
+    pm_name: str,
+    manual_text: str,
+) -> tuple[str, str, list]:
     """
-    Look up the equipment name so job aid titles can be prefixed with it,
-    e.g. "Wrapper 4 - PM2 - Lubrication" instead of just "PM2 - Lubrication".
-    Falls back to a generic label if the equipment cannot be found.
+    Call Claude via Bedrock for one PM type.
+    Returns (pm_code, pm_name, list_of_step_dicts).
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT name FROM equipment
-            WHERE id = %s::uuid
-            AND company_id = %s::uuid
-        """, (equipment_id, company_id))
-        row = cur.fetchone()
+    prompt = build_pm_prompt(pm_code, pm_name, manual_text)
 
-    if row and row["name"]:
-        return row["name"]
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens":        MAX_TOKENS,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+    })
 
-    log.warning(f"Equipment name not found for {equipment_id}, using fallback label")
-    return "Equipment"
+    try:
+        loop     = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: bedrock.invoke_model(
+                modelId     = BEDROCK_MODEL,
+                body        = body,
+                contentType = "application/json",
+                accept      = "application/json",
+            )
+        )
+        raw      = json.loads(response["body"].read())
+        raw_text = raw["content"][0]["text"].strip()
+
+        # Strip markdown fences if present
+        clean = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        steps = json.loads(clean)
+
+        if not isinstance(steps, list):
+            steps = []
+
+        log.info(f"{pm_code} ({pm_name}): {len(steps)} steps extracted")
+        return pm_code, pm_name, steps
+
+    except Exception as e:
+        log.error(f"Claude call failed for {pm_code} ({pm_name}): {e}")
+        return pm_code, pm_name, []
 
 
-# ── Slug helper ───────────────────────────────────────────────────────────────
+# ── Excel builder ─────────────────────────────────────────────────────────────
 
-def make_slug(title: str, unique_id: str) -> str:
-    import re as _re
-    base   = _re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    suffix = unique_id[:8]
-    return f"{base}-{suffix}"
-
-
-# ── DB write ──────────────────────────────────────────────────────────────────
-
-def save_block(
-    conn,
-    block: dict,
-    equipment_id: str,
-    equipment_name: str,
-    company_id: str,
-    created_by: str,
-) -> str:
+def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     """
-    Insert one job aid and its procedure steps for a PM type block.
-    Title is prefixed with the equipment name, e.g.
-      "Wrapper 4 - PM2 - Lubrication"
-    Returns the job_aid_id.
+    Build the PM strategy Excel file from Claude's structured output.
+    Format matches PM_strategy.xlsx exactly.
+
+    pm_results: list of (pm_code, pm_name, steps_list) tuples in PM1-PM9 order.
+    All PM types are written -- empty ones show the header and column row
+    with no data rows, ready for the reviewer to fill in manually.
     """
-    job_aid_id = str(uuid.uuid4())
-    title      = f"{equipment_name} - {block['pm_code']} - {block['pm_name']}"
-    slug       = make_slug(title, job_aid_id)
+    wb   = Workbook()
+    ws   = wb.active
+    ws.title = "PM Strategy"
 
-    # estimated_duration = sum of all step durations in minutes
-    total_minutes = sum(
-        s["duration_minutes"] for s in block["steps"] if s["duration_minutes"]
-    ) or None
+    col_widths = [15, 55, 12, 8, 13, 17, 16, 35, 60, 35, 40]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
 
-    with conn.cursor() as cur:
+    current_row = 1
 
-        # 1. Insert job aid
-        cur.execute("""
-            INSERT INTO job_aids
-                (id, company_id, title, slug, instruction, status,
-                 estimated_duration, category, created_by,
-                 view_count, scan_count, created_at, updated_at)
-            VALUES
-                (%s::uuid, %s::uuid, %s, %s, %s, 'draft',
-                 %s, %s, %s::uuid,
-                 0, 0, NOW(), NOW())
-        """, (
-            job_aid_id,
-            company_id,
-            title,
-            slug,
-            f"Imported {block['pm_name']} job aid for {equipment_name}",
-            total_minutes,
-            block["category"],
-            created_by,
-        ))
+    for pm_code, pm_name, steps in pm_results:
 
-        # 2. Insert procedure steps
-        for step_num, step in enumerate(block["steps"], 1):
-            cur.execute("""
-                INSERT INTO procedures
-                    (id, company_id, job_aid_id, title, step,
-                     instruction, type, precautions, image,
-                     created_at, updated_at)
-                VALUES
-                    (%s::uuid, %s::uuid, %s::uuid, %s, %s,
-                     %s, 'procedure', %s, %s,
-                     NOW(), NOW())
-            """, (
-                str(uuid.uuid4()),
-                company_id,
-                job_aid_id,
-                step["title"],
-                step_num,
-                step["instruction"],
-                step["precautions"],
-                step["image_url"],
-            ))
+        # PM type header row (e.g. "PM2 - Lubrication")
+        header_cell = ws.cell(row=current_row, column=1, value=f"{pm_code} - {pm_name}")
+        header_cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+        header_cell.fill = HEADER_FILL
+        header_cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[current_row].height = 20
+        ws.merge_cells(
+            start_row=current_row, start_column=1,
+            end_row=current_row, end_column=len(COLUMNS)
+        )
+        current_row += 1
 
-        # 3. Link job aid to equipment node
-        cur.execute("""
-            INSERT INTO job_aid_equipment
-                (id, company_id, job_aid_id, equipment_id,
-                 created_at, updated_at)
-            VALUES
-                (%s::uuid, %s::uuid, %s::uuid, %s::uuid,
-                 NOW(), NOW())
-        """, (
-            str(uuid.uuid4()),
-            company_id,
-            job_aid_id,
-            equipment_id,
-        ))
+        # Column headers
+        for col_idx, col_name in enumerate(COLUMNS, 1):
+            cell           = ws.cell(row=current_row, column=col_idx, value=col_name)
+            cell.font      = SUBHEAD_FONT
+            cell.fill      = SUBHEAD_FILL
+            cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        ws.row_dimensions[current_row].height = 30
+        current_row += 1
 
-    log.info(f"Saved job aid {job_aid_id} ({title}) with {len(block['steps'])} steps")
-    return job_aid_id
+        # Data rows -- skipped naturally if steps is empty
+        for step in steps:
+            row_values = [
+                step.get("operation", ""),
+                step.get("task_list_description", ""),
+                step.get("frequency", ""),
+                step.get("hrs", ""),
+                step.get("work_needed", ""),
+                step.get("system_condition", ""),
+                step.get("material_number", ""),
+                step.get("component", ""),
+                step.get("instruction", ""),
+                step.get("failure_modes", ""),
+                "",  # Image -- left blank for reviewer to fill
+            ]
+            for col_idx, value in enumerate(row_values, 1):
+                cell           = ws.cell(row=current_row, column=col_idx, value=value)
+                cell.font      = DATA_FONT
+                cell.alignment = WRAP_ALIGN
+                cell.border    = None
+            ws.row_dimensions[current_row].height = 40
+            current_row += 1
+
+        # Spacer row between PM type blocks
+        current_row += 1
+
+    # Freeze the top row of the first block
+    ws.freeze_panes = "A3"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def ingest(
-    file_bytes: bytes,
-    equipment_id: str,
-    company_id: str,
-    created_by: str,
-) -> dict:
+async def generate(equipment_id: str, company_id: str) -> bytes:
     """
-    Full import pipeline called from the FastAPI endpoint.
-    1. Look up the equipment name for title prefixing
-    2. Parse Excel into PM type blocks
-    3. Save each block as a job aid with procedure steps
-    4. Return summary of created job aids
+    Full pipeline called from the FastAPI endpoint.
+    1. Fetch all manual chunks for the equipment
+    2. Run nine parallel Claude calls (one per PM type)
+    3. Build and return the Excel file as bytes
+       -- always returns a valid file even if all PM types are empty
     """
-    blocks = parse_excel(file_bytes)
+    manual_text = fetch_all_manual_chunks(equipment_id, company_id)
 
-    if not blocks:
-        raise ValueError(
-            "No valid PM strategy data found in the uploaded file. "
-            "Ensure the file follows the PM strategy template format."
-        )
+    bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
-    conn        = get_db_connection()
-    created_ids = []
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            call_claude_for_pm_type(client, bedrock, pm_code, pm_name, manual_text)
+            for pm_code, pm_name in PM_TYPES
+        ]
+        results = await asyncio.gather(*tasks)
 
-    try:
-        equipment_name = fetch_equipment_name(conn, equipment_id, company_id)
+    pm_results = list(results)
 
-        for block in blocks:
-            job_aid_id = save_block(
-                conn, block, equipment_id, equipment_name, company_id, created_by
-            )
-            created_ids.append({
-                "job_aid_id": job_aid_id,
-                "pm_code":    block["pm_code"],
-                "pm_name":    block["pm_name"],
-                "steps":      len(block["steps"]),
-            })
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    populated = sum(1 for _, _, steps in pm_results if steps)
+    log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
 
-    log.info(f"Import complete. {len(created_ids)} job aids created for equipment {equipment_id} ({equipment_name})")
-
-    return {
-        "equipment_id": equipment_id,
-        "equipment_name": equipment_name,
-        "job_aids_created": len(created_ids),
-        "job_aids": created_ids,
-    }
+    return build_excel(equipment_id, pm_results)

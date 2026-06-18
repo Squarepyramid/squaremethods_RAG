@@ -8,6 +8,10 @@ generate_pm_strategy.py after reviewer edits) and creates
 job aids and procedure steps in the database.
 
 One job aid is created per PM type block that contains rows.
+Job aid titles are prefixed with the equipment name so that
+job aids for different equipment are distinguishable, e.g.
+  "Wrapper 4 - PM2 - Lubrication"
+
 Steps with an Image column value get that URL stored in the
 procedures.image column. Steps with a blank Image column get
 image = NULL.
@@ -171,6 +175,29 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
     return blocks
 
 
+# ── Equipment lookup ──────────────────────────────────────────────────────────
+
+def fetch_equipment_name(conn, equipment_id: str, company_id: str) -> str:
+    """
+    Look up the equipment name so job aid titles can be prefixed with it,
+    e.g. "Wrapper 4 - PM2 - Lubrication" instead of just "PM2 - Lubrication".
+    Falls back to a generic label if the equipment cannot be found.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT name FROM equipment
+            WHERE id = %s::uuid
+            AND company_id = %s::uuid
+        """, (equipment_id, company_id))
+        row = cur.fetchone()
+
+    if row and row["name"]:
+        return row["name"]
+
+    log.warning(f"Equipment name not found for {equipment_id}, using fallback label")
+    return "Equipment"
+
+
 # ── Slug helper ───────────────────────────────────────────────────────────────
 
 def make_slug(title: str, unique_id: str) -> str:
@@ -186,15 +213,18 @@ def save_block(
     conn,
     block: dict,
     equipment_id: str,
+    equipment_name: str,
     company_id: str,
     created_by: str,
 ) -> str:
     """
     Insert one job aid and its procedure steps for a PM type block.
+    Title is prefixed with the equipment name, e.g.
+      "Wrapper 4 - PM2 - Lubrication"
     Returns the job_aid_id.
     """
     job_aid_id = str(uuid.uuid4())
-    title      = f"{block['pm_code']} - {block['pm_name']}"
+    title      = f"{equipment_name} - {block['pm_code']} - {block['pm_name']}"
     slug       = make_slug(title, job_aid_id)
 
     # estimated_duration = sum of all step durations in minutes
@@ -219,7 +249,7 @@ def save_block(
             company_id,
             title,
             slug,
-            f"Imported {block['pm_name']} job aid",
+            f"Imported {block['pm_name']} job aid for {equipment_name}",
             total_minutes,
             block["category"],
             created_by,
@@ -276,9 +306,10 @@ def ingest(
 ) -> dict:
     """
     Full import pipeline called from the FastAPI endpoint.
-    1. Parse Excel into PM type blocks
-    2. Save each block as a job aid with procedure steps
-    3. Return summary of created job aids
+    1. Look up the equipment name for title prefixing
+    2. Parse Excel into PM type blocks
+    3. Save each block as a job aid with procedure steps
+    4. Return summary of created job aids
     """
     blocks = parse_excel(file_bytes)
 
@@ -292,8 +323,12 @@ def ingest(
     created_ids = []
 
     try:
+        equipment_name = fetch_equipment_name(conn, equipment_id, company_id)
+
         for block in blocks:
-            job_aid_id = save_block(conn, block, equipment_id, company_id, created_by)
+            job_aid_id = save_block(
+                conn, block, equipment_id, equipment_name, company_id, created_by
+            )
             created_ids.append({
                 "job_aid_id": job_aid_id,
                 "pm_code":    block["pm_code"],
@@ -307,10 +342,11 @@ def ingest(
     finally:
         conn.close()
 
-    log.info(f"Import complete. {len(created_ids)} job aids created for equipment {equipment_id}")
+    log.info(f"Import complete. {len(created_ids)} job aids created for equipment {equipment_id} ({equipment_name})")
 
     return {
         "equipment_id": equipment_id,
+        "equipment_name": equipment_name,
         "job_aids_created": len(created_ids),
         "job_aids": created_ids,
     }
