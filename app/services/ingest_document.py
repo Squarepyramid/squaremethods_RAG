@@ -11,6 +11,7 @@ Key design decisions:
     can delete all chunks for a specific document without a separate column
   - Deleting a document removes only its chunks, not other documents
   - Deleting a node removes all chunks for that node
+  - Ingest runs as an async background job via SQS (see run_ingest_job)
 """
 
 import io
@@ -144,13 +145,11 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     rows     = []
 
     for i, chunk in enumerate(chunks):
-        # Prefix chunk with equipment_id and doc_id for filtering
         content   = f"equipment_id:{equipment_id} | doc_id:{doc_uuid} | {chunk}"
         embedding = get_embedding(content)
         emb_str   = "[" + ",".join(map(str, embedding)) + "]"
         record_id = str(uuid.uuid4())
 
-        # Stable unique UUID per chunk: derived from (doc_uuid, chunk_index)
         chunk_source_id = str(uuid.uuid5(uuid.UUID(doc_uuid), str(i)))
 
         rows.append((
@@ -179,13 +178,12 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     log.info(f"Saved {len(rows)} chunks for document {file_url}")
 
 
-# ── Main functions ────────────────────────────────────────────────────────────
+# ── Synchronous core (used by both sync and async entry points) ───────────────
 
-def ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
+def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     """
-    Ingest a document uploaded to an equipment or component node.
-    Multiple documents on the same node are handled independently.
-    Re-uploading the same file replaces only its chunks.
+    The actual ingest work. Shared by the synchronous ingest() function
+    and the async run_ingest_job() background runner.
     """
     log.info(f"Ingesting document for equipment {equipment_id}: {file_url}")
 
@@ -219,6 +217,53 @@ def ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
         "chunks":       len(chunks),
         "status":       "ingested"
     }
+
+
+# ── Main functions ────────────────────────────────────────────────────────────
+
+def ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
+    """
+    Synchronous ingest, kept for any direct/internal callers.
+    Most traffic should go through run_ingest_job via SQS instead.
+    """
+    return _run_ingest(file_url, equipment_id, company_id)
+
+
+def run_ingest_job(job_id: str, file_url: str, equipment_id: str, company_id: str):
+    """
+    Called when Lambda is triggered by SQS for a document_ingest job.
+    Runs the ingest, then updates the jobs table with the result.
+    """
+    try:
+        result = _run_ingest(file_url, equipment_id, company_id)
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'ready', result = %s::jsonb, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (psycopg2.extras.Json(result), job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        log.info(f"DOCUMENT INGEST JOB COMPLETE [{job_id}]")
+
+    except Exception as e:
+        log.error(f"DOCUMENT INGEST JOB ERROR [{job_id}]: {str(e)}")
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'failed', error = %s, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (str(e), job_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def delete_document(file_url: str, company_id: str) -> dict:

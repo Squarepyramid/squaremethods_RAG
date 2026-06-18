@@ -13,7 +13,10 @@ from app.services.retrieval import build_context
 from app.services.session import create_session, get_session, get_history, save_messages
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
-from app.services.ingest_document import ingest as ingest_document_service
+from app.services.ingest_document import (
+    ingest as ingest_document_service,
+    run_ingest_job,
+)
 from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 
@@ -22,7 +25,7 @@ root_path = os.getenv("ROOT_PATH", "")
 ALLOWED_IMAGE_TYPES  = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 S3_BUCKET            = os.getenv("S3_BUCKET", "squaremethods")
 AWS_REGION           = os.getenv("AWS_REGION", "ca-central-1")
-SQS_PM_STRATEGY_URL  = os.getenv("SQS_PM_STRATEGY_URL", "")
+SQS_JOBS_URL         = os.getenv("SQS_PM_STRATEGY_URL", "")
 
 app = FastAPI(
     title="SquareMethods RAG API",
@@ -111,8 +114,10 @@ def root():
             "health":               "/health",
             "chat":                 "/chat",
             "generate_job_aid":     "/job-aids/generate",
+            "ingest_document":      "/documents/ingest",
+            "ingest_status":        "/jobs/status/{job_id}",
             "generate_pm_strategy": "/pm-strategy/generate",
-            "pm_strategy_status":   "/pm-strategy/status/{job_id}",
+            "pm_strategy_status":   "/jobs/status/{job_id}",
             "import_pm_strategy":   "/pm-strategy/import",
             "docs":                 "/docs"
         }
@@ -242,20 +247,92 @@ def generate_job_aid(request: GenerateJobAidRequest):
 
 # ── Documents ─────────────────────────────────────────────────────────────────
 
-@app.post("/documents/ingest", status_code=201, tags=["Documents"])
+@app.post("/documents/ingest", status_code=202, tags=["Documents"])
 def ingest_document(request: IngestDocumentRequest):
+    """
+    Kick off async document ingestion.
+
+    Creates a background job and returns immediately with a job_id.
+    Poll GET /jobs/status/{job_id}?company_id={company_id}
+    every 3 seconds until status is 'ready' or 'failed'.
+
+    Returns: { job_id: string, status: "pending" }
+    """
+    conn = get_db_connection()
     try:
-        result = ingest_document_service(
-            file_url=request.file_url,
-            equipment_id=request.equipment_id,
-            company_id=request.company_id,
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pm_strategy_jobs (job_type, equipment_id, company_id, status)
+                VALUES ('document_ingest', %s::uuid, %s::uuid, 'pending')
+                RETURNING id
+            """, (request.equipment_id, request.company_id))
+            job_id = str(cur.fetchone()["id"])
+        conn.commit()
     except Exception as e:
-        print(f"INGEST DOCUMENT ERROR: {str(e)}")
+        print(f"DOCUMENT INGEST JOB CREATE ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+    sqs = boto3.client("sqs", region_name=AWS_REGION)
+    sqs.send_message(
+        QueueUrl    = SQS_JOBS_URL,
+        MessageBody = json.dumps({
+            "job_type":     "document_ingest",
+            "job_id":       job_id,
+            "file_url":     request.file_url,
+            "equipment_id": request.equipment_id,
+            "company_id":   request.company_id,
+        })
+    )
+
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/jobs/status/{job_id}", tags=["Jobs"])
+def job_status(job_id: str, company_id: str):
+    """
+    Generic status check for any async job (pm_strategy, document_ingest).
+
+    Returns:
+      { status: "pending" }
+      { status: "ready", result: {...} }            -- document_ingest
+      { status: "ready", download_url: "https://..." } -- pm_strategy
+      { status: "failed", error: "..." }
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT job_type, status, s3_key, result, error
+                FROM pm_strategy_jobs
+                WHERE id = %s::uuid
+                AND company_id = %s::uuid
+            """, (job_id, company_id))
+            job = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] == "failed":
+        return {"status": "failed", "error": job["error"]}
+
+    if job["status"] != "ready":
+        return {"status": "pending"}
+
+    # ready
+    if job["job_type"] == "pm_strategy" and job["s3_key"]:
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        download_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": job["s3_key"]},
+            ExpiresIn=300
+        )
+        return {"status": "ready", "download_url": download_url}
+
+    return {"status": "ready", "result": job["result"]}
 
 
 @app.delete("/documents/delete", tags=["Documents"])
@@ -288,9 +365,12 @@ def delete_node(request: DeleteNodeRequest):
 
 # ── PM Strategy ───────────────────────────────────────────────────────────────
 
-
-
 def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
+    """
+    Called when Lambda is triggered by SQS for a pm_strategy job.
+    Generates the PM strategy Excel and uploads it to S3.
+    Updates pm_strategy_jobs when done.
+    """
     import asyncio
 
     try:
@@ -333,6 +413,7 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
         finally:
             conn.close()
 
+
 @app.post("/pm-strategy/generate", status_code=202, tags=["PM Strategy"])
 async def generate_pm_strategy(
     equipment_id: str = Form(...),
@@ -342,7 +423,7 @@ async def generate_pm_strategy(
     Kick off async PM strategy generation.
 
     Creates a background job and returns immediately with a job_id.
-    Poll GET /pm-strategy/status/{job_id}?company_id={company_id}
+    Poll GET /jobs/status/{job_id}?company_id={company_id}
     every 3 seconds until status is 'ready', then use the
     download_url to auto-download the Excel file.
 
@@ -355,8 +436,8 @@ async def generate_pm_strategy(
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO pm_strategy_jobs (equipment_id, company_id, status)
-                VALUES (%s::uuid, %s::uuid, 'pending')
+                INSERT INTO pm_strategy_jobs (job_type, equipment_id, company_id, status)
+                VALUES ('pm_strategy', %s::uuid, %s::uuid, 'pending')
                 RETURNING id
             """, (equipment_id, company_id))
             job_id = str(cur.fetchone()["id"])
@@ -367,11 +448,11 @@ async def generate_pm_strategy(
     finally:
         conn.close()
 
-    # Push to SQS -- Lambda will be triggered automatically
     sqs = boto3.client("sqs", region_name=AWS_REGION)
     sqs.send_message(
-        QueueUrl    = SQS_PM_STRATEGY_URL,
+        QueueUrl    = SQS_JOBS_URL,
         MessageBody = json.dumps({
+            "job_type":     "pm_strategy",
             "job_id":       job_id,
             "equipment_id": equipment_id,
             "company_id":   company_id,
@@ -379,47 +460,6 @@ async def generate_pm_strategy(
     )
 
     return {"job_id": job_id, "status": "pending"}
-
-
-@app.get("/pm-strategy/status/{job_id}", tags=["PM Strategy"])
-def pm_strategy_status(job_id: str, company_id: str):
-    """
-    Poll this after calling POST /pm-strategy/generate.
-
-    Returns:
-      { status: "pending" }
-      { status: "ready", download_url: "https://..." }   presigned URL valid 5 min
-      { status: "failed", error: "..." }
-    """
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT status, s3_key, error
-                FROM pm_strategy_jobs
-                WHERE id = %s::uuid
-                AND company_id = %s::uuid
-            """, (job_id, company_id))
-            job = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if job["status"] == "ready":
-        s3 = boto3.client("s3", region_name=AWS_REGION)
-        download_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": job["s3_key"]},
-            ExpiresIn=300
-        )
-        return {"status": "ready", "download_url": download_url}
-
-    if job["status"] == "failed":
-        return {"status": "failed", "error": job["error"]}
-
-    return {"status": "pending"}
 
 
 @app.post("/pm-strategy/import", status_code=201, tags=["PM Strategy"])
@@ -436,8 +476,8 @@ async def import_pm_strategy(
     reviewer edits). Creates one job aid per PM type block that
     has data rows. Each job aid is linked to the equipment node.
 
-    Steps with a URL in the Image column get image_url stored.
-    Steps with a blank Image column get image_url = NULL.
+    Steps with a URL in the Image column get image stored.
+    Steps with a blank Image column get image = NULL.
 
     NOTE: Send as multipart/form-data, not JSON.
     Fields:
@@ -449,6 +489,7 @@ async def import_pm_strategy(
     Returns:
       {
         "equipment_id": "...",
+        "equipment_name": "...",
         "job_aids_created": 3,
         "job_aids": [
           { "job_aid_id": "...", "pm_code": "PM2", "pm_name": "Lubrication", "steps": 6 },
@@ -608,35 +649,34 @@ def delete_session(session_id: str, request: SessionRequest):
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
-
 _mangum_handler = Mangum(app, lifespan="off")
 
 
 def handler(event, context):
-    import asyncio
-
-    # SQS trigger for background PM strategy jobs
     try:
         records = event.get("Records", [])
         if records and records[0].get("eventSource") == "aws:sqs":
-            body = json.loads(records[0]["body"])
-            run_pm_strategy_job(
-                job_id       = body["job_id"],
-                equipment_id = body["equipment_id"],
-                company_id   = body["company_id"],
-            )
+            body     = json.loads(records[0]["body"])
+            job_type = body.get("job_type")
+
+            if job_type == "pm_strategy":
+                run_pm_strategy_job(
+                    job_id       = body["job_id"],
+                    equipment_id = body["equipment_id"],
+                    company_id   = body["company_id"],
+                )
+            elif job_type == "document_ingest":
+                run_ingest_job(
+                    job_id       = body["job_id"],
+                    file_url     = body["file_url"],
+                    equipment_id = body["equipment_id"],
+                    company_id   = body["company_id"],
+                )
+            else:
+                print(f"UNKNOWN JOB TYPE: {job_type}")
+
             return {"status": "done"}
     except (KeyError, json.JSONDecodeError) as e:
         print(f"SQS ROUTING ERROR: {e}")
 
-    # Reset event loop before handing to Mangum
-    # Prevents "Event loop is closed" if a previous SQS invocation closed it
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            asyncio.set_event_loop(asyncio.new_event_loop())
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-    # Normal API Gateway traffic
     return _mangum_handler(event, context)
