@@ -243,7 +243,7 @@ def save_block(
                 step_num,
                 step["instruction"],
                 step["precautions"],
-                step["image_url"],
+                step["image"],
             ))
 
         # 3. Link job aid to equipment node
