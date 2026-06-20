@@ -169,8 +169,6 @@ EQUIPMENT MANUAL:
 
 
 
-
-
 async def call_claude_for_pm_type(
     client: httpx.AsyncClient,
     bedrock,
@@ -188,20 +186,34 @@ async def call_claude_for_pm_type(
         ],
     })
 
-    try:
-        loop     = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: bedrock.invoke_model(
-                modelId     = BEDROCK_MODEL,
-                body        = body,
-                contentType = "application/json",
-                accept      = "application/json",
-            )
-        )
-        raw = json.loads(response["body"].read())
-        log.info(f"{pm_code} RAW BEDROCK RESPONSE: {json.dumps(raw)[:2000]}")
+    log.info(f"{pm_code} PROMPT LENGTH (chars): {len(prompt)}")
 
+    try:
+        loop = asyncio.get_event_loop()
+
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: bedrock.invoke_model(
+                    modelId     = BEDROCK_MODEL,
+                    body        = body,
+                    contentType = "application/json",
+                    accept      = "application/json",
+                )
+            )
+        except Exception as invoke_err:
+            log.error(f"{pm_code} INVOKE_MODEL FAILED: {type(invoke_err).__name__}: {invoke_err}")
+            raise
+
+        try:
+            raw_body = response["body"].read()
+            log.info(f"{pm_code} RAW BODY LENGTH: {len(raw_body)} bytes")
+            log.info(f"{pm_code} RAW BODY PREVIEW: {raw_body[:500]}")
+        except Exception as read_err:
+            log.error(f"{pm_code} BODY READ FAILED: {type(read_err).__name__}: {read_err}")
+            raise
+
+        raw = json.loads(raw_body)
         raw_text = raw["content"][0]["text"].strip()
         clean = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         steps = json.loads(clean)
@@ -213,9 +225,9 @@ async def call_claude_for_pm_type(
         return pm_code, pm_name, steps
 
     except Exception as e:
-        log.error(f"Claude call failed for {pm_code} ({pm_name}): {e}")
+        log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
         return pm_code, pm_name, []
-    
+   
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
