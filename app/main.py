@@ -649,10 +649,14 @@ def delete_session(session_id: str, request: SessionRequest):
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
+# ── Lambda handler ────────────────────────────────────────────────────────────
+
 _mangum_handler = Mangum(app, lifespan="off")
 
 
 def handler(event, context):
+    import asyncio
+
     try:
         records = event.get("Records", [])
         if records and records[0].get("eventSource") == "aws:sqs":
@@ -679,4 +683,15 @@ def handler(event, context):
     except (KeyError, json.JSONDecodeError) as e:
         print(f"SQS ROUTING ERROR: {e}")
 
+    # Always ensure a usable event loop exists before handing off to Mangum.
+    # Background jobs (asyncio.run) can leave the thread without one on
+    # Python 3.10+, which raises instead of auto-creating a new loop.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     return _mangum_handler(event, context)
+
+
+ 
