@@ -168,6 +168,9 @@ EQUIPMENT MANUAL:
 {manual_text}"""
 
 
+
+
+
 async def call_claude_for_pm_type(
     client: httpx.AsyncClient,
     bedrock,
@@ -175,10 +178,6 @@ async def call_claude_for_pm_type(
     pm_name: str,
     manual_text: str,
 ) -> tuple[str, str, list]:
-    """
-    Call Claude via Bedrock for one PM type.
-    Returns (pm_code, pm_name, list_of_step_dicts).
-    """
     prompt = build_pm_prompt(pm_code, pm_name, manual_text)
 
     body = json.dumps({
@@ -200,10 +199,10 @@ async def call_claude_for_pm_type(
                 accept      = "application/json",
             )
         )
-        raw      = json.loads(response["body"].read())
-        raw_text = raw["content"][0]["text"].strip()
+        raw = json.loads(response["body"].read())
+        log.info(f"{pm_code} RAW BEDROCK RESPONSE: {json.dumps(raw)[:2000]}")
 
-        # Strip markdown fences if present
+        raw_text = raw["content"][0]["text"].strip()
         clean = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         steps = json.loads(clean)
 
@@ -216,8 +215,7 @@ async def call_claude_for_pm_type(
     except Exception as e:
         log.error(f"Claude call failed for {pm_code} ({pm_name}): {e}")
         return pm_code, pm_name, []
-
-
+    
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
