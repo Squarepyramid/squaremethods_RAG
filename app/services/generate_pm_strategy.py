@@ -169,6 +169,7 @@ EQUIPMENT MANUAL:
 
 
 
+
 async def call_claude_for_pm_type(
     client: httpx.AsyncClient,
     bedrock,
@@ -176,7 +177,9 @@ async def call_claude_for_pm_type(
     pm_name: str,
     manual_text: str,
 ) -> tuple[str, str, list]:
+    print(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
     prompt = build_pm_prompt(pm_code, pm_name, manual_text)
+    print(f"{pm_code} PROMPT BUILT, length={len(prompt)}")
 
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
