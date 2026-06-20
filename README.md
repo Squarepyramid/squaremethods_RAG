@@ -350,6 +350,7 @@ curl ifconfig.me
      -p 5432
 
 
+
   # To see thee tables on the DB
 SELECT table_name 
 FROM information_schema.tables 

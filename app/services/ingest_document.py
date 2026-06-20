@@ -12,12 +12,15 @@ Key design decisions:
   - Deleting a document removes only its chunks, not other documents
   - Deleting a node removes all chunks for that node
   - Ingest runs as an async background job via SQS (see run_ingest_job)
+  - Embeddings are generated concurrently in bounded batches to handle
+    large documents (50+ pages) within the Lambda timeout window
 """
 
 import io
 import uuid
 import hashlib
 import logging
+import asyncio
 import requests
 
 import psycopg2.extras
@@ -27,8 +30,9 @@ from app.services.embeddings import get_embedding
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE    = 500   # approximate words per chunk
-CHUNK_OVERLAP = 50    # words overlap between chunks
+CHUNK_SIZE         = 500   # approximate words per chunk
+CHUNK_OVERLAP      = 50    # words overlap between chunks
+EMBED_CONCURRENCY  = 10    # max simultaneous embedding calls in flight
 
 
 # ── File URL to stable UUID ───────────────────────────────────────────────────
@@ -133,6 +137,37 @@ def clear_node_chunks(conn, equipment_id: str, company_id: str):
     return deleted
 
 
+# ── Concurrent embedding ───────────────────────────────────────────────────────
+
+async def _embed_one(executor_loop, semaphore, index: int, content: str):
+    """
+    Embed a single chunk, bounded by a semaphore so we never have more
+    than EMBED_CONCURRENCY calls in flight at once. Runs the blocking
+    get_embedding() call in a thread executor so it doesn't block the loop.
+    """
+    async with semaphore:
+        embedding = await executor_loop.run_in_executor(None, get_embedding, content)
+        return index, embedding
+
+
+async def embed_chunks_concurrently(contents: list) -> list:
+    """
+    Embed all chunk contents concurrently, bounded by EMBED_CONCURRENCY.
+    Returns embeddings in the same order as the input contents list.
+    """
+    loop      = asyncio.get_event_loop()
+    semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
+
+    tasks = [
+        _embed_one(loop, semaphore, i, content)
+        for i, content in enumerate(contents)
+    ]
+
+    results = await asyncio.gather(*tasks)
+    results.sort(key=lambda r: r[0])
+    return [embedding for _, embedding in results]
+
+
 def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id: str):
     """
     Embed and save all chunks. Each chunk gets:
@@ -140,16 +175,26 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
         so re-ingesting the same file produces the same chunk UUIDs
       - a content prefix with equipment_id and doc_id for node-scoped
         retrieval and document-scoped deletion
+
+    Embeddings are generated concurrently (bounded by EMBED_CONCURRENCY)
+    instead of one at a time, so large documents (50-100+ pages) complete
+    well within the Lambda timeout window.
     """
     doc_uuid = url_to_uuid(file_url)
-    rows     = []
 
-    for i, chunk in enumerate(chunks):
-        content   = f"equipment_id:{equipment_id} | doc_id:{doc_uuid} | {chunk}"
-        embedding = get_embedding(content)
+    contents = [
+        f"equipment_id:{equipment_id} | doc_id:{doc_uuid} | {chunk}"
+        for chunk in chunks
+    ]
+
+    log.info(f"Embedding {len(contents)} chunks with concurrency={EMBED_CONCURRENCY}...")
+    embeddings = asyncio.run(embed_chunks_concurrently(contents))
+    log.info(f"Finished embedding {len(embeddings)} chunks.")
+
+    rows = []
+    for i, (content, embedding) in enumerate(zip(contents, embeddings)):
         emb_str   = "[" + ",".join(map(str, embedding)) + "]"
         record_id = str(uuid.uuid4())
-
         chunk_source_id = str(uuid.uuid5(uuid.UUID(doc_uuid), str(i)))
 
         rows.append((
@@ -161,9 +206,6 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
             emb_str,
         ))
 
-        if (i + 1) % 20 == 0:
-            log.info(f"Embedded {i + 1} / {len(chunks)} chunks...")
-
     sql = """
         INSERT INTO knowledge_embeddings
             (id, company_id, source_type, source_id, content, embedding,
@@ -172,7 +214,8 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     """
     psycopg2.extras.execute_values(
         conn.cursor(), sql, rows,
-        template="(%s, %s::uuid, %s, %s::uuid, %s, %s::vector, NOW(), NOW())"
+        template="(%s, %s::uuid, %s, %s::uuid, %s, %s::vector, NOW(), NOW())",
+        page_size=100,
     )
     conn.commit()
     log.info(f"Saved {len(rows)} chunks for document {file_url}")

@@ -7,6 +7,7 @@ from typing import List, Optional
 import os
 import json
 import boto3
+import psycopg2.extras
 
 from app.services.bedrock_client import ask_bedrock
 from app.services.retrieval import build_context
@@ -247,25 +248,39 @@ def generate_job_aid(request: GenerateJobAidRequest):
 
 # ── Documents ─────────────────────────────────────────────────────────────────
 
+
+
+
 @app.post("/documents/ingest", status_code=202, tags=["Documents"])
 def ingest_document(request: IngestDocumentRequest):
     """
     Kick off async document ingestion.
 
     Creates a background job and returns immediately with a job_id.
-    Poll GET /jobs/status/{job_id}?company_id={company_id}
-    every 3 seconds until status is 'ready' or 'failed'.
+    Poll GET /documents/ingest/status?equipment_id={equipment_id}&company_id={company_id}
+    to see status of all ingest jobs for that equipment node.
 
     Returns: { job_id: string, status: "pending" }
     """
+    filename = request.file_url.split("/")[-1].split("?")[0]
+
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO pm_strategy_jobs (job_type, equipment_id, company_id, status)
-                VALUES ('document_ingest', %s::uuid, %s::uuid, 'pending')
+                INSERT INTO pm_strategy_jobs
+                    (job_type, equipment_id, company_id, status, payload)
+                VALUES
+                    ('document_ingest', %s::uuid, %s::uuid, 'pending', %s::jsonb)
                 RETURNING id
-            """, (request.equipment_id, request.company_id))
+            """, (
+                request.equipment_id,
+                request.company_id,
+                psycopg2.extras.Json({
+                    "file_url": request.file_url,
+                    "filename": filename,
+                }),
+            ))
             job_id = str(cur.fetchone()["id"])
         conn.commit()
     except Exception as e:
@@ -287,6 +302,79 @@ def ingest_document(request: IngestDocumentRequest):
     )
 
     return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/documents/ingest/status", tags=["Documents"])
+def list_ingest_jobs(equipment_id: str, company_id: str, limit: int = 20):
+    """
+    List recent document_ingest jobs for an equipment node, most recent first.
+
+    Lets the frontend show ingestion status per document without needing
+    to track individual job_ids client-side. The original file_url and
+    filename are visible immediately (from payload), even before the job
+    completes. Once ready, chunks/words are available from result.
+    If a job's status is 'failed', the frontend can surface the error
+    and let the user retrigger the ingest via POST /documents/ingest
+    using the same file_url.
+
+    Returns:
+      {
+        "equipment_id": "...",
+        "company_id": "...",
+        "jobs": [
+          {
+            "job_id": "...",
+            "status": "ready" | "pending" | "failed",
+            "file_url": "...",
+            "filename": "...",
+            "chunks": 142,
+            "words": 38210,
+            "error": "...",
+            "created_at": "...",
+            "updated_at": "..."
+          },
+          ...
+        ]
+      }
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, status, payload, result, error, created_at, updated_at
+                FROM pm_strategy_jobs
+                WHERE job_type = 'document_ingest'
+                AND equipment_id = %s::uuid
+                AND company_id = %s::uuid
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (equipment_id, company_id, limit))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    jobs = []
+    for row in rows:
+        payload = row["payload"] or {}
+        result  = row["result"] or {}
+        jobs.append({
+            "job_id":     str(row["id"]),
+            "status":     row["status"],
+            "file_url":   payload.get("file_url"),
+            "filename":   result.get("filename") or payload.get("filename"),
+            "chunks":     result.get("chunks"),
+            "words":      result.get("words"),
+            "error":      row["error"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        })
+
+    return {
+        "equipment_id": equipment_id,
+        "company_id":   company_id,
+        "jobs":         jobs,
+    }
+
 
 
 @app.get("/jobs/status/{job_id}", tags=["Jobs"])
