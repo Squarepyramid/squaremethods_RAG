@@ -28,6 +28,9 @@ S3_BUCKET            = os.getenv("S3_BUCKET", "squaremethods")
 AWS_REGION           = os.getenv("AWS_REGION", "ca-central-1")
 SQS_JOBS_URL         = os.getenv("SQS_PM_STRATEGY_URL", "")
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(
     title="SquareMethods RAG API",
     version="1.0.0",
