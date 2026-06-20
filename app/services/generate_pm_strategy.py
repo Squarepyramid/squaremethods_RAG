@@ -218,8 +218,25 @@ async def call_claude_for_pm_type(
 
         raw = json.loads(raw_body)
         raw_text = raw["content"][0]["text"].strip()
-        clean = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        steps = json.loads(clean)
+
+        # Claude sometimes prepends explanatory text before the JSON array
+        # (e.g. "Based on the equipment manual provided, here are the
+        # maintenance tasks..."), despite being instructed to return only
+        # JSON. Extract the array substring directly instead of assuming
+        # the entire response is valid JSON.
+        start_bracket = raw_text.find("[")
+        end_bracket   = raw_text.rfind("]")
+
+        if start_bracket != -1 and end_bracket != -1 and end_bracket > start_bracket:
+            json_str = raw_text[start_bracket:end_bracket + 1]
+            try:
+                steps = json.loads(json_str)
+            except json.JSONDecodeError as parse_err:
+                log.error(f"{pm_code} JSON parse failed after extraction: {parse_err}. Extracted: {json_str[:300]}")
+                steps = []
+        else:
+            log.warning(f"{pm_code} no JSON array found in response, treating as empty. Raw text: {raw_text[:300]}")
+            steps = []
 
         if not isinstance(steps, list):
             steps = []
@@ -229,8 +246,7 @@ async def call_claude_for_pm_type(
 
     except Exception as e:
         log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
-        return pm_code, pm_name, []
-   
+        return pm_code, pm_name, []   
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
