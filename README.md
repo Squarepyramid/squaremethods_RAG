@@ -362,6 +362,7 @@ ORDER BY table_name;
 \dt
 # view what is in table
 SELECT * FROM equipment_type_defaults LIMIT 10;
+SELECT COUNT(*) FROM equipment_type_defaults;
 
 SELECT COUNT(*) FROM knowledge_embeddings;
 
