@@ -349,7 +349,10 @@ curl ifconfig.me
      -d squaremethods \
      -p 5432
 
-# git pull --rebase origin main
+# To sync the excel file that is uploaded from github
+git pull --rebase origin main
+
+Then commit and sync
 
   # To see thee tables on the DB
 SELECT table_name 
