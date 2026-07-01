@@ -21,6 +21,7 @@ Usage:
 
 import uuid
 import re
+import hashlib
 import argparse
 import logging
 
@@ -55,13 +56,39 @@ def make_slug(name: str) -> str:
 
 def load_all_components(filepath: str) -> list:
     df = pd.read_excel(filepath, sheet_name=SHEET_DROPDOWN)
-    components = sorted(df["COMPONENT"].dropna().str.strip().unique().tolist())
-    log.info(f"Loaded {len(components)} component types from dropdown.")
+    raw = df["COMPONENT"].dropna().str.strip().tolist()
+
+    # Detect duplicates (case-insensitive) and warn
+    seen = {}
+    duplicates = []
+    for name in raw:
+        key = name.lower()
+        if key in seen:
+            duplicates.append(f"'{name}' (already seen as '{seen[key]}')")
+        else:
+            seen[key] = name
+
+    if duplicates:
+        log.warning(f"Duplicate components found in Dropdown options sheet — these will be ignored:")
+        for d in duplicates:
+            log.warning(f"  DUPLICATE: {d}")
+
+    # Deduplicate keeping first occurrence, preserve original casing
+    seen_keys = set()
+    components = []
+    for name in raw:
+        key = name.lower()
+        if key not in seen_keys:
+            seen_keys.add(key)
+            components.append(name)
+
+    components = sorted(components)
+    log.info(f"Loaded {len(components)} unique component types from dropdown.")
     return components
 
 
 def load_tasks(filepath: str, valid_components: set) -> pd.DataFrame:
-    df = pd.read_excel(filepath, sheet_name=SHEET_TASKS)
+    df = pd.read_excel(filepath, sheet_name=SHEET_TASKS, header=1)
     df.columns = [str(c).strip() for c in df.columns]
     df["Component"] = df["Component"].astype(str).str.strip()
     df = df[df["Component"].isin(valid_components)].copy()
@@ -72,7 +99,7 @@ def load_tasks(filepath: str, valid_components: set) -> pd.DataFrame:
 
 def load_working_principle(filepath: str, valid_components: set) -> pd.DataFrame:
     try:
-        df = pd.read_excel(filepath, sheet_name=SHEET_WP)
+        df = pd.read_excel(filepath, sheet_name=SHEET_WP, header=1)
     except Exception:
         log.warning(f"Sheet '{SHEET_WP}' not found. Skipping working principle indexing.")
         return pd.DataFrame()
@@ -165,35 +192,37 @@ def sync_equipment_type_defaults(conn, components: list, dry_run: bool):
         for name in components:
             slug = make_slug(name)
 
-            # Update if exists (including restoring soft-deleted rows)
+            # Update existing row if name matches (restores soft-deleted too)
             cur.execute("""
                 UPDATE equipment_type_defaults
                 SET slug       = %s,
                     is_active  = true,
                     deleted_at = NULL,
                     updated_at = NOW()
-                WHERE name = %s
+                WHERE LOWER(name) = LOWER(%s)
             """, (slug, name))
 
-            # Insert only if no row exists with this name
+            # Insert only if no row with this name exists (case-insensitive)
             cur.execute("""
                 INSERT INTO equipment_type_defaults
                     (id, name, slug, is_active, created_at, updated_at)
                 SELECT gen_random_uuid(), %s, %s, true, NOW(), NOW()
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM equipment_type_defaults WHERE name = %s
+                    SELECT 1 FROM equipment_type_defaults
+                    WHERE LOWER(name) = LOWER(%s)
                 )
             """, (name, slug, name))
 
-        # Soft-delete anything not in the Excel
+        # Soft-delete anything not in the Excel (case-insensitive)
+        lower_components = [c.lower() for c in components]
         cur.execute("""
             UPDATE equipment_type_defaults
             SET is_active  = false,
                 deleted_at = NOW(),
                 updated_at = NOW()
-            WHERE name NOT IN %s
+            WHERE LOWER(name) NOT IN %s
               AND deleted_at IS NULL
-        """, (tuple(components),))
+        """, (tuple(lower_components),))
 
         cur.execute("""
             SELECT
@@ -202,29 +231,47 @@ def sync_equipment_type_defaults(conn, components: list, dry_run: bool):
             FROM equipment_type_defaults
         """)
         result = cur.fetchone()
-        log.info(f"equipment_type_defaults — active: {result[0]}, soft-deleted: {result[1]}")
+        log.info(f"equipment_type_defaults — active: {result['active']}, soft-deleted: {result['soft_deleted']}")
 
     conn.commit()
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-def clear_source_type(conn, source_type: str):
+def load_existing_hashes(conn, source_type: str) -> set:
+    """Return the set of content_hash values already stored for this source_type."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT content_hash FROM knowledge_embeddings
+            WHERE source_type = %s
+              AND company_id  = %s::uuid
+              AND content_hash IS NOT NULL
+        """, (source_type, SHARED_COMPANY_ID))
+        return {row['content_hash'] for row in cur.fetchall()}
+
+
+def delete_stale_records(conn, source_type: str, current_hashes: set):
+    """Remove records whose content_hash is no longer in the current Excel."""
+    if not current_hashes:
+        return
     with conn.cursor() as cur:
         cur.execute("""
             DELETE FROM knowledge_embeddings
             WHERE source_type = %s
               AND company_id  = %s::uuid
-        """, (source_type, SHARED_COMPANY_ID))
+              AND content_hash NOT IN %s
+        """, (source_type, SHARED_COMPANY_ID, tuple(current_hashes)))
+        deleted = cur.rowcount
     conn.commit()
-    log.info(f"Cleared existing '{source_type}' records from knowledge_embeddings.")
+    if deleted:
+        log.info(f"Removed {deleted} stale '{source_type}' records no longer in Excel.")
 
 
 def flush_batch(conn, batch: list):
     sql = """
         INSERT INTO knowledge_embeddings
             (id, company_id, source_type, source_id, content, embedding,
-             created_at, updated_at)
+             content_hash, created_at, updated_at)
         VALUES %s
     """
     psycopg2.extras.execute_values(conn.cursor(), sql, batch)
@@ -239,12 +286,22 @@ def index_records(conn, records: list, source_type: str, label: str, dry_run: bo
             print(content)
         return
 
-    clear_source_type(conn, source_type)
+    # Load hashes already in the DB for this source_type
+    existing_hashes = load_existing_hashes(conn, source_type)
 
-    batch   = []
-    indexed = 0
+    batch     = []
+    indexed   = 0
+    skipped   = 0
+    new_hashes = set()
 
     for component_type, content in records:
+        h = hashlib.md5(content.encode()).hexdigest()
+        new_hashes.add(h)
+
+        if h in existing_hashes:
+            skipped += 1
+            continue  # Content unchanged — skip Bedrock call
+
         embedding = get_embedding(content)
         emb_str   = "[" + ",".join(map(str, embedding)) + "]"
         record_id = str(uuid.uuid4())
@@ -256,6 +313,7 @@ def index_records(conn, records: list, source_type: str, label: str, dry_run: bo
             record_id,
             content,
             emb_str,
+            h,
             "NOW()",
             "NOW()",
         ))
@@ -270,7 +328,10 @@ def index_records(conn, records: list, source_type: str, label: str, dry_run: bo
         flush_batch(conn, batch)
         indexed += len(batch)
 
-    log.info(f"{label} — complete. {indexed} records inserted.")
+    # Remove any records in the DB that are no longer in the Excel
+    delete_stale_records(conn, source_type, new_hashes)
+
+    log.info(f"{label} — complete. {indexed} new, {skipped} unchanged (skipped).")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
