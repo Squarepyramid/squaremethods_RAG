@@ -17,6 +17,8 @@ Excel is always master. Run this any time the file changes.
 Usage:
     PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx --dry-run
     PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx
+    PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py \
+  --file app/SquareMethods_Import_Template.xlsx
 """
 
 import uuid

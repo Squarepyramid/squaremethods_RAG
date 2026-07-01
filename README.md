@@ -349,7 +349,7 @@ curl ifconfig.me
      -d squaremethods \
      -p 5432
 
-
+# git pull --rebase origin main
 
   # To see thee tables on the DB
 SELECT table_name 
