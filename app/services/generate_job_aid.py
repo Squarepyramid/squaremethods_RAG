@@ -385,8 +385,13 @@ def generate(
         f"component '{component_type}' on equipment {equipment_id}"
     )
 
-    return {
-        "equipment_id":     equipment_id,
-        "job_aids_created": len(created),
-        "job_aids":         created,
-    }
+    # Return the PM job aid in the original JobAidOut shape so the frontend
+    # routes correctly without any changes. The WP job aid is saved to DB
+    # and appears in the job aids list linked to the same equipment node.
+    # If only WP was generated, return that instead.
+    primary_id = created[0]["job_aid_id"]
+    conn2 = get_db_connection()
+    try:
+        return fetch_job_aid(conn2, primary_id, company_id)
+    finally:
+        conn2.close()

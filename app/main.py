@@ -105,17 +105,6 @@ class JobAidOut(BaseModel):
     status:             str
     procedures:         List[ProcedureOut]
 
-class JobAidSummary(BaseModel):
-    job_aid_id: str
-    category:   str
-    title:      str
-    steps:      int
-
-class GenerateJobAidOut(BaseModel):
-    equipment_id:     str
-    job_aids_created: int
-    job_aids:         List[JobAidSummary]
-
 
 # ── Root and health ───────────────────────────────────────────────────────────
 
@@ -243,7 +232,7 @@ Assistant:"""
 
 # ── Job aid generation ────────────────────────────────────────────────────────
 
-@app.post("/job-aids/generate", response_model=GenerateJobAidOut, status_code=201, tags=["Job Aid Generation"])
+@app.post("/job-aids/generate", response_model=JobAidOut, status_code=201, tags=["Job Aid Generation"])
 def generate_job_aid(request: GenerateJobAidRequest):
     try:
         result = generate_job_aid_service(
