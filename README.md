@@ -437,6 +437,10 @@ aws lambda update-function-code \
 
   # the run the indexer
 
+
+git pull --rebase origin main
+
+
 dry run
 PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --file app/squaremethods_import.xlsx --dry-run
 
@@ -445,6 +449,8 @@ PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py --f
 
 
 
+ PYTHONPATH=/workspaces/squaremethods_RAG python app/squaremethods_indexer.py \
+  --file app/SquareMethods_Import_Template.xlsx
 
 # equipment id
 1d3c6ad8-7795-4b3d-ad36-198e8a3620f7
