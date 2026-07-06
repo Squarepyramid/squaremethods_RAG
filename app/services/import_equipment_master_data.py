@@ -8,6 +8,13 @@ per equipment) and creates locations, equipment_types, and equipment
 directly in the database. No async ingestion queue -- runs
 synchronously end to end, called from a FastAPI endpoint.
 
+Skip-and-report, not all-or-nothing: a row with a problem (duplicate
+reference_code, missing required field, a malformed location path)
+is skipped and reported, it does not block the rest of the file from
+importing. Every row runs inside its own SAVEPOINT so an unexpected
+DB error on one row only rolls back that row. Everything that
+succeeds across the whole file is committed together at the end.
+
 Template shape: any number of leading "Location Name" columns
 (depth is however many are present, not fixed), followed by
 "Equipment Name *", "Equipment Type Name *", "Reference Code *",
@@ -21,6 +28,8 @@ Location path rules:
     happen to be named "Mixing Line"), not a stop signal.
   - A blank path (all location columns empty) means the equipment
     has no location.
+  - A blank column followed by a filled one is a gap -- that row is
+    skipped and reported rather than guessed at.
   - The same name can appear in different branches or at different
     depths across rows and refers to different location nodes each
     time -- identity is the full path (name + its parent chain),
@@ -139,10 +148,19 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
                 hit_blank = True
 
         if gap_found:
-            raise ValueError(
-                f"Row {row_number}: location path has a blank column followed by a "
-                f"filled one. Fill location columns left to right with no gaps."
-            )
+            equipment.append({
+                "path": [],
+                "equipment_name": name,
+                "type_name": "",
+                "reference_code": "",
+                "notes": None,
+                "row_number": row_number,
+                "parse_error": (
+                    "location path has a blank column followed by a filled one. "
+                    "Fill location columns left to right with no gaps."
+                ),
+            })
+            continue
 
         type_name = row[idx["Equipment Type Name *"]]
         type_name = str(type_name).strip() if type_name is not None else ""
@@ -160,33 +178,32 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
             "reference_code": reference_code,
             "notes": notes,
             "row_number": row_number,
+            "parse_error": None,
         })
 
     log.info(f"Parsed {len(equipment)} equipment rows ({n_loc} location columns detected)")
     return equipment
 
 
-# ── Validation (within-file checks only; DB checks happen during save) ───────
+# ── Row-level checks (used per-row inside save_equipment, not import-blocking) ─
 
-def validate(equipment: list[dict]) -> list[str]:
-    errors = []
-    seen_codes = set()
-
-    for e in equipment:
-        row = e["row_number"]
-        if not e["reference_code"]:
-            errors.append(f"Row {row}: Reference Code is required.")
-        elif e["reference_code"] in seen_codes:
-            errors.append(f"Row {row}: duplicate Reference Code '{e['reference_code']}' within file.")
-        else:
-            seen_codes.add(e["reference_code"])
-
-        if not e["type_name"]:
-            errors.append(f"Row {row}: Equipment Type Name is required.")
-        if not e["equipment_name"]:
-            errors.append(f"Row {row}: Equipment Name is required.")
-
-    return errors
+def row_issue(e: dict, existing_ref_codes: set) -> Optional[str]:
+    """
+    Returns a human-readable reason this row should be skipped, or
+    None if the row is fine to insert. Checked per-row so one bad
+    row never blocks the rest of the file.
+    """
+    if e.get("parse_error"):
+        return e["parse_error"]
+    if not e["reference_code"]:
+        return "Reference Code is required."
+    if e["reference_code"] in existing_ref_codes:
+        return f"reference_code '{e['reference_code']}' already exists for this company."
+    if not e["type_name"]:
+        return "Equipment Type Name is required."
+    if not e["equipment_name"]:
+        return "Equipment Name is required."
+    return None
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -290,11 +307,18 @@ def resolve_or_create_equipment_type(conn, type_name: str, company_id: str, type
     return new_id
 
 
-def save_equipment(conn, equipment: list[dict], company_id: str) -> list[dict]:
+def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
     """
-    Resolves each row's location path and equipment type, enforces
-    reference_code uniqueness per company, and inserts equipment.
-    Returns a summary list of created equipment.
+    Resolves each row's location path and equipment type, then inserts
+    equipment -- skipping (not aborting) any row with a problem, such
+    as a duplicate reference_code or a missing required field.
+
+    Each row runs inside its own SAVEPOINT so a failure on one row
+    (a constraint violation, an unexpected DB error, etc.) only rolls
+    back that row; every other row in the file still gets processed
+    and the successful ones are committed at the end.
+
+    Returns {"created": [...], "skipped": [...]}.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -306,43 +330,70 @@ def save_equipment(conn, equipment: list[dict], company_id: str) -> list[dict]:
     location_cache: dict = {}
     type_id_map: dict = {}
     created = []
+    skipped = []
 
-    for e in equipment:
-        if e["reference_code"] in existing_ref_codes:
-            raise ValueError(
-                f"Row {e['row_number']}: reference_code '{e['reference_code']}' "
-                f"already exists for this company."
+    for i, e in enumerate(equipment):
+        savepoint = f"row_{i}"
+        issue = row_issue(e, existing_ref_codes)
+        if issue:
+            skipped.append({
+                "row_number": e["row_number"],
+                "name": e["equipment_name"],
+                "reference_code": e["reference_code"] or None,
+                "reason": issue,
+            })
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {savepoint}")
+
+        try:
+            location_id = resolve_location_path(conn, e["path"], company_id, location_cache)
+            equipment_type_id = resolve_or_create_equipment_type(
+                conn, e["type_name"], company_id, type_id_map
             )
 
-        location_id = resolve_location_path(conn, e["path"], company_id, location_cache)
-        equipment_type_id = resolve_or_create_equipment_type(
-            conn, e["type_name"], company_id, type_id_map
-        )
+            new_id = str(uuid.uuid4())
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO equipment
+                        (id, company_id, equipment_type_id, location_id, name,
+                         reference_code, notes, status, created_at, updated_at)
+                    VALUES
+                        (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s,
+                         %s, %s, 'draft', NOW(), NOW())
+                """, (
+                    new_id, company_id, equipment_type_id, location_id,
+                    e["equipment_name"], e["reference_code"], e["notes"],
+                ))
 
-        new_id = str(uuid.uuid4())
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO equipment
-                    (id, company_id, equipment_type_id, location_id, name,
-                     reference_code, notes, status, created_at, updated_at)
-                VALUES
-                    (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s,
-                     %s, %s, 'draft', NOW(), NOW())
-            """, (
-                new_id, company_id, equipment_type_id, location_id,
-                e["equipment_name"], e["reference_code"], e["notes"],
-            ))
+            with conn.cursor() as cur:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
 
-        existing_ref_codes.add(e["reference_code"])
-        created.append({
-            "equipment_id": new_id,
-            "name": e["equipment_name"],
-            "reference_code": e["reference_code"],
-            "location_path": " > ".join(e["path"]) if e["path"] else None,
-        })
+            existing_ref_codes.add(e["reference_code"])
+            created.append({
+                "equipment_id": new_id,
+                "name": e["equipment_name"],
+                "reference_code": e["reference_code"],
+                "location_path": " > ".join(e["path"]) if e["path"] else None,
+            })
 
-    log.info(f"Created {len(created)} equipment rows, {len(location_cache)} location nodes resolved for company {company_id}")
-    return created
+        except Exception as row_err:
+            with conn.cursor() as cur:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            log.warning(f"Row {e['row_number']} failed and was skipped: {row_err}")
+            skipped.append({
+                "row_number": e["row_number"],
+                "name": e["equipment_name"],
+                "reference_code": e["reference_code"] or None,
+                "reason": str(row_err),
+            })
+
+    log.info(
+        f"{len(created)} equipment created, {len(skipped)} skipped, "
+        f"{len(location_cache)} location nodes resolved for company {company_id}"
+    )
+    return {"created": created, "skipped": skipped}
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -351,21 +402,24 @@ def ingest(file_bytes: bytes, company_id: str, created_by: str) -> dict:
     """
     Full import pipeline called from the FastAPI endpoint.
     1. Parse the Equipment Hierarchy sheet (dynamic location depth)
-    2. Validate required fields and duplicate reference codes
-    3. Resolve/create each row's location path (name+parent identity)
-       and equipment type, then insert equipment
-    4. Commit as a single transaction; roll back entirely on any error
+    2. Resolve/create each row's location path (name+parent identity)
+       and equipment type, then insert equipment -- skipping any row
+       with a problem (duplicate reference_code, missing required
+       field, unresolvable data) rather than aborting the whole file
+    3. Commit everything that succeeded as one transaction
     """
     equipment = parse_excel(file_bytes)
 
-    errors = validate(equipment)
-    if errors:
-        raise ValueError("Validation failed:\n" + "\n".join(f"- {e}" for e in errors))
+    if not equipment:
+        raise ValueError(
+            "No equipment rows found in the uploaded file. Check that the "
+            "'Equipment Hierarchy' tab has data below the header row."
+        )
 
     conn = get_db_connection()
 
     try:
-        created_equipment = save_equipment(conn, equipment, company_id)
+        result = save_equipment(conn, equipment, company_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -373,13 +427,18 @@ def ingest(file_bytes: bytes, company_id: str, created_by: str) -> dict:
     finally:
         conn.close()
 
+    created = result["created"]
+    skipped = result["skipped"]
+
     log.info(
-        f"Import complete. {len(created_equipment)} equipment created for company "
-        f"{company_id} (imported by {created_by})"
+        f"Import complete. {len(created)} equipment created, {len(skipped)} skipped "
+        f"for company {company_id} (imported by {created_by})"
     )
 
     return {
         "company_id": company_id,
-        "equipment_created": len(created_equipment),
-        "equipment": created_equipment,
+        "equipment_created": len(created),
+        "equipment_skipped": len(skipped),
+        "equipment": created,
+        "skipped": skipped,
     }
