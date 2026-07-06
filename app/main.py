@@ -611,6 +611,73 @@ async def import_pm_strategy(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+# ── Equipment Master Data ─────────────────────────────────────────────────────
+
+@app.post("/equipment/master-data/import", status_code=201, tags=["Equipment Master Data"])
+async def import_equipment_master_data(
+    file:       UploadFile = File(...),
+    company_id: str        = Form(...),
+    created_by: str        = Form(...),
+):
+    """
+    Import an Equipment Master Data Excel file and create locations,
+    equipment types, and equipment directly in the database.
+
+    Runs synchronously, no SQS job queue -- parses the three tabs
+    (Locations, Equipment Types, Equipment), resolves nested location
+    hierarchies parent-first, resolves or creates equipment types
+    (matched against the company's existing types, then against
+    equipment_type_defaults), and inserts equipment with reference_code
+    enforced unique per company. Commits as a single transaction; rolls
+    back entirely if any row fails.
+
+    NOTE: Send as multipart/form-data, not JSON.
+    Fields:
+      file       - the .xlsx file (binary), matching the Equipment
+                   Master Data template (Locations, Equipment Types,
+                   Equipment tabs)
+      company_id - UUID of the company
+      created_by - UUID of the user performing the import
+
+    Returns:
+      {
+        "company_id": "...",
+        "locations_resolved": 12,
+        "equipment_created": 8,
+        "equipment": [
+          { "equipment_id": "...", "name": "Pump 4B", "reference_code": "EQ-1001" },
+          ...
+        ]
+      }
+    """
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .xlsx files are accepted"
+        )
+
+    file_bytes = await file.read()
+
+    try:
+        result = import_equipment_master_data_service(
+            file_bytes = file_bytes,
+            company_id = company_id,
+            created_by = created_by,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"IMPORT EQUIPMENT MASTER DATA ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 @app.get("/sessions", tags=["Session"])
