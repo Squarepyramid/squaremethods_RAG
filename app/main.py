@@ -22,6 +22,7 @@ from app.services.generate_pm_strategy import generate as generate_pm_strategy_s
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_equipment_master_data import ingest as import_equipment_master_data_service
+from app.services.manage_locations import move as move_location_service, insert_level as insert_location_level_service
 
 root_path = os.getenv("ROOT_PATH", "")
 
@@ -643,15 +644,20 @@ async def import_equipment_master_data(
       company_id - UUID of the company
       created_by - UUID of the user performing the import
 
-    Returns:
+   Returns:
       {
         "company_id": "...",
-        "locations_resolved": 12,
+        "location_moves_applied": 1,
+        "location_moves_skipped": 0,
+        "location_moves": { "applied": [...], "skipped": [...] },
         "equipment_created": 8,
-        "equipment": [
-          { "equipment_id": "...", "name": "Pump 4B", "reference_code": "EQ-1001" },
-          ...
-        ]
+        "equipment_updated": 1,
+        "equipment_skipped": 0,
+        "equipment": {
+          "created": [ { "equipment_id": "...", "name": "...", "reference_code": "...", "location_path": "..." }, ... ],
+          "updated": [ ... same shape ... ],
+          "skipped": [ { "row_number": 2, "name": "...", "reference_code": "...", "reason": "..." }, ... ]
+        }
       }
     """
     if not file.filename.endswith(".xlsx"):

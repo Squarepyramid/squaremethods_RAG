@@ -3,24 +3,42 @@ SquareMethods - Equipment Hierarchy Import Service
 ===================================================
 Place this file at: app/services/import_equipment_master_data.py
 
-Parses the Equipment Hierarchy Excel template (one sheet, one row
-per equipment) and creates locations, equipment_types, and equipment
-directly in the database. No async ingestion queue -- runs
-synchronously end to end, called from a FastAPI endpoint.
+Parses an Excel workbook with up to two tabs and applies them to the
+database in one transaction, structural changes first, then equipment:
 
-Skip-and-report, not all-or-nothing: a row with a problem (duplicate
-reference_code, missing required field, a malformed location path)
-is skipped and reported, it does not block the rest of the file from
-importing. Every row runs inside its own SAVEPOINT so an unexpected
-DB error on one row only rolls back that row. Everything that
-succeeds across the whole file is committed together at the end.
+  1. "Location Moves" (optional tab) -- explicit hierarchy
+     restructuring: move an existing location to a new parent, or
+     insert a new level directly above one. Processed first so the
+     Equipment Hierarchy tab below sees the updated tree. This is
+     deliberately explicit, not inferred from a changed path on an
+     equipment row -- moving a location moves its entire subtree
+     (every child location and every piece of equipment under it at
+     any depth), so it needs its own unambiguous instruction rather
+     than a guess based on a name that looks similar to something
+     seen before.
 
-Template shape: any number of leading "Location Name" columns
-(depth is however many are present, not fixed), followed by
+  2. "Equipment Hierarchy" (required tab) -- one row per equipment.
+     A row whose Reference Code already exists for this company is
+     treated as an UPDATE (location, equipment type, name, notes),
+     not a duplicate to skip -- this is what lets a single piece of
+     equipment be repositioned by simply re-uploading it with a new
+     location path. A row with a brand-new Reference Code is created.
+
+Skip-and-report throughout, not all-or-nothing: a row or move
+instruction with a problem (duplicate reference_code with no
+resolvable change, missing required field, a malformed location
+path, a path that can't be found) is skipped and reported, it does
+not block the rest of the file. Every row/instruction runs inside
+its own SAVEPOINT so an unexpected DB error on one only rolls back
+that one. Everything that succeeds across the whole file is
+committed together at the end.
+
+Equipment Hierarchy tab shape: any number of leading "Location Name"
+columns (depth is however many are present, not fixed), followed by
 "Equipment Name *", "Equipment Type Name *", "Reference Code *",
 "Notes".
 
-Location path rules:
+Location path rules (Equipment Hierarchy tab):
   - Read location columns left to right. The first blank column
     ends the path -- nothing after it is read.
   - Consecutive columns repeating the same name are a genuine
@@ -38,6 +56,12 @@ Location path rules:
   - A location is only created if it is the ancestor of at least
     one equipment row; there is no separate "define an empty
     location" step in this format.
+
+Location Moves tab shape: "Action *" (Move | Insert Level),
+"Existing Location Path *" (a single ' > '-separated string, e.g.
+"Plant 1 - Toronto > Packaging Line 1"), "New Parent Path" (used for
+Move; ' > '-separated, blank means top-level), "New Level Name"
+(used for Insert Level).
 """
 
 import io
@@ -48,11 +72,14 @@ from typing import Optional
 from openpyxl import load_workbook
 
 from app.utils.db import get_db_connection
+from app.services.manage_locations import move_location, insert_location_level
 
 log = logging.getLogger(__name__)
 
 SHEET_NAME = "Equipment Hierarchy"
+SHEET_NAME_MOVES = "Location Moves"
 EQUIPMENT_HEADERS = ["Equipment Name *", "Equipment Type Name *", "Reference Code *", "Notes"]
+MOVE_HEADERS = ["Action *", "Existing Location Path *", "New Parent Path", "New Level Name"]
 
 
 # ── Excel parser ──────────────────────────────────────────────────────────────
@@ -185,20 +212,169 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
     return equipment
 
 
+# ── Location Moves parser (optional tab) ──────────────────────────────────────
+
+def _split_path(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    return [p.strip() for p in text.split(">") if p.strip()]
+
+
+def parse_location_moves(file_bytes: bytes) -> list[dict]:
+    """
+    Parses the optional "Location Moves" tab into a list of dicts:
+    {
+        "action": "move" | "insert_level",
+        "existing_path": [...],
+        "new_parent_path": [...] | None,   # used for "move"
+        "new_level_name": str | None,      # used for "insert_level"
+        "row_number": int,
+    }
+    Returns [] if the tab isn't present -- it's optional, most
+    imports are pure equipment additions with no restructuring.
+    """
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+
+    if SHEET_NAME_MOVES not in wb.sheetnames:
+        return []
+
+    ws = wb[SHEET_NAME_MOVES]
+    all_rows = list(ws.iter_rows(values_only=True))
+
+    header_row_idx = None
+    for i, row in enumerate(all_rows):
+        cells = [str(c).strip() if c is not None else "" for c in row]
+        if "Action *" in cells:
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        return []
+
+    header_row = all_rows[header_row_idx]
+    data_rows = all_rows[header_row_idx + 1:]
+    data_row_offset = header_row_idx + 2  # 1-indexed Excel row number of the first data row
+
+    headers = [str(h).strip() if h is not None else "" for h in header_row]
+    idx = {}
+    for name in MOVE_HEADERS:
+        if name not in headers:
+            raise ValueError(f"Missing required column '{name}' in Location Moves tab.")
+        idx[name] = headers.index(name)
+
+    moves = []
+    for offset, row in enumerate(data_rows):
+        row_number = data_row_offset + offset
+        if not any(cell for cell in row if cell is not None):
+            continue
+
+        action_raw = row[idx["Action *"]]
+        action_raw = str(action_raw).strip().lower() if action_raw is not None else ""
+        if not action_raw:
+            continue
+
+        if action_raw in ("move",):
+            action = "move"
+        elif action_raw in ("insert level", "insert_level", "insertlevel"):
+            action = "insert_level"
+        else:
+            moves.append({
+                "action": None,
+                "existing_path": [],
+                "new_parent_path": None,
+                "new_level_name": None,
+                "row_number": row_number,
+                "parse_error": f"Unrecognized Action '{action_raw}'. Use 'Move' or 'Insert Level'.",
+            })
+            continue
+
+        existing_path = _split_path(row[idx["Existing Location Path *"]])
+        new_parent_path = _split_path(row[idx["New Parent Path"]]) if idx["New Parent Path"] < len(row) else []
+        new_level_name_raw = row[idx["New Level Name"]] if idx["New Level Name"] < len(row) else None
+        new_level_name = str(new_level_name_raw).strip() if new_level_name_raw is not None else ""
+
+        moves.append({
+            "action": action,
+            "existing_path": existing_path,
+            "new_parent_path": new_parent_path or None,
+            "new_level_name": new_level_name or None,
+            "row_number": row_number,
+            "parse_error": None,
+        })
+
+    log.info(f"Parsed {len(moves)} location move instructions")
+    return moves
+
+
+def apply_location_moves(conn, moves: list[dict], company_id: str) -> dict:
+    """
+    Applies each Location Moves instruction inside its own SAVEPOINT,
+    skipping (not aborting) any instruction with a problem -- an
+    unrecognized action, a missing path, or a path that can't be
+    found. Everything that succeeds is left in place for the
+    Equipment Hierarchy tab to build on afterward.
+    """
+    applied = []
+    skipped = []
+
+    for i, m in enumerate(moves):
+        savepoint = f"move_{i}"
+
+        if m.get("parse_error"):
+            skipped.append({"row_number": m["row_number"], "reason": m["parse_error"]})
+            continue
+        if not m["existing_path"]:
+            skipped.append({"row_number": m["row_number"], "reason": "Existing Location Path is required."})
+            continue
+        if m["action"] == "insert_level" and not m["new_level_name"]:
+            skipped.append({"row_number": m["row_number"], "reason": "New Level Name is required for Insert Level."})
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {savepoint}")
+
+        try:
+            if m["action"] == "move":
+                result = move_location(conn, company_id, m["existing_path"], m["new_parent_path"])
+            else:
+                result = insert_location_level(conn, company_id, m["existing_path"], m["new_level_name"])
+
+            with conn.cursor() as cur:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+            applied.append({
+                "row_number": m["row_number"],
+                "action": m["action"],
+                "existing_path": " > ".join(m["existing_path"]),
+                "result": result,
+            })
+
+        except Exception as move_err:
+            with conn.cursor() as cur:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            log.warning(f"Location move row {m['row_number']} failed and was skipped: {move_err}")
+            skipped.append({"row_number": m["row_number"], "reason": str(move_err)})
+
+    log.info(f"{len(applied)} location moves applied, {len(skipped)} skipped for company {company_id}")
+    return {"applied": applied, "skipped": skipped}
+
+
 # ── Row-level checks (used per-row inside save_equipment, not import-blocking) ─
 
-def row_issue(e: dict, existing_ref_codes: set) -> Optional[str]:
+def row_issue(e: dict) -> Optional[str]:
     """
-    Returns a human-readable reason this row should be skipped, or
-    None if the row is fine to insert. Checked per-row so one bad
-    row never blocks the rest of the file.
+    Returns a human-readable reason this row can't be processed at
+    all (skip, regardless of insert vs update), or None if it's fine.
+    A pre-existing reference_code is NOT a skip reason on its own --
+    that's handled as an update in save_equipment.
     """
     if e.get("parse_error"):
         return e["parse_error"]
     if not e["reference_code"]:
         return "Reference Code is required."
-    if e["reference_code"] in existing_ref_codes:
-        return f"reference_code '{e['reference_code']}' already exists for this company."
     if not e["type_name"]:
         return "Equipment Type Name is required."
     if not e["equipment_name"]:
@@ -309,32 +485,38 @@ def resolve_or_create_equipment_type(conn, type_name: str, company_id: str, type
 
 def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
     """
-    Resolves each row's location path and equipment type, then inserts
-    equipment -- skipping (not aborting) any row with a problem, such
-    as a duplicate reference_code or a missing required field.
+    Resolves each row's location path and equipment type, then either
+    inserts a new equipment row or -- if its Reference Code already
+    exists for this company -- updates that existing row's location,
+    type, name, and notes. This is what lets a single piece of
+    equipment be repositioned by simply re-uploading it with a new
+    location path, without touching anything else in the hierarchy.
+
+    Rows with a missing required field or an unresolvable location
+    path are skipped and reported rather than aborting the file.
 
     Each row runs inside its own SAVEPOINT so a failure on one row
     (a constraint violation, an unexpected DB error, etc.) only rolls
-    back that row; every other row in the file still gets processed
-    and the successful ones are committed at the end.
+    back that row; every other row still gets processed.
 
-    Returns {"created": [...], "skipped": [...]}.
+    Returns {"created": [...], "updated": [...], "skipped": [...]}.
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT reference_code FROM equipment WHERE company_id = %s::uuid",
+            "SELECT id, reference_code FROM equipment WHERE company_id = %s::uuid",
             (company_id,),
         )
-        existing_ref_codes = {row["reference_code"] for row in cur.fetchall()}
+        existing_by_ref_code = {row["reference_code"]: str(row["id"]) for row in cur.fetchall()}
 
     location_cache: dict = {}
     type_id_map: dict = {}
     created = []
+    updated = []
     skipped = []
 
     for i, e in enumerate(equipment):
         savepoint = f"row_{i}"
-        issue = row_issue(e, existing_ref_codes)
+        issue = row_issue(e)
         if issue:
             skipped.append({
                 "row_number": e["row_number"],
@@ -343,6 +525,8 @@ def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
                 "reason": issue,
             })
             continue
+
+        existing_equipment_id = existing_by_ref_code.get(e["reference_code"])
 
         with conn.cursor() as cur:
             cur.execute(f"SAVEPOINT {savepoint}")
@@ -353,30 +537,56 @@ def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
                 conn, e["type_name"], company_id, type_id_map
             )
 
-            new_id = str(uuid.uuid4())
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO equipment
-                        (id, company_id, equipment_type_id, location_id, name,
-                         reference_code, notes, status, created_at, updated_at)
-                    VALUES
-                        (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s,
-                         %s, %s, 'draft', NOW(), NOW())
-                """, (
-                    new_id, company_id, equipment_type_id, location_id,
-                    e["equipment_name"], e["reference_code"], e["notes"],
-                ))
+            if existing_equipment_id:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE equipment
+                        SET equipment_type_id = %s::uuid,
+                            location_id = %s::uuid,
+                            name = %s,
+                            notes = %s,
+                            updated_at = NOW()
+                        WHERE id = %s::uuid AND company_id = %s::uuid
+                    """, (
+                        equipment_type_id, location_id, e["equipment_name"], e["notes"],
+                        existing_equipment_id, company_id,
+                    ))
 
-            with conn.cursor() as cur:
-                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                with conn.cursor() as cur:
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
 
-            existing_ref_codes.add(e["reference_code"])
-            created.append({
-                "equipment_id": new_id,
-                "name": e["equipment_name"],
-                "reference_code": e["reference_code"],
-                "location_path": " > ".join(e["path"]) if e["path"] else None,
-            })
+                updated.append({
+                    "equipment_id": existing_equipment_id,
+                    "name": e["equipment_name"],
+                    "reference_code": e["reference_code"],
+                    "location_path": " > ".join(e["path"]) if e["path"] else None,
+                })
+
+            else:
+                new_id = str(uuid.uuid4())
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO equipment
+                            (id, company_id, equipment_type_id, location_id, name,
+                             reference_code, notes, status, created_at, updated_at)
+                        VALUES
+                            (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s,
+                             %s, %s, 'draft', NOW(), NOW())
+                    """, (
+                        new_id, company_id, equipment_type_id, location_id,
+                        e["equipment_name"], e["reference_code"], e["notes"],
+                    ))
+
+                with conn.cursor() as cur:
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+                existing_by_ref_code[e["reference_code"]] = new_id
+                created.append({
+                    "equipment_id": new_id,
+                    "name": e["equipment_name"],
+                    "reference_code": e["reference_code"],
+                    "location_path": " > ".join(e["path"]) if e["path"] else None,
+                })
 
         except Exception as row_err:
             with conn.cursor() as cur:
@@ -390,10 +600,10 @@ def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
             })
 
     log.info(
-        f"{len(created)} equipment created, {len(skipped)} skipped, "
+        f"{len(created)} equipment created, {len(updated)} updated, {len(skipped)} skipped, "
         f"{len(location_cache)} location nodes resolved for company {company_id}"
     )
-    return {"created": created, "skipped": skipped}
+    return {"created": created, "updated": updated, "skipped": skipped}
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -401,13 +611,17 @@ def save_equipment(conn, equipment: list[dict], company_id: str) -> dict:
 def ingest(file_bytes: bytes, company_id: str, created_by: str) -> dict:
     """
     Full import pipeline called from the FastAPI endpoint.
-    1. Parse the Equipment Hierarchy sheet (dynamic location depth)
-    2. Resolve/create each row's location path (name+parent identity)
-       and equipment type, then insert equipment -- skipping any row
-       with a problem (duplicate reference_code, missing required
-       field, unresolvable data) rather than aborting the whole file
-    3. Commit everything that succeeded as one transaction
+    1. Parse and apply "Location Moves" (optional tab) -- explicit
+       restructuring, processed first so the hierarchy is in its
+       final shape before equipment is resolved against it
+    2. Parse the "Equipment Hierarchy" tab (dynamic location depth)
+    3. Resolve/create each row's location path and equipment type,
+       then insert new equipment or update existing equipment
+       (matched by Reference Code) -- skipping any row/instruction
+       with a problem rather than aborting the whole file
+    4. Commit everything that succeeded as one transaction
     """
+    moves = parse_location_moves(file_bytes)
     equipment = parse_excel(file_bytes)
 
     if not equipment:
@@ -419,7 +633,8 @@ def ingest(file_bytes: bytes, company_id: str, created_by: str) -> dict:
     conn = get_db_connection()
 
     try:
-        result = save_equipment(conn, equipment, company_id)
+        move_result = apply_location_moves(conn, moves, company_id) if moves else {"applied": [], "skipped": []}
+        equipment_result = save_equipment(conn, equipment, company_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -427,18 +642,23 @@ def ingest(file_bytes: bytes, company_id: str, created_by: str) -> dict:
     finally:
         conn.close()
 
-    created = result["created"]
-    skipped = result["skipped"]
+    created = equipment_result["created"]
+    updated = equipment_result["updated"]
+    skipped = equipment_result["skipped"]
 
     log.info(
-        f"Import complete. {len(created)} equipment created, {len(skipped)} skipped "
-        f"for company {company_id} (imported by {created_by})"
+        f"Import complete for company {company_id} (imported by {created_by}): "
+        f"{len(move_result['applied'])} location moves applied, "
+        f"{len(created)} equipment created, {len(updated)} updated, {len(skipped)} skipped"
     )
 
     return {
         "company_id": company_id,
+        "location_moves_applied": len(move_result["applied"]),
+        "location_moves_skipped": len(move_result["skipped"]),
+        "location_moves": move_result,
         "equipment_created": len(created),
+        "equipment_updated": len(updated),
         "equipment_skipped": len(skipped),
-        "equipment": created,
-        "skipped": skipped,
+        "equipment": {"created": created, "updated": updated, "skipped": skipped},
     }
