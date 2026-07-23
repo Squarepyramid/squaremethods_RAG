@@ -76,6 +76,12 @@ SUBHEAD_FONT  = Font(bold=True, name="Arial", size=10)
 DATA_FONT     = Font(name="Arial", size=10)
 WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top")
 
+# Approx characters that fit on one wrapped line within the instruction
+# column width (col width 60 -> roughly 60-65 chars/line at Arial 10).
+INSTRUCTION_COL_CHARS_PER_LINE = 60
+MIN_ROW_HEIGHT = 40
+LINE_HEIGHT = 14  # points per wrapped line, Arial 10
+
 
 # ── Knowledge retrieval ───────────────────────────────────────────────────────
 
@@ -142,7 +148,7 @@ For each task you find, extract the following fields:
 - system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
 - material_number: SAP material number if mentioned, otherwise leave blank.
 - component: the specific component name only (without the assembly hierarchy), e.g. "Bearings x8"
-- instruction: step-by-step work instruction a technician can follow. Number each step. Be specific.
+- instruction: step-by-step work instruction a technician can follow. Number each step starting at 1. Put EACH numbered step on its own line, with a blank line between steps -- use a literal "\\n\\n" (newline, newline) between step N and step N+1, never a space. Be specific.
 - failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
 
 Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
@@ -159,7 +165,7 @@ Example format:
     "system_condition": 0,
     "material_number": "",
     "component": "Bearings x4",
-    "instruction": "1. Isolate and lock out the drive. 2. Remove guard. 3. Apply 2 shots of grease per nipple using grease gun.",
+    "instruction": "1. Isolate and lock out the drive.\\n\\n2. Remove guard.\\n\\n3. Apply 2 shots of grease per nipple using grease gun.",
     "failure_modes": "Bearing seizure, overheating"
   }}
 ]
@@ -177,9 +183,9 @@ async def call_claude_for_pm_type(
     pm_name: str,
     manual_text: str,
 ) -> tuple[str, str, list]:
-    print(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
+    log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
     prompt = build_pm_prompt(pm_code, pm_name, manual_text)
-    print(f"{pm_code} PROMPT BUILT, length={len(prompt)}")
+    log.debug(f"{pm_code} PROMPT BUILT, length={len(prompt)}")
 
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -249,6 +255,26 @@ async def call_claude_for_pm_type(
         return pm_code, pm_name, []   
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
+def _estimate_row_height(instruction: str) -> int:
+    """
+    Instruction text contains numbered steps separated by blank lines
+    (\\n\\n). Estimate wrapped line count so multi-step instructions
+    don't get visually clipped at a fixed row height.
+    """
+    if not instruction:
+        return MIN_ROW_HEIGHT
+
+    line_count = 0
+    for segment in instruction.split("\n"):
+        if segment == "":
+            line_count += 1  # blank line between steps
+        else:
+            # account for wrapping within a single step line
+            line_count += max(1, -(-len(segment) // INSTRUCTION_COL_CHARS_PER_LINE))
+
+    return max(MIN_ROW_HEIGHT, line_count * LINE_HEIGHT)
+
+
 def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     """
     Build the PM strategy Excel file from Claude's structured output.
@@ -293,6 +319,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
 
         # Data rows -- skipped naturally if steps is empty
         for step in steps:
+            instruction = step.get("instruction", "")
             row_values = [
                 step.get("operation", ""),
                 step.get("task_list_description", ""),
@@ -302,7 +329,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("system_condition", ""),
                 step.get("material_number", ""),
                 step.get("component", ""),
-                step.get("instruction", ""),
+                instruction,
                 step.get("failure_modes", ""),
                 "",  # Image -- left blank for reviewer to fill
             ]
@@ -310,8 +337,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 cell           = ws.cell(row=current_row, column=col_idx, value=value)
                 cell.font      = DATA_FONT
                 cell.alignment = WRAP_ALIGN
-                cell.border    = None
-            ws.row_dimensions[current_row].height = 40
+            ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
             current_row += 1
 
         # Spacer row between PM type blocks
