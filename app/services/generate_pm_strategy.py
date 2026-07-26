@@ -148,73 +148,75 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
 
 def build_working_principle_prompt(manual_text: str) -> str:
     """
-    Working Principle is a step-by-step narrative of how the equipment
-    actually operates (startup sequence, process flow, control logic,
-    shutdown), not a maintenance task list. Kept on the same row schema
-    as the PM types so it drops into the same Excel sheet, but the
-    fields that don't apply to an operating description (frequency,
-    hrs, work_needed, failure_modes) are left blank/defaulted rather
-    than asking the model to invent maintenance-style values for them.
+    Working Principle answers "how does this machine work?" -- the
+    engineering logic of how the equipment physically achieves its
+    function (intake, compression/reaction/processing, separation,
+    regulation, discharge, etc.), NOT how an operator runs it. This is
+    a distinct thing from operating procedure (button presses, start/
+    stop sequences, towing instructions) and from maintenance tasks --
+    both of those are excluded here.
 
-    Two contrasting examples are given (process equipment and mobile/
-    towed equipment) because a single-domain example causes the model
-    to pattern-match too tightly to that domain and return an empty
-    array on manuals that don't look like it, instead of generalizing.
+    Manuals rarely have a dedicated "theory of operation" chapter; the
+    engineering explanation is usually scattered inside Maintenance or
+    General Data sections as incidental description (e.g. "as the
+    compressed air enters the tank, the change in velocity and
+    direction drop out most of the oil from the air"). The prompt
+    explicitly tells the model to mine for that kind of sentence
+    wherever it appears, rather than only looking at an "Operation"
+    section -- which is very likely to contain the same procedural
+    checklist content, not the underlying mechanism.
     """
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
-Your task is to extract the WORKING PRINCIPLE -- a step-by-step explanation of how this equipment actually operates and is operated, in the order it happens. This is NOT a maintenance task list -- do not include lubrication, inspection, or repair tasks here, only how the equipment functions and is operated. Depending on the type of equipment, this may include any of:
-- Startup sequence, warm-up, running state, and shutdown sequence (e.g. "Before Starting", "Starting", "Stopping" sections)
-- Setup/positioning/towing/connection sequence for mobile or towed equipment (e.g. "Before Towing", "Setting Up", "Towing", "Disconnect" sections)
-- Process or material flow through the system (e.g. how air is compressed, cooled, and separated from oil)
-- Control panel, gauge, or switch functions -- what each control does and what it means when engaged (e.g. a control panel/instrument section listing gauges, switches, and lamps)
-- Control logic or safety interlocks that govern normal operation
+Your task is to extract the WORKING PRINCIPLE of this machine -- the engineering explanation of HOW THE MACHINE PHYSICALLY ACHIEVES ITS FUNCTION. This answers the question "how does this machine work?", not "how does an operator run it?"
 
-Pull from whichever of these sections actually exist in the manual -- do not assume it must look like a continuous process-flow narrative. A sequence of numbered operating steps (start engine, warm up, open valve, run, close valve, shut down) is just as valid a Working Principle as an internal process description.
+Do NOT extract:
+- Operator procedures: button presses, switch positions, start/stop sequences, towing/setup instructions. ("Turn the power switch to ON" is an operator action, not working principle.)
+- Maintenance tasks: inspection, lubrication, replacement, cleaning, calibration.
 
-For each step, extract:
-- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
-- task_list_description: the stage name following the pattern "Sequence/Subsystem - Stage", e.g. "Startup Sequence - Fill hopper" or "Control Panel - Engine Oil Pressure Gauge"
-- frequency: leave blank (not applicable to a working principle)
+DO extract the underlying mechanism: how the machine's core function is physically carried out, stage by stage, as material/air/fluid/energy moves through the system and components interact to produce the intended output. For example, for a compressor: how ambient air is drawn in and filtered, how it's mechanically compressed, how oil is injected for sealing/cooling/lubrication during compression, how the compressed air-oil mixture is separated back into clean air and oil, how discharge pressure is sensed and regulated, how heat is removed from the system. For other equipment types, the equivalent stages are whatever physically carries the material or energy from input to output (e.g. feed, reaction/processing, separation, discharge for a process vessel; intake, power transmission, output for a mechanical drive system).
+
+IMPORTANT: manuals rarely have a section explicitly titled "theory of operation" or "working principle." This kind of engineering explanation is usually scattered as incidental description INSIDE maintenance, general data, or specification sections -- not confined to a section literally called "Operation." Read the whole manual for sentences that explain WHY or HOW something physically happens (e.g. "as the compressed air enters the tank, the change in velocity and direction drop out most of the oil from the air"), even if that sentence sits inside a section about draining or replacing a part. Extract the engineering logic from wherever it appears; do not limit yourself to a single section.
+
+For each functional stage, extract:
+- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10), in the order the function is physically carried out (e.g. intake before compression before separation)
+- task_list_description: the functional stage following the pattern "Function - Mechanism", e.g. "Air Compression - Screw Airend" or "Oil/Air Separation - Receiver-Separator Tank"
+- frequency: leave blank (not applicable)
 - hrs: leave blank (not applicable)
-- work_needed: 0 (this describes operation, not maintenance work)
-- system_condition: 1 if this step occurs while the machine is running, 0 if it occurs while stopped (e.g. startup pre-checks, towing setup)
+- work_needed: 0 (this describes function, not maintenance work)
+- system_condition: 1 (this describes the machine's normal running function)
 - material_number: leave blank
-- component: the specific component, subsystem, or control involved in this step, e.g. "Main hopper" or "Engine Oil Pressure Gauge"
-- instruction: a clear, detailed explanation of what happens or what the operator does at this stage. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space. Be specific about how the equipment behaves, not just what a technician does.
+- component: the specific component or subsystem that carries out this function, e.g. "Screw Airend" or "Receiver-Separator Tank"
+- instruction: a clear, detailed engineering explanation of what physically happens at this stage and why -- the mechanism, not an action a person takes. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space.
 - failure_modes: leave blank (not applicable)
 
 Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-If the manual doesn't describe how the equipment operates anywhere, return an empty array: []
+If the manual has no engineering description of how the machine functions anywhere, return an empty array: []
 
-Example format (process equipment):
+Example format:
 [
   {{
     "operation": "Operation_010",
-    "task_list_description": "Startup Sequence - Fill hopper",
+    "task_list_description": "Air Compression - Screw Airend",
     "frequency": "",
     "hrs": "",
     "work_needed": 0,
-    "system_condition": 0,
+    "system_condition": 1,
     "material_number": "",
-    "component": "Main hopper",
-    "instruction": "1. Operator loads raw material into the main hopper via the top-mounted chute.\\n\\n2. A level sensor in the hopper confirms sufficient material before the feed screw is permitted to start.\\n\\n3. Once confirmed, the control system releases the interlock and allows the startup sequence to proceed.",
+    "component": "Screw Airend",
+    "instruction": "1. Ambient air is drawn through the air cleaner and into the rotary screw airend.\\n\\n2. Two meshing helical rotors trap and progressively reduce the volume of the air as it moves along the rotor length, raising its pressure.\\n\\n3. Lubricating oil is injected directly into the compression chamber during this stage, where it seals the clearances between rotors and housing, cools the air as it is compressed, and lubricates the rotating parts.",
     "failure_modes": ""
-  }}
-]
-
-Example format (mobile/towed equipment):
-[
+  }},
   {{
-    "operation": "Operation_010",
-    "task_list_description": "Starting Sequence - Power switch",
+    "operation": "Operation_020",
+    "task_list_description": "Oil/Air Separation - Receiver-Separator Tank",
     "frequency": "",
     "hrs": "",
     "work_needed": 0,
-    "system_condition": 0,
+    "system_condition": 1,
     "material_number": "",
-    "component": "Power Switch",
-    "instruction": "1. Turn the power switch to \\"ON\\" to activate the system prior to starting.\\n\\n2. Turn the power switch to \\"START\\" to crank the engine, holding it in that position for approximately 5 seconds after the engine starts.\\n\\n3. Release the switch, which automatically moves to the \\"ON\\" position once the engine starts and sustains running.",
+    "component": "Receiver-Separator Tank",
+    "instruction": "1. The compressed air-oil mixture discharged from the airend enters the receiver-separator tank.\\n\\n2. The sudden change in velocity and direction as the mixture enters the tank causes most of the entrained oil to drop out of the air by gravity and impact separation.\\n\\n3. The remaining fine oil mist passes through a coalescing separator element, which captures the smaller oil droplets before the air is discharged from the tank.\\n\\n4. Oil collected in the separator element is continuously drained back into the system through a scavenge line, so it re-enters circulation rather than being lost.",
     "failure_modes": ""
   }}
 ]
@@ -462,6 +464,59 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     return buf.read()
 
 
+def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
+    """
+    Pull the equipment's display name and reference code for use in the
+    output filename. Matches the `equipment` table schema: `name` is the
+    human-readable label, `reference_code` is the unique per-company
+    identifier -- both go in the filename so two units with the same
+    name (different reference_code) don't produce identical filenames.
+    Respects the soft-delete pattern (deleted_at IS NULL) used elsewhere
+    in the equipment import system.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, reference_code
+                FROM equipment
+                WHERE id = %s::uuid
+                AND company_id = %s::uuid
+                AND deleted_at IS NULL
+            """, (equipment_id, company_id))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        log.warning(f"No equipment record found for {equipment_id}, falling back to equipment_id in filename")
+        return {"name": "", "reference_code": ""}
+
+    return {"name": row.get("name") or "", "reference_code": row.get("reference_code") or ""}
+
+
+def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
+    """
+    Build a human-readable filename like:
+      PM_Strategy_P185WJD_Compressor_1_A102_2026-07-26.xlsx
+    (name + reference_code). Falls back to the equipment_id if no
+    record is found, so the file is still uniquely identifiable rather
+    than failing.
+    """
+    from datetime import date
+    import re
+
+    label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
+    if not label:
+        label = equipment_id
+
+    # slugify: keep letters/numbers, collapse everything else to a single underscore
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+    slug = slug[:80]  # keep filenames reasonable on Windows/shared drives
+
+    return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def generate(equipment_id: str, company_id: str) -> bytes:
@@ -471,6 +526,21 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     2. Run nine parallel Claude calls (one per PM type)
     3. Build and return the Excel file as bytes
        -- always returns a valid file even if all PM types are empty
+
+    Return type is unchanged (bytes only) to avoid breaking existing
+    callers. To get a human-readable filename, call
+    fetch_equipment_info() + build_output_filename() separately in your
+    endpoint -- see the usage note below.
+
+    Example endpoint usage:
+        excel_bytes = await generate(equipment_id, company_id)
+        equipment_info = fetch_equipment_info(equipment_id, company_id)
+        filename = build_output_filename(equipment_id, equipment_info)
+        return Response(
+            content=excel_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     """
     manual_text = fetch_all_manual_chunks(equipment_id, company_id)
 
