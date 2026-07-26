@@ -155,27 +155,39 @@ def build_working_principle_prompt(manual_text: str) -> str:
     fields that don't apply to an operating description (frequency,
     hrs, work_needed, failure_modes) are left blank/defaulted rather
     than asking the model to invent maintenance-style values for them.
+
+    Two contrasting examples are given (process equipment and mobile/
+    towed equipment) because a single-domain example causes the model
+    to pattern-match too tightly to that domain and return an empty
+    array on manuals that don't look like it, instead of generalizing.
     """
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
-Your task is to extract the WORKING PRINCIPLE -- a step-by-step explanation of how this equipment actually operates, in the order it happens (e.g. startup sequence, process/material flow through the system, control logic, normal running state, shutdown sequence). This is NOT a maintenance task list -- do not include lubrication, inspection, or repair tasks here, only how the equipment functions and is operated.
+Your task is to extract the WORKING PRINCIPLE -- a step-by-step explanation of how this equipment actually operates and is operated, in the order it happens. This is NOT a maintenance task list -- do not include lubrication, inspection, or repair tasks here, only how the equipment functions and is operated. Depending on the type of equipment, this may include any of:
+- Startup sequence, warm-up, running state, and shutdown sequence (e.g. "Before Starting", "Starting", "Stopping" sections)
+- Setup/positioning/towing/connection sequence for mobile or towed equipment (e.g. "Before Towing", "Setting Up", "Towing", "Disconnect" sections)
+- Process or material flow through the system (e.g. how air is compressed, cooled, and separated from oil)
+- Control panel, gauge, or switch functions -- what each control does and what it means when engaged (e.g. a control panel/instrument section listing gauges, switches, and lamps)
+- Control logic or safety interlocks that govern normal operation
+
+Pull from whichever of these sections actually exist in the manual -- do not assume it must look like a continuous process-flow narrative. A sequence of numbered operating steps (start engine, warm up, open valve, run, close valve, shut down) is just as valid a Working Principle as an internal process description.
 
 For each step, extract:
 - operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
-- task_list_description: the stage name following the pattern "Sequence/Subsystem - Stage", e.g. "Startup Sequence - Fill hopper" or "Process Flow - Material transfer to mixer"
+- task_list_description: the stage name following the pattern "Sequence/Subsystem - Stage", e.g. "Startup Sequence - Fill hopper" or "Control Panel - Engine Oil Pressure Gauge"
 - frequency: leave blank (not applicable to a working principle)
 - hrs: leave blank (not applicable)
 - work_needed: 0 (this describes operation, not maintenance work)
-- system_condition: 1 if this step occurs while the machine is running, 0 if it occurs while stopped (e.g. startup pre-checks)
+- system_condition: 1 if this step occurs while the machine is running, 0 if it occurs while stopped (e.g. startup pre-checks, towing setup)
 - material_number: leave blank
-- component: the specific component or subsystem involved in this step, e.g. "Main hopper" or "Mixing chamber"
+- component: the specific component, subsystem, or control involved in this step, e.g. "Main hopper" or "Engine Oil Pressure Gauge"
 - instruction: a clear, detailed explanation of what happens or what the operator does at this stage. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space. Be specific about how the equipment behaves, not just what a technician does.
 - failure_modes: leave blank (not applicable)
 
 Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-If the manual doesn't describe how the equipment operates, return an empty array: []
+If the manual doesn't describe how the equipment operates anywhere, return an empty array: []
 
-Example format:
+Example format (process equipment):
 [
   {{
     "operation": "Operation_010",
@@ -191,20 +203,54 @@ Example format:
   }}
 ]
 
+Example format (mobile/towed equipment):
+[
+  {{
+    "operation": "Operation_010",
+    "task_list_description": "Starting Sequence - Power switch",
+    "frequency": "",
+    "hrs": "",
+    "work_needed": 0,
+    "system_condition": 0,
+    "material_number": "",
+    "component": "Power Switch",
+    "instruction": "1. Turn the power switch to \\"ON\\" to activate the system prior to starting.\\n\\n2. Turn the power switch to \\"START\\" to crank the engine, holding it in that position for approximately 5 seconds after the engine starts.\\n\\n3. Release the switch, which automatically moves to the \\"ON\\" position once the engine starts and sustains running.",
+    "failure_modes": ""
+  }}
+]
+
 EQUIPMENT MANUAL:
 {manual_text}"""
 
 
+PM_TYPE_GUIDANCE = {
+    "PM1": "Inspection means a routine visual or physical CHECK with no scheduled part replacement -- e.g. checking for leaks, checking fastener tightness, checking fluid level, visually inspecting hoses or tires. If the task's end action is replacing a part, it does NOT belong here -- that's PM4.",
+    "PM2": "Lubrication means applying, topping up, or changing a lubricant, grease, or coolant itself (e.g. greasing a fitting, topping up engine oil, changing compressor oil). Do not include filter/element replacement here unless the task is specifically about the fluid, not the filter -- filter/element swaps belong in PM4.",
+    "PM3": "Calibration means adjusting a device or setting to a specified reference value. This includes pressure regulator adjustment, governor or engine speed adjustment, sensor calibration, torque specifications, and any 'adjust to X value' instruction in the manual -- even if the manual's section heading doesn't use the word 'calibration'. If the manual has any section on adjusting pressure, speed, torque, or regulator settings, it belongs here.",
+    "PM4": "Replacements means the routine, scheduled swap of a wearable part or consumable on a fixed interval (filters, elements, belts, fluids, fasteners). This is the ONLY category that should contain recurring element/filter/fluid replacement tasks -- do not also list the same task under PM2, PM5, or PM6.",
+    "PM5": "Overhaul means major teardown, rebuild, or reconditioning of an assembly (e.g. rebuilding the airend internals, engine rebuild, replacing internal bearings/rotors/gears as part of a rebuild). Do NOT include routine scheduled part replacement here (that's PM4) or routine fluid changes (that's PM2). If the manual explicitly states major overhauls are outside its scope or should be referred to an authorized service department, return an EMPTY array for this category -- do not invent overhaul tasks by relabeling routine maintenance content.",
+    "PM6": "Condition Monitoring means measuring or observing a parameter against a threshold using a gauge, sensor, or instrument, WITHOUT performing a replacement as part of the same task (e.g. monitoring discharge temperature, monitoring vibration, oil sampling/analysis, watching a diagnostic lamp). If a task's end action is replacing a part on a schedule, it belongs in PM4, not here.",
+    "PM7": "Cleaning means removing dirt, grease, debris, or buildup from a component that stays installed (e.g. cleaning a cooler core exterior, wiping down a housing interior). Do not include tasks whose primary action is replacing a part.",
+    "PM8": "Safety Inspection means checking safety-critical items specifically: guards, safety valves, safety decals/labels, emergency stops, and fasteners or panels tied to injury or noise-containment risk.",
+    "PM9": "Software Back-up means backing up or restoring configuration, firmware, or software on a PLC, controller, or electronic control module. If the manual describes no software, controller, or firmware, return an EMPTY array -- do not invent a software task.",
+}
+
+
 def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str) -> str:
+    category_guidance = PM_TYPE_GUIDANCE.get(pm_code, "")
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
 Your task is to extract ALL maintenance tasks that fall under the category: {pm_code} - {pm_name}
+
+CATEGORY DEFINITION FOR {pm_code} - {pm_name}: {category_guidance}
+
+If a task genuinely fits more than one category, extract it under the SINGLE most specific category above and skip it in the others -- do not extract the same task into multiple PM types.
 
 For each task you find, extract the following fields:
 - operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
 - task_list_description: the step title following the component hierarchy pattern "Assembly - Subassembly - Component x[quantity]". Preserve quantities (x1, x2, x4 etc) as they indicate how many of that component exist.
 - frequency: how often this task should be done (e.g. "2W" for 2 weekly, "1M" for monthly, "1Y" for yearly). Leave blank if not specified.
-- hrs: estimated hours as a decimal number (e.g. 0.1, 0.5, 1.0). Leave blank if not specified.
+- hrs: estimated TECHNICIAN TIME to perform this specific task, as a decimal number of hours (e.g. 0.1, 0.5, 1.0). This is NOT the maintenance interval -- if the manual says "every 1000 hours," that 1000 belongs in frequency, never here. Leave blank if no time estimate is given.
 - work_needed: 1 if active work is required, 0 if observation only. Default to 1.
 - system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
 - material_number: SAP material number if mentioned, otherwise leave blank.
