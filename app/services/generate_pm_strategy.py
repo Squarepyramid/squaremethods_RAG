@@ -12,6 +12,9 @@ the reviewer can fill gaps, add image URLs, then upload it via
 the import endpoint.
 
 PM Types:
+  WP  - Working Principle (step-by-step operating procedure, not a
+        maintenance task -- placed first as the foundational section
+        the rest of the strategies build on)
   PM1 - Inspection
   PM2 - Lubrication
   PM3 - Calibration
@@ -39,7 +42,16 @@ from app.utils.db import get_db_connection
 
 log = logging.getLogger(__name__)
 
+WORKING_PRINCIPLE = ("WP", "Working Principle")
+
+# Working Principle is placed first: it's the foundational "how this
+# equipment operates" narrative that the PM tasks below build on. It runs
+# through the same async gather as the PM types but uses its own prompt
+# (see build_working_principle_prompt) since it isn't a maintenance task
+# extraction -- there's no frequency, work_needed, or failure mode in the
+# same sense as PM1-PM9.
 PM_TYPES = [
+    WORKING_PRINCIPLE,
     ("PM1", "Inspection"),
     ("PM2", "Lubrication"),
     ("PM3", "Calibration"),
@@ -134,6 +146,55 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
 
 # ── Claude call ───────────────────────────────────────────────────────────────
 
+def build_working_principle_prompt(manual_text: str) -> str:
+    """
+    Working Principle is a step-by-step narrative of how the equipment
+    actually operates (startup sequence, process flow, control logic,
+    shutdown), not a maintenance task list. Kept on the same row schema
+    as the PM types so it drops into the same Excel sheet, but the
+    fields that don't apply to an operating description (frequency,
+    hrs, work_needed, failure_modes) are left blank/defaulted rather
+    than asking the model to invent maintenance-style values for them.
+    """
+    return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
+
+Your task is to extract the WORKING PRINCIPLE -- a step-by-step explanation of how this equipment actually operates, in the order it happens (e.g. startup sequence, process/material flow through the system, control logic, normal running state, shutdown sequence). This is NOT a maintenance task list -- do not include lubrication, inspection, or repair tasks here, only how the equipment functions and is operated.
+
+For each step, extract:
+- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
+- task_list_description: the stage name following the pattern "Sequence/Subsystem - Stage", e.g. "Startup Sequence - Fill hopper" or "Process Flow - Material transfer to mixer"
+- frequency: leave blank (not applicable to a working principle)
+- hrs: leave blank (not applicable)
+- work_needed: 0 (this describes operation, not maintenance work)
+- system_condition: 1 if this step occurs while the machine is running, 0 if it occurs while stopped (e.g. startup pre-checks)
+- material_number: leave blank
+- component: the specific component or subsystem involved in this step, e.g. "Main hopper" or "Mixing chamber"
+- instruction: a clear, detailed explanation of what happens or what the operator does at this stage. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space. Be specific about how the equipment behaves, not just what a technician does.
+- failure_modes: leave blank (not applicable)
+
+Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
+If the manual doesn't describe how the equipment operates, return an empty array: []
+
+Example format:
+[
+  {{
+    "operation": "Operation_010",
+    "task_list_description": "Startup Sequence - Fill hopper",
+    "frequency": "",
+    "hrs": "",
+    "work_needed": 0,
+    "system_condition": 0,
+    "material_number": "",
+    "component": "Main hopper",
+    "instruction": "1. Operator loads raw material into the main hopper via the top-mounted chute.\\n\\n2. A level sensor in the hopper confirms sufficient material before the feed screw is permitted to start.\\n\\n3. Once confirmed, the control system releases the interlock and allows the startup sequence to proceed.",
+    "failure_modes": ""
+  }}
+]
+
+EQUIPMENT MANUAL:
+{manual_text}"""
+
+
 def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str) -> str:
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
@@ -184,7 +245,10 @@ async def call_claude_for_pm_type(
     manual_text: str,
 ) -> tuple[str, str, list]:
     log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
-    prompt = build_pm_prompt(pm_code, pm_name, manual_text)
+    if pm_code == "WP":
+        prompt = build_working_principle_prompt(manual_text)
+    else:
+        prompt = build_pm_prompt(pm_code, pm_name, manual_text)
     log.debug(f"{pm_code} PROMPT BUILT, length={len(prompt)}")
 
     body = json.dumps({
