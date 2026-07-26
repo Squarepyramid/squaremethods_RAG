@@ -150,73 +150,58 @@ def build_working_principle_prompt(manual_text: str) -> str:
     """
     Working Principle answers "how does this machine work?" -- the
     engineering logic of how the equipment physically achieves its
-    function (intake, compression/reaction/processing, separation,
-    regulation, discharge, etc.), NOT how an operator runs it. This is
-    a distinct thing from operating procedure (button presses, start/
-    stop sequences, towing instructions) and from maintenance tasks --
-    both of those are excluded here.
+    function, NOT how an operator runs it and NOT maintenance tasks.
 
-    Manuals rarely have a dedicated "theory of operation" chapter; the
-    engineering explanation is usually scattered inside Maintenance or
-    General Data sections as incidental description (e.g. "as the
-    compressed air enters the tank, the change in velocity and
-    direction drop out most of the oil from the air"). The prompt
-    explicitly tells the model to mine for that kind of sentence
-    wherever it appears, rather than only looking at an "Operation"
-    section -- which is very likely to contain the same procedural
-    checklist content, not the underlying mechanism.
+    The example below is intentionally abstract/generic (no real
+    equipment domain, no specific component names) rather than a
+    concrete worked example (e.g. an air compressor). An earlier
+    version used a real compressor example, and the model latched
+    onto that specific vocabulary (screw airend, oil injection,
+    receiver-separator) and started projecting compressor terminology
+    onto completely unrelated equipment. The example here only
+    demonstrates the JSON shape and the *kind* of engineering
+    reasoning expected -- every actual term must come from the
+    manual provided, never from this example.
     """
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
-Your task is to extract the WORKING PRINCIPLE of this machine -- the engineering explanation of HOW THE MACHINE PHYSICALLY ACHIEVES ITS FUNCTION. This answers the question "how does this machine work?", not "how does an operator run it?"
+Your task is to extract the WORKING PRINCIPLE of THIS SPECIFIC MACHINE -- the engineering explanation of HOW IT PHYSICALLY ACHIEVES ITS FUNCTION. This answers the question "how does this machine work?", not "how does an operator run it?"
 
 Do NOT extract:
-- Operator procedures: button presses, switch positions, start/stop sequences, towing/setup instructions. ("Turn the power switch to ON" is an operator action, not working principle.)
+- Operator procedures: button presses, switch positions, start/stop sequences, towing/setup instructions.
 - Maintenance tasks: inspection, lubrication, replacement, cleaning, calibration.
 
-DO extract the underlying mechanism: how the machine's core function is physically carried out, stage by stage, as material/air/fluid/energy moves through the system and components interact to produce the intended output. For example, for a compressor: how ambient air is drawn in and filtered, how it's mechanically compressed, how oil is injected for sealing/cooling/lubrication during compression, how the compressed air-oil mixture is separated back into clean air and oil, how discharge pressure is sensed and regulated, how heat is removed from the system. For other equipment types, the equivalent stages are whatever physically carries the material or energy from input to output (e.g. feed, reaction/processing, separation, discharge for a process vessel; intake, power transmission, output for a mechanical drive system).
+DO extract the underlying mechanism: how the machine's core function is physically carried out, stage by stage, as material/air/fluid/energy/signal moves through the system and components interact to produce the intended output. The specific stages, components, and terminology MUST come entirely from the manual below -- do not import terminology, component names, or mechanisms from any other type of equipment. If this machine is not a compressor, do not mention compression, airends, or oil separation; if it's not a pump, do not mention impellers; describe THIS machine using only what the manual actually says about it.
 
-IMPORTANT: manuals rarely have a section explicitly titled "theory of operation" or "working principle." This kind of engineering explanation is usually scattered as incidental description INSIDE maintenance, general data, or specification sections -- not confined to a section literally called "Operation." Read the whole manual for sentences that explain WHY or HOW something physically happens (e.g. "as the compressed air enters the tank, the change in velocity and direction drop out most of the oil from the air"), even if that sentence sits inside a section about draining or replacing a part. Extract the engineering logic from wherever it appears; do not limit yourself to a single section.
+IMPORTANT: manuals rarely have a section explicitly titled "theory of operation" or "working principle." This kind of engineering explanation is usually scattered as incidental description INSIDE maintenance, general data, or specification sections -- not confined to a section literally called "Operation." Read the whole manual for sentences that explain WHY or HOW something physically happens, even if that sentence sits inside a section about draining or replacing a part. Extract the engineering logic from wherever it appears in THIS manual; do not limit yourself to a single section, and do not substitute reasoning from a different type of machine when this manual's explanation is thin -- if the manual genuinely doesn't explain a stage, leave it out rather than inventing it.
 
 For each functional stage, extract:
-- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10), in the order the function is physically carried out (e.g. intake before compression before separation)
-- task_list_description: the functional stage following the pattern "Function - Mechanism", e.g. "Air Compression - Screw Airend" or "Oil/Air Separation - Receiver-Separator Tank"
+- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10), in the order the function is physically carried out
+- task_list_description: the functional stage following the pattern "Function - Mechanism", using the manual's own terms for the function and the component that carries it out
 - frequency: leave blank (not applicable)
 - hrs: leave blank (not applicable)
 - work_needed: 0 (this describes function, not maintenance work)
 - system_condition: 1 (this describes the machine's normal running function)
 - material_number: leave blank
-- component: the specific component or subsystem that carries out this function, e.g. "Screw Airend" or "Receiver-Separator Tank"
-- instruction: a clear, detailed engineering explanation of what physically happens at this stage and why -- the mechanism, not an action a person takes. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space.
+- component: the specific component or subsystem named in the manual that carries out this function
+- instruction: a clear, detailed engineering explanation of what physically happens at this stage and why, using only terms and mechanisms the manual actually describes. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space.
 - failure_modes: leave blank (not applicable)
 
 Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
 If the manual has no engineering description of how the machine functions anywhere, return an empty array: []
 
-Example format:
+Example format (illustrates JSON shape and reasoning style only -- "Stage" and "Component" below are placeholders; replace with whatever this manual's actual machine and components are):
 [
   {{
     "operation": "Operation_010",
-    "task_list_description": "Air Compression - Screw Airend",
+    "task_list_description": "[First functional stage from the manual] - [Component that performs it]",
     "frequency": "",
     "hrs": "",
     "work_needed": 0,
     "system_condition": 1,
     "material_number": "",
-    "component": "Screw Airend",
-    "instruction": "1. Ambient air is drawn through the air cleaner and into the rotary screw airend.\\n\\n2. Two meshing helical rotors trap and progressively reduce the volume of the air as it moves along the rotor length, raising its pressure.\\n\\n3. Lubricating oil is injected directly into the compression chamber during this stage, where it seals the clearances between rotors and housing, cools the air as it is compressed, and lubricates the rotating parts.",
-    "failure_modes": ""
-  }},
-  {{
-    "operation": "Operation_020",
-    "task_list_description": "Oil/Air Separation - Receiver-Separator Tank",
-    "frequency": "",
-    "hrs": "",
-    "work_needed": 0,
-    "system_condition": 1,
-    "material_number": "",
-    "component": "Receiver-Separator Tank",
-    "instruction": "1. The compressed air-oil mixture discharged from the airend enters the receiver-separator tank.\\n\\n2. The sudden change in velocity and direction as the mixture enters the tank causes most of the entrained oil to drop out of the air by gravity and impact separation.\\n\\n3. The remaining fine oil mist passes through a coalescing separator element, which captures the smaller oil droplets before the air is discharged from the tank.\\n\\n4. Oil collected in the separator element is continuously drained back into the system through a scavenge line, so it re-enters circulation rather than being lost.",
+    "component": "[Component name from the manual]",
+    "instruction": "1. [What physically enters or triggers this stage, per the manual].\\n\\n2. [What the component does to it, and how, per the manual].\\n\\n3. [What results, and what happens next in the sequence, per the manual].",
     "failure_modes": ""
   }}
 ]
