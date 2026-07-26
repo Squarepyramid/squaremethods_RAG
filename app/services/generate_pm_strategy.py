@@ -462,16 +462,73 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     return buf.read()
 
 
+def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
+    """
+    Pull the equipment's display name and reference code for use in the
+    output filename. Matches the `equipment` table schema: `name` is the
+    human-readable label, `reference_code` is the unique per-company
+    identifier -- both go in the filename so two units with the same
+    name (different reference_code) don't produce identical filenames.
+    Respects the soft-delete pattern (deleted_at IS NULL) used elsewhere
+    in the equipment import system.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, reference_code
+                FROM equipment
+                WHERE id = %s::uuid
+                AND company_id = %s::uuid
+                AND deleted_at IS NULL
+            """, (equipment_id, company_id))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        log.warning(f"No equipment record found for {equipment_id}, falling back to equipment_id in filename")
+        return {"name": "", "reference_code": ""}
+
+    return {"name": row.get("name") or "", "reference_code": row.get("reference_code") or ""}
+
+
+def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
+    """
+    Build a human-readable filename like:
+      PM_Strategy_P185WJD_Compressor_1_A102_2026-07-26.xlsx
+    (name + reference_code). Falls back to the equipment_id if no
+    record is found, so the file is still uniquely identifiable rather
+    than failing.
+    """
+    from datetime import date
+    import re
+
+    label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
+    if not label:
+        label = equipment_id
+
+    # slugify: keep letters/numbers, collapse everything else to a single underscore
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+    slug = slug[:80]  # keep filenames reasonable on Windows/shared drives
+
+    return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-async def generate(equipment_id: str, company_id: str) -> bytes:
+async def generate(equipment_id: str, company_id: str) -> tuple[str, bytes]:
     """
     Full pipeline called from the FastAPI endpoint.
-    1. Fetch all manual chunks for the equipment
-    2. Run nine parallel Claude calls (one per PM type)
-    3. Build and return the Excel file as bytes
+    1. Fetch equipment name/model for the output filename
+    2. Fetch all manual chunks for the equipment
+    3. Run nine parallel Claude calls (one per PM type)
+    4. Build and return (filename, excel_bytes)
        -- always returns a valid file even if all PM types are empty
     """
+    equipment_info = fetch_equipment_info(equipment_id, company_id)
+    filename = build_output_filename(equipment_id, equipment_info)
+
     manual_text = fetch_all_manual_chunks(equipment_id, company_id)
 
     bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
@@ -488,4 +545,5 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     populated = sum(1 for _, _, steps in pm_results if steps)
     log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
 
-    return build_excel(equipment_id, pm_results)
+    excel_bytes = build_excel(equipment_id, pm_results)
+    return filename, excel_bytes
