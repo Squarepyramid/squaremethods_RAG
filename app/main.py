@@ -18,7 +18,7 @@ from app.services.ingest_document import (
     ingest as ingest_document_service,
     run_ingest_job,
 )
-from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
+from app.services.generate_pm_strategy_working import generate as generate_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_equipment_master_data import ingest as import_equipment_master_data_service

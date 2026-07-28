@@ -30,7 +30,6 @@ import io
 import json
 import logging
 import asyncio
-import re
 from typing import Optional
 
 import httpx
@@ -351,129 +350,6 @@ async def call_claude_for_pm_type(
     except Exception as e:
         log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
         return pm_code, pm_name, []   
-# ── Stock component image lookup ─────────────────────────────────────────────
-#
-# No internal curated image library exists yet, so this falls back to
-# Openverse (https://openverse.org) -- an aggregator of Creative Commons
-# and public domain images (Wikimedia Commons, Flickr Commons, museum
-# collections, etc.), rather than raw Google/Bing image search results,
-# which are not cleared for reuse. This gives a generic stock reference
-# for a component TYPE (e.g. "a bearing"), not a photo of this specific
-# unit's actual part -- the reviewer is expected to swap it if it's the
-# wrong image, same as the existing "reviewer fills gaps" workflow.
-#
-# Known limitations, by design for a v1:
-# - Match quality depends entirely on how common/generic the component
-#   name is. "Bearing", "V-belt", "oil filter" will hit; a very specific
-#   OEM part name likely won't -- that's expected to come back blank.
-# - Some Openverse results carry a CC BY / CC BY-SA license, which
-#   technically requires attribution if this ever leaves your org (sent
-#   to a customer, embedded in a deliverable). This implementation does
-#   not track/store attribution -- flagging this now rather than silently
-#   shipping it, since it's a legal detail worth a deliberate decision
-#   once this graduates past internal use.
-# - Openverse's public API has a modest unauthenticated rate limit.
-#   Fine for a single equipment's PM strategy generation; if this runs
-#   at higher volume, register for an Openverse API key/token.
-
-OPENVERSE_API_URL = "https://api.openverse.org/v1/images/"
-_QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
-
-
-def normalize_component_for_image_search(component: str) -> Optional[str]:
-    """
-    Turn a Component field value into a bare search keyword.
-    "Main Drive assembly - Bearings x4"  -> "bearings"
-    "Compressor Oil Filter Element"      -> "compressor oil filter element"
-    "Bearings x8"                       -> "bearings"
-    Returns None for empty/unusable input so callers can skip the lookup.
-    """
-    if not component:
-        return None
-
-    # Strip assembly/subassembly hierarchy -- keep only the last segment
-    # after " - ", since that's the actual component, not its location.
-    term = component.split(" - ")[-1]
-
-    # Strip trailing quantity markers like "x4", "X12"
-    term = _QUANTITY_SUFFIX_RE.sub("", term)
-
-    term = term.strip()
-    return term.lower() if term else None
-
-
-async def fetch_stock_image_url(client: httpx.AsyncClient, keyword: str) -> Optional[str]:
-    """
-    Query Openverse for a single reusable stock image URL matching the
-    keyword. Returns None on any failure or empty result -- a missing
-    image is not an error, it just leaves the Excel cell blank for the
-    reviewer to fill, same as today.
-    """
-    try:
-        response = await client.get(
-            OPENVERSE_API_URL,
-            params={
-                "q": keyword,
-                "license_type": "commercial,modification",  # excludes NC/ND-only licenses
-                "page_size": 1,
-            },
-            timeout=8.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("results") or []
-        if not results:
-            return None
-        return results[0].get("url") or results[0].get("thumbnail")
-    except Exception as e:
-        log.warning(f"Stock image lookup failed for '{keyword}': {type(e).__name__}: {e}")
-        return None
-
-
-async def attach_stock_images(pm_results: list[tuple]) -> list[tuple]:
-    """
-    For every extracted task across all PM types (excluding WP, whose
-    "component" values describe functional stages rather than physical
-    parts a reviewer would want a stock photo of), normalize the
-    Component field and look up one stock image per UNIQUE normalized
-    keyword -- so "Bearings x4" appearing in five different tasks
-    triggers exactly one network call, not five. Mutates each step
-    dict in place with an "image_url" key (empty string if no match or
-    lookup failed), then returns pm_results unchanged in shape.
-    """
-    unique_keywords: set[str] = set()
-    for pm_code, _pm_name, steps in pm_results:
-        if pm_code == "WP":
-            continue
-        for step in steps:
-            keyword = normalize_component_for_image_search(step.get("component", ""))
-            if keyword:
-                unique_keywords.add(keyword)
-
-    if not unique_keywords:
-        return pm_results
-
-    image_cache: dict[str, Optional[str]] = {}
-    async with httpx.AsyncClient() as client:
-        lookups = [fetch_stock_image_url(client, kw) for kw in unique_keywords]
-        results = await asyncio.gather(*lookups)
-        image_cache = dict(zip(unique_keywords, results))
-
-    found = sum(1 for v in image_cache.values() if v)
-    log.info(f"Stock image lookup: {found} / {len(unique_keywords)} unique components matched")
-
-    for pm_code, _pm_name, steps in pm_results:
-        if pm_code == "WP":
-            for step in steps:
-                step["image_url"] = ""
-            continue
-        for step in steps:
-            keyword = normalize_component_for_image_search(step.get("component", ""))
-            step["image_url"] = (image_cache.get(keyword) or "") if keyword else ""
-
-    return pm_results
-
-
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def _estimate_row_height(instruction: str) -> int:
@@ -541,7 +417,6 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
         # Data rows -- skipped naturally if steps is empty
         for step in steps:
             instruction = step.get("instruction", "")
-            image_url = step.get("image_url", "")
             row_values = [
                 step.get("operation", ""),
                 step.get("task_list_description", ""),
@@ -553,15 +428,12 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("component", ""),
                 instruction,
                 step.get("failure_modes", ""),
-                image_url,  # stock reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
+                "",  # Image -- left blank for reviewer to fill
             ]
             for col_idx, value in enumerate(row_values, 1):
                 cell           = ws.cell(row=current_row, column=col_idx, value=value)
                 cell.font      = DATA_FONT
                 cell.alignment = WRAP_ALIGN
-                if col_idx == len(COLUMNS) and image_url:
-                    cell.hyperlink = image_url
-                    cell.font = Font(name="Arial", size=10, color="0563C1", underline="single")
             ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
             current_row += 1
 
@@ -670,7 +542,5 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
 
     populated = sum(1 for _, _, steps in pm_results if steps)
     log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
-
-    pm_results = await attach_stock_images(pm_results)
 
     return build_excel(equipment_id, pm_results)
