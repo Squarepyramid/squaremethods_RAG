@@ -3,8 +3,8 @@ SquareMethods - PM Strategy Generation Service
 ==============================================
 Place this file at: app/services/generate_pm_strategy.py
 
-Pulls all manual chunks for an equipment node, then runs nine
-parallel async Claude calls (one per PM type) to extract and
+Pulls all manual chunks for an equipment node, then runs ten
+parallel async Claude calls (Working Principle + nine PM types) to extract and
 structure maintenance tasks into a downloadable Excel file.
 
 The Excel output matches the PM_strategy.xlsx format exactly so
@@ -277,6 +277,7 @@ async def call_claude_for_pm_type(
     pm_code: str,
     pm_name: str,
     manual_text: str,
+    image_ctx: dict,
 ) -> tuple[str, str, list]:
     log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
     if pm_code == "WP":
@@ -346,6 +347,16 @@ async def call_claude_for_pm_type(
             steps = []
 
         log.info(f"{pm_code} ({pm_name}): {len(steps)} steps extracted")
+
+        # Resolve stock images for this type's steps now, concurrently with
+        # the other steps in this same list. Runs for WP too -- its
+        # components (e.g. "Airend", "Pressure Regulator") are genuine
+        # physical parts, same as PM1-PM9's.
+        await attach_images_to_steps(client, steps, image_ctx)
+        matched = sum(1 for s in steps if s.get("image_url"))
+        if steps:
+            log.info(f"{pm_code} images: {matched} / {len(steps)} steps matched a stock image")
+
         return pm_code, pm_name, steps
 
     except Exception as e:
@@ -362,6 +373,14 @@ async def call_claude_for_pm_type(
 # unit's actual part -- the reviewer is expected to swap it if it's the
 # wrong image, same as the existing "reviewer fills gaps" workflow.
 #
+# Image lookup happens INLINE inside call_claude_for_pm_type(), right
+# after each PM type's steps come back from Claude -- including WP, since
+# its "component" field also names real physical parts (thermocouples,
+# airends, etc.) that benefit from a stock reference just like PM1-PM9.
+# A cache + lock is shared across all ten concurrent PM-type calls (via
+# generate()) so "Bearings x4" appearing in three different PM types
+# still only triggers one network call, not three.
+#
 # Known limitations, by design for a v1:
 # - Match quality depends entirely on how common/generic the component
 #   name is. "Bearing", "V-belt", "oil filter" will hit; a very specific
@@ -377,6 +396,7 @@ async def call_claude_for_pm_type(
 #   at higher volume, register for an Openverse API key/token.
 
 OPENVERSE_API_URL = "https://api.openverse.org/v1/images/"
+OPENVERSE_MAX_CONCURRENCY = 4
 _QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
 
 
@@ -402,76 +422,96 @@ def normalize_component_for_image_search(component: str) -> Optional[str]:
     return term.lower() if term else None
 
 
-async def fetch_stock_image_url(client: httpx.AsyncClient, keyword: str) -> Optional[str]:
+async def fetch_stock_image_url(
+    client: httpx.AsyncClient,
+    keyword: str,
+    semaphore: asyncio.Semaphore,
+) -> Optional[str]:
     """
     Query Openverse for a single reusable stock image URL matching the
     keyword. Returns None on any failure or empty result -- a missing
     image is not an error, it just leaves the Excel cell blank for the
-    reviewer to fill, same as today.
+    reviewer to fill, same as today. The semaphore caps how many of
+    these are in flight at once across the whole generate() run, since
+    Openverse's unauthenticated API has a modest rate limit and up to
+    10 PM/WP types worth of unique components could otherwise all fire
+    at the same moment.
     """
-    try:
-        response = await client.get(
-            OPENVERSE_API_URL,
-            params={
-                "q": keyword,
-                "license_type": "commercial,modification",  # excludes NC/ND-only licenses
-                "page_size": 1,
-            },
-            timeout=8.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("results") or []
-        if not results:
+    async with semaphore:
+        try:
+            response = await client.get(
+                OPENVERSE_API_URL,
+                params={
+                    "q": keyword,
+                    "license_type": "commercial,modification",  # excludes NC/ND-only licenses
+                    "page_size": 1,
+                },
+                headers={"User-Agent": "SquareMethods-PM-Strategy/1.0 (contact: support@squaremethods.com)"},
+                timeout=8.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results") or []
+            if not results:
+                return None
+            return results[0].get("url") or results[0].get("thumbnail")
+        except Exception as e:
+            log.warning(f"Stock image lookup failed for '{keyword}': {type(e).__name__}: {e}")
             return None
-        return results[0].get("url") or results[0].get("thumbnail")
-    except Exception as e:
-        log.warning(f"Stock image lookup failed for '{keyword}': {type(e).__name__}: {e}")
-        return None
 
 
-async def attach_stock_images(pm_results: list[tuple]) -> list[tuple]:
+async def get_or_fetch_stock_image_url(
+    client: httpx.AsyncClient,
+    keyword: str,
+    image_ctx: dict,
+) -> Optional[str]:
     """
-    For every extracted task across all PM types (excluding WP, whose
-    "component" values describe functional stages rather than physical
-    parts a reviewer would want a stock photo of), normalize the
-    Component field and look up one stock image per UNIQUE normalized
-    keyword -- so "Bearings x4" appearing in five different tasks
-    triggers exactly one network call, not five. Mutates each step
-    dict in place with an "image_url" key (empty string if no match or
-    lookup failed), then returns pm_results unchanged in shape.
+    Cache-aware wrapper around fetch_stock_image_url(), shared across
+    all ten concurrent PM/WP-type calls in a single generate() run. If
+    two types both need an image for "bearings" at the same moment, the
+    per-keyword lock (created on first use, guarded by cache_lock)
+    ensures only one of them actually hits the network -- the second
+    waits and reuses the result instead of firing a duplicate request.
+
+    image_ctx is built once in generate() and threaded through every
+    call: {"cache": dict, "locks": dict, "cache_lock": asyncio.Lock,
+    "semaphore": asyncio.Semaphore}.
     """
-    unique_keywords: set[str] = set()
-    for pm_code, _pm_name, steps in pm_results:
-        if pm_code == "WP":
-            continue
-        for step in steps:
-            keyword = normalize_component_for_image_search(step.get("component", ""))
-            if keyword:
-                unique_keywords.add(keyword)
+    cache = image_ctx["cache"]
+    locks = image_ctx["locks"]
+    cache_lock = image_ctx["cache_lock"]
+    semaphore = image_ctx["semaphore"]
 
-    if not unique_keywords:
-        return pm_results
+    if keyword in cache:
+        return cache[keyword]
 
-    image_cache: dict[str, Optional[str]] = {}
-    async with httpx.AsyncClient() as client:
-        lookups = [fetch_stock_image_url(client, kw) for kw in unique_keywords]
-        results = await asyncio.gather(*lookups)
-        image_cache = dict(zip(unique_keywords, results))
+    async with cache_lock:
+        lock = locks.setdefault(keyword, asyncio.Lock())
 
-    found = sum(1 for v in image_cache.values() if v)
-    log.info(f"Stock image lookup: {found} / {len(unique_keywords)} unique components matched")
+    async with lock:
+        if keyword in cache:  # someone else populated it while we waited
+            return cache[keyword]
+        url = await fetch_stock_image_url(client, keyword, semaphore)
+        cache[keyword] = url
+        return url
 
-    for pm_code, _pm_name, steps in pm_results:
-        if pm_code == "WP":
-            for step in steps:
-                step["image_url"] = ""
-            continue
-        for step in steps:
-            keyword = normalize_component_for_image_search(step.get("component", ""))
-            step["image_url"] = (image_cache.get(keyword) or "") if keyword else ""
 
-    return pm_results
+async def attach_images_to_steps(client: httpx.AsyncClient, steps: list, image_ctx: dict) -> None:
+    """
+    Mutates each step dict in place with an "image_url" key. All steps
+    in this one PM/WP type's result are looked up concurrently with
+    each other, and -- via the shared image_ctx -- safely concurrently
+    with every other PM/WP type's lookups running at the same time.
+    """
+    async def resolve(step: dict) -> None:
+        keyword = normalize_component_for_image_search(step.get("component", ""))
+        if not keyword:
+            step["image_url"] = ""
+            return
+        step["image_url"] = await get_or_fetch_stock_image_url(client, keyword, image_ctx) or ""
+
+    if steps:
+        await asyncio.gather(*(resolve(step) for step in steps))
 
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
@@ -636,7 +676,8 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     """
     Full pipeline called from the FastAPI endpoint.
     1. Fetch all manual chunks for the equipment
-    2. Run nine parallel Claude calls (one per PM type)
+    2. Run ten parallel Claude calls (Working Principle + nine PM types),
+       each resolving its own stock component images inline
     3. Build and return the Excel file as bytes
        -- always returns a valid file even if all PM types are empty
 
@@ -660,8 +701,18 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
     async with httpx.AsyncClient() as client:
+        # Built once and shared across all ten concurrent PM/WP calls, so
+        # image lookups happening inside each call at the same time can
+        # dedupe against each other rather than each firing independently.
+        image_ctx = {
+            "cache": {},
+            "locks": {},
+            "cache_lock": asyncio.Lock(),
+            "semaphore": asyncio.Semaphore(OPENVERSE_MAX_CONCURRENCY),
+        }
+
         tasks = [
-            call_claude_for_pm_type(client, bedrock, pm_code, pm_name, manual_text)
+            call_claude_for_pm_type(client, bedrock, pm_code, pm_name, manual_text, image_ctx)
             for pm_code, pm_name in PM_TYPES
         ]
         results = await asyncio.gather(*tasks)
@@ -670,7 +721,5 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
 
     populated = sum(1 for _, _, steps in pm_results if steps)
     log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
-
-    pm_results = await attach_stock_images(pm_results)
 
     return build_excel(equipment_id, pm_results)
