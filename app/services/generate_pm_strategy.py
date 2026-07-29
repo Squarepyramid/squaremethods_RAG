@@ -362,7 +362,7 @@ async def fetch_stock_image_url(
                     "page_size": 1,
                 },
                 headers={"User-Agent": OPENVERSE_USER_AGENT},
-                timeout=8.0,
+                timeout=3.0,
             )
             response.raise_for_status()
             data = response.json()
@@ -417,6 +417,14 @@ async def attach_images_to_steps(client: httpx.AsyncClient, steps: list, image_c
     in this one PM/WP type's result are looked up concurrently with
     each other, and -- via the shared image_ctx -- safely concurrently
     with every other PM/WP type's lookups running at the same time.
+
+    Wrapped in an overall deadline: even if every individual request's
+    own timeout somehow doesn't fire cleanly (e.g. broken VPC egress
+    hanging at the connection level rather than erroring), this caps
+    the total time this PM type's image lookups can consume. If the
+    deadline hits, any steps still unresolved simply get an empty
+    image_url -- the job continues and the Excel still builds, rather
+    than the whole Lambda invocation timing out.
     """
     async def resolve(step: dict) -> None:
         keyword = normalize_component_for_image_search(step.get("component", ""))
@@ -425,8 +433,22 @@ async def attach_images_to_steps(client: httpx.AsyncClient, steps: list, image_c
             return
         step["image_url"] = await get_or_fetch_stock_image_url(client, keyword, image_ctx) or ""
 
-    if steps:
-        await asyncio.gather(*(resolve(step) for step in steps))
+    if not steps:
+        return
+
+    for step in steps:
+        step.setdefault("image_url", "")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(resolve(step) for step in steps)),
+            timeout=IMAGE_LOOKUP_DEADLINE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            f"Image lookup deadline ({IMAGE_LOOKUP_DEADLINE_SECONDS}s) hit for a PM type's "
+            f"{len(steps)} steps -- continuing with whatever resolved so far, rest left blank."
+        )
 
 
 async def call_claude_for_pm_type(
