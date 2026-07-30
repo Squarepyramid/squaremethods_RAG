@@ -62,6 +62,7 @@ import hashlib
 import logging
 import asyncio
 import requests
+from typing import Optional
 
 import boto3
 import psycopg2.extras
@@ -83,16 +84,6 @@ AWS_REGION = os.environ.get("AWS_REGION", "ca-central-1")
 # section-divider logos in the manuals we've tested were consistently
 # well under this size, while real component photos/diagrams were not.
 MIN_IMAGE_BYTES = 8000
-
-_EXTENSION_CONTENT_TYPES = {
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif":  "image/gif",
-    ".bmp":  "image/bmp",
-    ".tiff": "image/tiff",
-    ".webp": "image/webp",
-}
 
 
 # ── File URL to stable UUID ───────────────────────────────────────────────────
@@ -141,14 +132,50 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # ── Image extraction (PDF only for now) ──────────────────────────────────────
 
+def detect_image_format(image_bytes: bytes) -> Optional[tuple]:
+    """
+    Sniff the actual image format from its magic bytes (binary file
+    signature), rather than trusting the PDF's internal image object
+    name -- pypdf's img.data returns the real decoded bytes (often JPEG
+    for photos) regardless of what that internal name claims, and that
+    name is frequently missing or generic anyway. Tagging an S3 object
+    with the wrong extension/Content-Type (e.g. real JPEG bytes stored
+    as .png) makes browsers unable to parse it, which shows up as a
+    generic file icon instead of the actual image -- exactly the
+    symptom that prompted this fix.
+
+    Returns (extension, content_type), or None if the bytes don't match
+    any recognized image signature -- in which case the image should be
+    skipped entirely rather than uploaded with a guessed, likely-wrong
+    format.
+    """
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg", "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png", "image/png"
+    if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif", "image/gif"
+    if image_bytes.startswith(b"BM"):
+        return ".bmp", "image/bmp"
+    if image_bytes[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tiff", "image/tiff"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    return None
+
+
 def extract_images_from_pdf(file_bytes: bytes) -> list:
     """
     Extract embedded images from a PDF, paired with the extracted text
     of the page they appear on (used as coarse "context_text" for later
     keyword matching against a component name).
 
-    Returns a list of dicts: {page_number, image_bytes, extension, context_text}
-    Skips images smaller than MIN_IMAGE_BYTES (logos/icons/watermarks).
+    Returns a list of dicts: {page_number, image_bytes, extension, content_type, context_text}
+    Skips images smaller than MIN_IMAGE_BYTES (logos/icons/watermarks)
+    AND images whose bytes don't match a recognized image format --
+    uploading those anyway would just produce another broken-icon
+    result down the line, so it's better to leave the cell blank than
+    to store data that will never render correctly.
 
     NOTE: DOCX image extraction is not implemented yet -- extract_text_from_docx
     only pulls paragraph text. If DOCX manuals with embedded images become
@@ -183,13 +210,20 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
             if len(image_bytes) < MIN_IMAGE_BYTES:
                 continue  # likely a logo/icon/watermark, not a component reference
 
-            _, ext = os.path.splitext(getattr(img, "name", "") or "")
-            ext = ext.lower() if ext else ".png"
+            detected = detect_image_format(image_bytes)
+            if detected is None:
+                log.warning(
+                    f"Skipping image on page {page_number}: bytes don't match a "
+                    f"recognized image format (would render as a broken icon if uploaded)."
+                )
+                continue
+            ext, content_type = detected
 
             images.append({
                 "page_number":  page_number,
                 "image_bytes":  image_bytes,
                 "extension":    ext,
+                "content_type": content_type,
                 "context_text": page_text.strip(),
             })
 
@@ -342,8 +376,8 @@ def save_manual_images(conn, images: list, file_url: str, equipment_id: str, com
 
     rows = []
     for idx, img in enumerate(images):
-        ext = img["extension"] if img["extension"] in _EXTENSION_CONTENT_TYPES else ".png"
-        content_type = _EXTENSION_CONTENT_TYPES.get(ext, "application/octet-stream")
+        ext = img["extension"]
+        content_type = img["content_type"]
 
         s3_key = f"manual-images/{company_id}/{equipment_id}/{doc_uuid}/{img['page_number']}_{idx}{ext}"
 
