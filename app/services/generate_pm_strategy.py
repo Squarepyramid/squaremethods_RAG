@@ -3,9 +3,11 @@ SquareMethods - PM Strategy Generation Service
 ==============================================
 Place this file at: app/services/generate_pm_strategy.py
 
-Pulls all manual chunks for an equipment node, then runs nine
-parallel async Claude calls (one per PM type) to extract and
-structure maintenance tasks into a downloadable Excel file.
+Pulls all manual chunks for an equipment node, then runs ten
+parallel async Claude calls (Working Principle + nine PM types) to
+extract and structure maintenance tasks into a downloadable Excel
+file. Each call also resolves stock component images for its own
+steps inline, concurrently with the other calls.
 
 The Excel output matches the PM_strategy.xlsx format exactly so
 the reviewer can fill gaps, add image URLs, then upload it via
@@ -30,9 +32,9 @@ import io
 import json
 import logging
 import asyncio
+import re
 from typing import Optional
 
-import httpx
 import boto3
 import os
 from openpyxl import Workbook
@@ -268,14 +270,152 @@ EQUIPMENT MANUAL:
 {manual_text}"""
 
 
+# ── Component image lookup ───────────────────────────────────────────────────
+#
+# Images come ONLY from this equipment's own ingested manual
+# (equipment_manual_images table, populated at ingestion time by
+# ingest_document.py's PDF image extraction). No external image search
+# (Openverse or otherwise) -- if the manual has no relevant image, the
+# cell is left blank for the reviewer to fill, rather than substituting
+# a generic stock photo that isn't actually this equipment's part.
+#
+# This is a fully local operation: the S3 key is already in the DB, and
+# generating a presigned URL is a local signing call, not a network
+# request. There's no timeout, retry, or concurrency-limiting logic
+# needed here because there's nothing that can hang or rate-limit.
+#
+# Image lookup happens INLINE inside call_claude_for_pm_type(), right
+# after each PM/WP type's steps come back from Claude. WP is included:
+# its "component" field names real physical parts (e.g. "Airend",
+# "Pressure Regulator"), same as PM1-PM9's.
+#
+# Known limitation, by design: match quality depends on the ingested
+# manual actually having a relevant image AND that image's page text
+# mentioning the component by name. A manual with no images, or a
+# components section whose images sit on pages that don't share the
+# component's wording, will come back blank -- there's no fallback.
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
+MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
+
+_QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
+
+
+def normalize_component_for_image_search(component: str) -> Optional[str]:
+    """
+    Turn a Component field value into a bare search keyword.
+    "Main Drive assembly - Bearings x4"  -> "bearings"
+    "Compressor Oil Filter Element"      -> "compressor oil filter element"
+    "Bearings x8"                       -> "bearings"
+    Returns None for empty/unusable input so callers can skip the lookup.
+    """
+    if not component:
+        return None
+
+    # Strip assembly/subassembly hierarchy -- keep only the last segment
+    # after " - ", since that's the actual component, not its location.
+    term = component.split(" - ")[-1]
+
+    # Strip trailing quantity markers like "x4", "X12"
+    term = _QUANTITY_SUFFIX_RE.sub("", term)
+
+    term = term.strip()
+    return term.lower() if term else None
+
+
+def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> list:
+    """
+    Pulls every extracted manual image row for this equipment ONCE, up
+    front, so matching against many components doesn't mean many DB
+    round-trips. Returns a list of {s3_key, context_text, page_number}
+    dicts. Empty list if the equipment has no ingested images (e.g. a
+    DOCX manual, or a PDF with no images that cleared the size filter).
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s3_key, context_text, page_number
+                FROM equipment_manual_images
+                WHERE equipment_id = %s::uuid
+                AND company_id = %s::uuid
+            """, (equipment_id, company_id))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    log.info(f"Loaded {len(rows)} manual images for equipment {equipment_id}")
+    return [
+        {"s3_key": r["s3_key"], "context_text": (r["context_text"] or "").lower(), "page_number": r["page_number"]}
+        for r in rows
+    ]
+
+
+def match_manual_image(keyword: str, manual_images: list) -> Optional[str]:
+    """
+    Coarse keyword match: first manual image whose page context text
+    contains the keyword. Not a precise per-figure caption match -- see
+    the module comment above for why that's an acceptable trade-off.
+    Returns the S3 KEY (not a URL); presigning happens separately so
+    this function stays a pure, side-effect-free string match.
+    """
+    if not keyword or not manual_images:
+        return None
+    for img in manual_images:
+        if keyword in img["context_text"]:
+            return img["s3_key"]
+    return None
+
+
+def presign_manual_image_url(s3_key: str) -> Optional[str]:
+    """
+    Generate a presigned GET URL for a manual image. Images are stored
+    privately (see ingest_document.py) since manuals may be confidential
+    OEM documents -- this is a local signing operation, not a network
+    call, so it can't hang or fail on connectivity.
+    """
+    try:
+        s3 = boto3.client("s3", region_name=BEDROCK_REGION)
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": s3_key},
+            ExpiresIn=MANUAL_IMAGE_URL_EXPIRY_SECONDS,
+        )
+    except Exception as e:
+        log.warning(f"Failed to presign manual image URL for key {s3_key}: {type(e).__name__}: {e}")
+        return None
+
+
+def resolve_component_image_url(keyword: str, manual_images: list) -> str:
+    """
+    Fully synchronous and local -- no network call, so nothing here can
+    hang or need a timeout. Returns "" if the equipment's manual has no
+    matching image; the Excel cell is simply left blank in that case.
+    """
+    manual_key = match_manual_image(keyword, manual_images)
+    if not manual_key:
+        return ""
+    return presign_manual_image_url(manual_key) or ""
+
+
+def attach_images_to_steps(steps: list, manual_images: list) -> None:
+    """
+    Mutates each step dict in place with an "image_url" key, matched
+    against this equipment's own ingested manual images. Purely
+    synchronous -- no async/await needed since there's no network call
+    involved anywhere in this path.
+    """
+    for step in steps:
+        keyword = normalize_component_for_image_search(step.get("component", ""))
+        step["image_url"] = resolve_component_image_url(keyword, manual_images) if keyword else ""
 
 
 async def call_claude_for_pm_type(
-    client: httpx.AsyncClient,
     bedrock,
     pm_code: str,
     pm_name: str,
     manual_text: str,
+    manual_images: list,
 ) -> tuple[str, str, list]:
     log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
     if pm_code == "WP":
@@ -345,11 +485,24 @@ async def call_claude_for_pm_type(
             steps = []
 
         log.info(f"{pm_code} ({pm_name}): {len(steps)} steps extracted")
+
+        # Resolve manual images for this type's steps now. Purely local
+        # (DB already fetched, presigning is local signing) -- no network
+        # call, so this can't hang. Runs for WP too -- its components
+        # (e.g. "Airend", "Pressure Regulator") are genuine physical
+        # parts, same as PM1-PM9's.
+        attach_images_to_steps(steps, manual_images)
+        matched = sum(1 for s in steps if s.get("image_url"))
+        if steps:
+            log.info(f"{pm_code} images: {matched} / {len(steps)} steps matched a manual image")
+
         return pm_code, pm_name, steps
 
     except Exception as e:
         log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
-        return pm_code, pm_name, []   
+        return pm_code, pm_name, []
+
+
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def _estimate_row_height(instruction: str) -> int:
@@ -417,6 +570,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
         # Data rows -- skipped naturally if steps is empty
         for step in steps:
             instruction = step.get("instruction", "")
+            image_url = step.get("image_url", "")
             row_values = [
                 step.get("operation", ""),
                 step.get("task_list_description", ""),
@@ -428,12 +582,15 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("component", ""),
                 instruction,
                 step.get("failure_modes", ""),
-                "",  # Image -- left blank for reviewer to fill
+                image_url,  # stock reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
             ]
             for col_idx, value in enumerate(row_values, 1):
                 cell           = ws.cell(row=current_row, column=col_idx, value=value)
                 cell.font      = DATA_FONT
                 cell.alignment = WRAP_ALIGN
+                if col_idx == len(COLUMNS) and image_url:
+                    cell.hyperlink = image_url
+                    cell.font = Font(name="Arial", size=10, color="0563C1", underline="single")
             ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
             current_row += 1
 
@@ -489,7 +646,6 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
     than failing.
     """
     from datetime import date
-    import re
 
     label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
     if not label:
@@ -508,7 +664,8 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     """
     Full pipeline called from the FastAPI endpoint.
     1. Fetch all manual chunks for the equipment
-    2. Run nine parallel Claude calls (one per PM type)
+    2. Run ten parallel Claude calls (Working Principle + nine PM types),
+       each resolving its own stock component images inline
     3. Build and return the Excel file as bytes
        -- always returns a valid file even if all PM types are empty
 
@@ -531,12 +688,17 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
 
     bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            call_claude_for_pm_type(client, bedrock, pm_code, pm_name, manual_text)
-            for pm_code, pm_name in PM_TYPES
-        ]
-        results = await asyncio.gather(*tasks)
+    # Fetched once, up front -- this equipment's own manual images are
+    # matched in-memory against every step's component keyword, rather
+    # than one DB round-trip per keyword. No network client needed for
+    # image lookup anymore: it's a local list match + local S3 presign.
+    manual_images = fetch_manual_images_for_equipment(equipment_id, company_id)
+
+    tasks = [
+        call_claude_for_pm_type(bedrock, pm_code, pm_name, manual_text, manual_images)
+        for pm_code, pm_name in PM_TYPES
+    ]
+    results = await asyncio.gather(*tasks)
 
     pm_results = list(results)
 
