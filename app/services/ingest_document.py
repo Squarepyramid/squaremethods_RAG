@@ -2,10 +2,21 @@
 SquareMethods - Document Ingestion Service
 ==========================================
 Parses uploaded equipment manuals (PDF or Word) and stores
-chunked embeddings in knowledge_embeddings. Also extracts embedded
-images from PDF manuals and stores them in S3 + equipment_manual_images,
-so PM strategy generation can reference the manual's OWN component
-images instead of a generic stock photo pulled from the open web.
+chunked embeddings in knowledge_embeddings. Also (see IMAGE_EXTRACTION_ENABLED
+below) can extract embedded images from PDF manuals and store them in S3 +
+equipment_manual_images, so PM strategy generation can reference the
+manual's OWN component images instead of a generic stock photo pulled
+from the open web.
+
+*** IMAGE EXTRACTION IS CURRENTLY DISABLED (IMAGE_EXTRACTION_ENABLED = False) ***
+Per-image S3 uploads were adding meaningful latency to ingestion,
+especially on manuals with many embedded drawings. Turned off for now so
+ingestion stays fast; all the image extraction/storage code below is
+intact and unused, not deleted -- flip the flag back to True to resume.
+See that constant's comment for what changes when you do. Nothing about
+re-enabling it requires re-ingesting already-processed documents' TEXT
+chunks; only documents ingested while the flag is off will be missing
+images until they're re-ingested.
 
 Key design decisions:
   - Each chunk gets a stable UUID derived from (doc_uuid, chunk_index)
@@ -88,6 +99,19 @@ EMBED_CONCURRENCY  = 10    # max simultaneous embedding calls in flight
 
 S3_BUCKET  = os.environ.get("S3_BUCKET", "squaremethods")
 AWS_REGION = os.environ.get("AWS_REGION", "ca-central-1")
+
+# Master switch for the PDF image-extraction + S3-upload step. Off for now
+# to keep ingestion fast -- extracting every embedded image and uploading
+# each one to S3 synchronously was the slow part of ingest, not the text
+# chunking/embedding. When you're ready to bring images back:
+#   1. Flip this to True.
+#   2. That's it -- extract_images_from_pdf(), save_manual_images(), and
+#      clear_document_images() are all still here and unchanged, just not
+#      being called from _run_ingest() while this is False.
+# If ingestion needs to stay fast even with images back on, the next step
+# would be moving the S3 uploads to their own async/background step rather
+# than inline in the main ingest job -- not needed until this flag is on.
+IMAGE_EXTRACTION_ENABLED = False
 
 # Heuristic filter for skipping small logos/icons/watermarks extracted
 # from a PDF. Tune based on what your actual manuals contain -- OEM
@@ -600,10 +624,14 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     chunks = chunk_text(text)
     log.info(f"Created {len(chunks)} chunks.")
 
-    # Image extraction is PDF-only for now -- see extract_images_from_pdf's
-    # docstring for the DOCX gap.
+    # Image extraction is PDF-only, and gated behind IMAGE_EXTRACTION_ENABLED
+    # (currently False -- see module docstring). Skipping this entirely
+    # while disabled is the whole point: no per-page image pulls, no
+    # per-image S3 uploads, so ingest is just download -> text -> chunk ->
+    # embed. See extract_images_from_pdf's docstring for the DOCX gap
+    # whenever this is turned back on.
     images = []
-    if filename.lower().endswith(".pdf"):
+    if IMAGE_EXTRACTION_ENABLED and filename.lower().endswith(".pdf"):
         try:
             images = extract_images_from_pdf(file_bytes)
         except Exception as e:
@@ -617,8 +645,9 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
         clear_document_chunks(conn, file_url, company_id)
         save_chunks(conn, chunks, file_url, equipment_id, company_id)
 
-        clear_document_images(conn, file_url, company_id)
-        save_manual_images(conn, images, file_url, equipment_id, company_id)
+        if IMAGE_EXTRACTION_ENABLED:
+            clear_document_images(conn, file_url, company_id)
+            save_manual_images(conn, images, file_url, equipment_id, company_id)
     finally:
         conn.close()
 
