@@ -24,15 +24,35 @@ Key design decisions:
     with a table of callouts below it. Page-level association is a
     reasonable middle ground: coarser than a true caption match, but
     still specific to the actual equipment, not a generic web photo.
-  - Extracted images are size-filtered (MIN_IMAGE_BYTES) as a first-pass
-    heuristic to skip small logos/watermarks/icons -- not perfect, but
-    avoids flooding storage with dozens of duplicate section-header
-    logos that OEM manuals commonly repeat on every divider page.
+  - Extracted images are filtered by PIXEL DIMENSIONS (MIN_IMAGE_WIDTH_PX
+    / MIN_IMAGE_HEIGHT_PX), not byte size, as a heuristic to skip small
+    logos/watermarks/icons -- byte size is an unreliable proxy since
+    compression ratio varies wildly (a highly-compressed large diagram
+    can be smaller in bytes than a simple, uncompressed watermark).
+  - Images are extracted via pypdf's img.image (a fully-decoded PIL
+    Image), then explicitly re-encoded as PNG. NOT via img.data: that
+    property is frequently just the raw undecoded pixel stream with no
+    file header at all (normal for FlateDecode-compressed images, very
+    common for line-art/technical diagrams), so guessing a file
+    extension for it produces invalid files that render as a broken
+    icon. Going through img.image + explicit PNG re-encode sidesteps
+    the problem entirely -- always a valid, renderable file regardless
+    of the PDF's internal compression filter.
   - S3 stores images privately; only the S3 KEY is saved in the DB, not
     a permanent public URL. A presigned URL is generated on demand
     whenever an image is actually referenced (e.g. during PM strategy
     generation), since these manuals may be confidential OEM documents
     and shouldn't be permanently public on the open internet.
+
+KNOWN LIMITATION (not fixed here, flagging for a deliberate decision):
+  clear_document_chunks()/save_chunks() and clear_document_images()/
+  save_manual_images() each commit independently rather than as one
+  transaction per document. If save_chunks() (or save_manual_images())
+  fails partway through, after the corresponding clear_* already
+  committed, the document is left with zero chunks/images until the
+  next successful re-ingest -- a silent gap, not a crash. Worth wrapping
+  each clear+save pair in a single transaction if ingest reliability
+  becomes a priority.
 
 REQUIRES A DB MIGRATION before this will work -- see the
 equipment_manual_images table DDL in the module docstring below the
@@ -79,20 +99,11 @@ S3_BUCKET  = os.environ.get("S3_BUCKET", "squaremethods")
 AWS_REGION = os.environ.get("AWS_REGION", "ca-central-1")
 
 # Heuristic filter for skipping small logos/icons/watermarks extracted
-# from a PDF. Tune based on what your actual manuals contain -- OEM
-# section-divider logos in the manuals we've tested were consistently
-# well under this size, while real component photos/diagrams were not.
-MIN_IMAGE_BYTES = 8000
-
-_EXTENSION_CONTENT_TYPES = {
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif":  "image/gif",
-    ".bmp":  "image/bmp",
-    ".tiff": "image/tiff",
-    ".webp": "image/webp",
-}
+# from a PDF, based on decoded pixel dimensions (not byte size -- see
+# module docstring for why). Tune based on what your actual manuals
+# contain.
+MIN_IMAGE_WIDTH_PX  = 120
+MIN_IMAGE_HEIGHT_PX = 120
 
 
 # ── File URL to stable UUID ───────────────────────────────────────────────────
@@ -147,8 +158,18 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
     of the page they appear on (used as coarse "context_text" for later
     keyword matching against a component name).
 
-    Returns a list of dicts: {page_number, image_bytes, extension, context_text}
-    Skips images smaller than MIN_IMAGE_BYTES (logos/icons/watermarks).
+    Returns a list of dicts: {page_number, image_bytes, extension, content_type, context_text}
+
+    Uses pypdf's img.image (a decoded PIL Image object), NOT img.data --
+    see the module docstring for why img.data is unsafe to upload
+    directly (it's often a raw pixel stream with no file header,
+    producing broken/unrenderable files). Every image extracted here is
+    explicitly re-encoded as PNG via Pillow, guaranteeing a valid file
+    regardless of the PDF's internal compression filter.
+
+    Filters on pixel DIMENSIONS (MIN_IMAGE_WIDTH_PX / MIN_IMAGE_HEIGHT_PX)
+    to skip logos/icons/watermarks -- more reliable than byte size, which
+    varies with compression ratio.
 
     NOTE: DOCX image extraction is not implemented yet -- extract_text_from_docx
     only pulls paragraph text. If DOCX manuals with embedded images become
@@ -175,25 +196,37 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
 
         for img in page_images:
             try:
-                image_bytes = img.data
+                pil_image = img.image  # fully-decoded PIL Image, regardless of internal PDF filter
             except Exception as e:
-                log.warning(f"Failed to read image data on page {page_number}: {e}")
+                log.warning(f"Failed to decode image on page {page_number}: {type(e).__name__}: {e}")
                 continue
 
-            if len(image_bytes) < MIN_IMAGE_BYTES:
+            width, height = pil_image.size
+            if width < MIN_IMAGE_WIDTH_PX or height < MIN_IMAGE_HEIGHT_PX:
                 continue  # likely a logo/icon/watermark, not a component reference
 
-            _, ext = os.path.splitext(getattr(img, "name", "") or "")
-            ext = ext.lower() if ext else ".png"
+            try:
+                # Pillow can only save certain modes as PNG cleanly -- some
+                # scanned/print-sourced PDFs yield CMYK images, which need
+                # converting first.
+                if pil_image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                    pil_image = pil_image.convert("RGB")
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG")
+                image_bytes = buf.getvalue()
+            except Exception as e:
+                log.warning(f"Failed to re-encode image on page {page_number} as PNG: {type(e).__name__}: {e}")
+                continue
 
             images.append({
                 "page_number":  page_number,
                 "image_bytes":  image_bytes,
-                "extension":    ext,
+                "extension":    ".png",
+                "content_type": "image/png",
                 "context_text": page_text.strip(),
             })
 
-    log.info(f"Extracted {len(images)} candidate images (>{MIN_IMAGE_BYTES} bytes) from PDF.")
+    log.info(f"Extracted {len(images)} candidate images (>={MIN_IMAGE_WIDTH_PX}x{MIN_IMAGE_HEIGHT_PX}px) from PDF.")
     return images
 
 
@@ -342,8 +375,8 @@ def save_manual_images(conn, images: list, file_url: str, equipment_id: str, com
 
     rows = []
     for idx, img in enumerate(images):
-        ext = img["extension"] if img["extension"] in _EXTENSION_CONTENT_TYPES else ".png"
-        content_type = _EXTENSION_CONTENT_TYPES.get(ext, "application/octet-stream")
+        ext = img["extension"]
+        content_type = img["content_type"]
 
         s3_key = f"manual-images/{company_id}/{equipment_id}/{doc_uuid}/{img['page_number']}_{idx}{ext}"
 
