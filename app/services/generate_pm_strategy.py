@@ -26,6 +26,24 @@ PM Types:
   PM7 - Cleaning
   PM8 - Safety Inspection
   PM9 - Software Back-up
+
+CHANGE LOG (this revision):
+  - Image matching now tries an exact match on the manual's own part
+    number (material_number) before falling back to the fuzzy
+    keyword-in-page-text match on the component description. This is
+    strictly additive: if material_number is blank or doesn't match
+    anything, behavior is identical to before. See match_manual_image().
+  - The material_number field instruction in build_pm_prompt was
+    broadened from "SAP material number if mentioned" to also capture
+    a manual's own parts-list number when the manual provides one --
+    it was previously easy for Claude to leave this blank on manuals
+    that don't use SAP terminology even when they clearly list part
+    numbers (e.g. "341047").
+  - fetch_all_manual_chunks now also handles the 4-segment content
+    prefix ("equipment_id | doc_id | bom_items | text") written by the
+    updated ingest_document.py, in addition to the older 2- and
+    3-segment formats, so this keeps working against both old and
+    newly-ingested chunks without a backfill.
 """
 
 import io
@@ -104,7 +122,15 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
     Fetch ALL manual chunks for this equipment node and concatenate
     them into a single text block for Claude to reason over.
     No vector search -- full recall by equipment_id prefix match.
-    Handles both old and new content prefix formats.
+
+    Handles three content prefix formats, oldest to newest:
+      1. "equipment_id:{id} | {text}"                                (2 segments)
+      2. "equipment_id:{id} | doc_id:{uuid} | {text}"                (3 segments)
+      3. "equipment_id:{id} | doc_id:{uuid} | bom_items:... | {text}" (4 segments, current)
+    Splitting on " | " with no maxsplit and taking everything after the
+    last recognized "key:value" metadata segment keeps this working
+    against whichever format a given chunk happens to be in, without
+    needing to touch previously-ingested rows.
     """
     conn = get_db_connection()
     try:
@@ -127,19 +153,28 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
             "Please upload and ingest a document for this node first."
         )
 
+    known_prefix_keys = ("equipment_id:", "doc_id:", "bom_items:")
+
     clean_chunks = []
     for r in rows:
         content = r["content"]
-        # Split on " | " to strip prefixes
-        # Old format: "equipment_id:{id} | actual content"
-        # New format: "equipment_id:{id} | doc_id:{uuid} | actual content"
-        parts = content.split(" | ", 2)
-        if len(parts) == 3:
-            clean_chunks.append(parts[2])   # new format
-        elif len(parts) == 2:
-            clean_chunks.append(parts[1])   # old format
+        parts = content.split(" | ")
+
+        # Consume leading "key:value" segments (in the known set) as
+        # metadata; the first segment that isn't one of those starts the
+        # actual chunk text. Rejoin the remainder with " | " in case the
+        # chunk's own text legitimately contains that substring further in.
+        split_at = 0
+        for part in parts:
+            if part.startswith(known_prefix_keys):
+                split_at += 1
+            else:
+                break
+
+        if split_at == 0:
+            clean_chunks.append(content)  # no recognized prefix at all
         else:
-            clean_chunks.append(content)    # fallback
+            clean_chunks.append(" | ".join(parts[split_at:]))
 
     full_text = "\n\n".join(clean_chunks)
     log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
@@ -242,7 +277,7 @@ For each task you find, extract the following fields:
 - hrs: estimated TECHNICIAN TIME to perform this specific task, as a decimal number of hours (e.g. 0.1, 0.5, 1.0). This is NOT the maintenance interval -- if the manual says "every 1000 hours," that 1000 belongs in frequency, never here. Leave blank if no time estimate is given.
 - work_needed: 1 if active work is required, 0 if observation only. Default to 1.
 - system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
-- material_number: SAP material number if mentioned, otherwise leave blank.
+- material_number: the manual's OWN part/component number for this item, if the manual provides one -- this includes a formal SAP material number, but just as importantly it includes any parts-list, drawing, or catalog number the manual itself prints next to this component (e.g. "341047", "992-03377", "8-110-626-107"). Copy it exactly as printed, including hyphens/periods. Leave blank only if the manual truly gives no such number for this component.
 - component: the specific component name only (without the assembly hierarchy), e.g. "Bearings x8"
 - instruction: step-by-step work instruction a technician can follow. Number each step starting at 1. Put EACH numbered step on its own line, with a blank line between steps -- use a literal "\\n\\n" (newline, newline) between step N and step N+1, never a space. Be specific.
 - failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
@@ -279,6 +314,19 @@ EQUIPMENT MANUAL:
 # cell is left blank for the reviewer to fill, rather than substituting
 # a generic stock photo that isn't actually this equipment's part.
 #
+# Matching is now two-tier:
+#   1. Exact match on material_number (the manual's own part number, e.g.
+#      "341047") against a drawing page's extracted text. This is a much
+#      stronger, lower-false-positive signal than a keyword match, since
+#      part numbers are specific tokens rather than descriptive words that
+#      might appear on several unrelated pages ("bearing" turning up on
+#      six different drawings). It only fires when Claude actually
+#      populated material_number for that step AND that exact string
+#      appears on some page's extracted text -- otherwise it's a silent
+#      no-op and behavior falls through to tier 2, unchanged from before.
+#   2. Fallback: keyword-in-page-text match on the component description,
+#      same coarse approach as before.
+#
 # This is a fully local operation: the S3 key is already in the DB, and
 # generating a presigned URL is a local signing call, not a network
 # request. There's no timeout, retry, or concurrency-limiting logic
@@ -291,14 +339,21 @@ EQUIPMENT MANUAL:
 #
 # Known limitation, by design: match quality depends on the ingested
 # manual actually having a relevant image AND that image's page text
-# mentioning the component by name. A manual with no images, or a
-# components section whose images sit on pages that don't share the
-# component's wording, will come back blank -- there's no fallback.
+# mentioning the component (by part number or by name). A manual with
+# no images, or a components section whose images sit on pages that
+# don't share the component's wording or number, will come back blank --
+# there's no fallback beyond tier 2.
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
 MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
 
 _QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
+
+# Guard against spurious substring matches on short/generic material
+# numbers (e.g. a stray "24" matching all over a page of tables). Real
+# manual part numbers in the manuals we've seen are consistently longer
+# than this, so it's a cheap, conservative filter rather than a tuned one.
+MIN_PART_NUMBER_MATCH_LENGTH = 4
 
 
 def normalize_component_for_image_search(component: str) -> Optional[str]:
@@ -351,20 +406,29 @@ def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> lis
     ]
 
 
-def match_manual_image(keyword: str, manual_images: list) -> Optional[str]:
+def match_manual_image(component_keyword: str, material_number: str, manual_images: list) -> tuple:
     """
-    Coarse keyword match: first manual image whose page context text
-    contains the keyword. Not a precise per-figure caption match -- see
-    the module comment above for why that's an acceptable trade-off.
-    Returns the S3 KEY (not a URL); presigning happens separately so
-    this function stays a pure, side-effect-free string match.
+    Two-tier match against this equipment's own ingested manual images.
+    Returns (s3_key, match_method) where match_method is "part_number",
+    "keyword", or None if nothing matched. Returning the method alongside
+    the key is just for the summary logging in call_claude_for_pm_type --
+    callers that don't care can ignore it.
     """
-    if not keyword or not manual_images:
-        return None
-    for img in manual_images:
-        if keyword in img["context_text"]:
-            return img["s3_key"]
-    return None
+    if not manual_images:
+        return None, None
+
+    part_no = (material_number or "").strip().lower()
+    if len(part_no) >= MIN_PART_NUMBER_MATCH_LENGTH:
+        for img in manual_images:
+            if part_no in img["context_text"]:
+                return img["s3_key"], "part_number"
+
+    if component_keyword:
+        for img in manual_images:
+            if component_keyword in img["context_text"]:
+                return img["s3_key"], "keyword"
+
+    return None, None
 
 
 def presign_manual_image_url(s3_key: str) -> Optional[str]:
@@ -386,28 +450,37 @@ def presign_manual_image_url(s3_key: str) -> Optional[str]:
         return None
 
 
-def resolve_component_image_url(keyword: str, manual_images: list) -> str:
+def resolve_component_image_url(component_keyword: str, material_number: str, manual_images: list) -> tuple:
     """
     Fully synchronous and local -- no network call, so nothing here can
-    hang or need a timeout. Returns "" if the equipment's manual has no
-    matching image; the Excel cell is simply left blank in that case.
+    hang or need a timeout. Returns (url, match_method); url is "" if
+    the equipment's manual has no matching image, in which case the
+    Excel cell is simply left blank.
     """
-    manual_key = match_manual_image(keyword, manual_images)
+    manual_key, method = match_manual_image(component_keyword, material_number, manual_images)
     if not manual_key:
-        return ""
-    return presign_manual_image_url(manual_key) or ""
+        return "", None
+    return presign_manual_image_url(manual_key) or "", method
 
 
-def attach_images_to_steps(steps: list, manual_images: list) -> None:
+def attach_images_to_steps(steps: list, manual_images: list) -> dict:
     """
     Mutates each step dict in place with an "image_url" key, matched
     against this equipment's own ingested manual images. Purely
     synchronous -- no async/await needed since there's no network call
     involved anywhere in this path.
+
+    Returns a small {"part_number": n, "keyword": n} tally for logging.
     """
+    tally = {"part_number": 0, "keyword": 0}
     for step in steps:
         keyword = normalize_component_for_image_search(step.get("component", ""))
-        step["image_url"] = resolve_component_image_url(keyword, manual_images) if keyword else ""
+        material_number = step.get("material_number", "")
+        url, method = resolve_component_image_url(keyword or "", material_number, manual_images)
+        step["image_url"] = url
+        if method:
+            tally[method] += 1
+    return tally
 
 
 async def call_claude_for_pm_type(
@@ -491,10 +564,13 @@ async def call_claude_for_pm_type(
         # call, so this can't hang. Runs for WP too -- its components
         # (e.g. "Airend", "Pressure Regulator") are genuine physical
         # parts, same as PM1-PM9's.
-        attach_images_to_steps(steps, manual_images)
-        matched = sum(1 for s in steps if s.get("image_url"))
+        tally = attach_images_to_steps(steps, manual_images)
+        matched = tally["part_number"] + tally["keyword"]
         if steps:
-            log.info(f"{pm_code} images: {matched} / {len(steps)} steps matched a manual image")
+            log.info(
+                f"{pm_code} images: {matched}/{len(steps)} steps matched "
+                f"({tally['part_number']} by part number, {tally['keyword']} by keyword)"
+            )
 
         return pm_code, pm_name, steps
 
@@ -582,7 +658,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("component", ""),
                 instruction,
                 step.get("failure_modes", ""),
-                image_url,  # stock reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
+                image_url,  # manual reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
             ]
             for col_idx, value in enumerate(row_values, 1):
                 cell           = ws.cell(row=current_row, column=col_idx, value=value)
