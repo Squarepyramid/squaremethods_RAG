@@ -12,6 +12,10 @@ Job aid titles are prefixed with the equipment name so that
 job aids for different equipment are distinguishable, e.g.
   "Wrapper 4 - PM2 - Lubrication"
 
+Each job aid's image is set to the equipment's own image
+(job_aids.image = equipment.image), so the job aid card shows
+a photo of the equipment it belongs to.
+
 Steps with an Image column value get that URL stored in the
 procedures.image column. Steps with a blank Image column get
 image = NULL.
@@ -177,25 +181,26 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
 
 # ── Equipment lookup ──────────────────────────────────────────────────────────
 
-def fetch_equipment_name(conn, equipment_id: str, company_id: str) -> str:
+def fetch_equipment(conn, equipment_id: str, company_id: str) -> dict:
     """
-    Look up the equipment name so job aid titles can be prefixed with it,
-    e.g. "Wrapper 4 - PM2 - Lubrication" instead of just "PM2 - Lubrication".
-    Falls back to a generic label if the equipment cannot be found.
+    Look up the equipment name and image so job aid titles can be prefixed
+    with the equipment name (e.g. "Wrapper 4 - PM2 - Lubrication") and the
+    job aid's image can be set to a photo of the equipment.
+    Falls back to a generic name and no image if the equipment cannot be found.
     """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT name FROM equipment
+            SELECT name, image FROM equipment
             WHERE id = %s::uuid
             AND company_id = %s::uuid
         """, (equipment_id, company_id))
         row = cur.fetchone()
 
     if row and row["name"]:
-        return row["name"]
+        return {"name": row["name"], "image": row.get("image")}
 
-    log.warning(f"Equipment name not found for {equipment_id}, using fallback label")
-    return "Equipment"
+    log.warning(f"Equipment not found for {equipment_id}, using fallback name and no image")
+    return {"name": "Equipment", "image": None}
 
 
 # ── Slug helper ───────────────────────────────────────────────────────────────
@@ -214,6 +219,7 @@ def save_block(
     block: dict,
     equipment_id: str,
     equipment_name: str,
+    equipment_image: Optional[str],
     company_id: str,
     created_by: str,
 ) -> str:
@@ -221,6 +227,7 @@ def save_block(
     Insert one job aid and its procedure steps for a PM type block.
     Title is prefixed with the equipment name, e.g.
       "Wrapper 4 - PM2 - Lubrication"
+    The job aid's image is set to the equipment's own image.
     Returns the job_aid_id.
     """
     job_aid_id = str(uuid.uuid4())
@@ -234,15 +241,15 @@ def save_block(
 
     with conn.cursor() as cur:
 
-        # 1. Insert job aid
+        # 1. Insert job aid (image comes from the equipment, not the Excel)
         cur.execute("""
             INSERT INTO job_aids
                 (id, company_id, title, slug, instruction, status,
-                 estimated_duration, category, created_by,
+                 estimated_duration, category, image, created_by,
                  view_count, scan_count, created_at, updated_at)
             VALUES
                 (%s::uuid, %s::uuid, %s, %s, %s, 'draft',
-                 %s, %s, %s::uuid,
+                 %s, %s, %s, %s::uuid,
                  0, 0, NOW(), NOW())
         """, (
             job_aid_id,
@@ -252,6 +259,7 @@ def save_block(
             f"Imported {block['pm_name']} job aid for {equipment_name}",
             total_minutes,
             block["category"],
+            equipment_image,
             created_by,
         ))
 
@@ -306,7 +314,7 @@ def ingest(
 ) -> dict:
     """
     Full import pipeline called from the FastAPI endpoint.
-    1. Look up the equipment name for title prefixing
+    1. Look up the equipment name and image for title prefixing / job aid image
     2. Parse Excel into PM type blocks
     3. Save each block as a job aid with procedure steps
     4. Return summary of created job aids
@@ -323,11 +331,14 @@ def ingest(
     created_ids = []
 
     try:
-        equipment_name = fetch_equipment_name(conn, equipment_id, company_id)
+        equipment       = fetch_equipment(conn, equipment_id, company_id)
+        equipment_name  = equipment["name"]
+        equipment_image = equipment["image"]
 
         for block in blocks:
             job_aid_id = save_block(
-                conn, block, equipment_id, equipment_name, company_id, created_by
+                conn, block, equipment_id, equipment_name, equipment_image,
+                company_id, created_by
             )
             created_ids.append({
                 "job_aid_id": job_aid_id,
@@ -347,6 +358,7 @@ def ingest(
     return {
         "equipment_id": equipment_id,
         "equipment_name": equipment_name,
+        "equipment_image": equipment_image,
         "job_aids_created": len(created_ids),
         "job_aids": created_ids,
     }
