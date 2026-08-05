@@ -3,9 +3,11 @@ SquareMethods - PM Strategy Generation Service
 ==============================================
 Place this file at: app/services/generate_pm_strategy.py
 
-Pulls all manual chunks for an equipment node, then runs nine
-parallel async Claude calls (one per PM type) to extract and
-structure maintenance tasks into a downloadable Excel file.
+Pulls all manual chunks for an equipment node, then runs ten
+parallel async Claude calls (Working Principle + nine PM types) to
+extract and structure maintenance tasks into a downloadable Excel
+file. Each call also resolves stock component images for its own
+steps inline, concurrently with the other calls.
 
 The Excel output matches the PM_strategy.xlsx format exactly so
 the reviewer can fill gaps, add image URLs, then upload it via
@@ -24,15 +26,33 @@ PM Types:
   PM7 - Cleaning
   PM8 - Safety Inspection
   PM9 - Software Back-up
+
+CHANGE LOG (this revision):
+  - Image matching now tries an exact match on the manual's own part
+    number (material_number) before falling back to the fuzzy
+    keyword-in-page-text match on the component description. This is
+    strictly additive: if material_number is blank or doesn't match
+    anything, behavior is identical to before. See match_manual_image().
+  - The material_number field instruction in build_pm_prompt was
+    broadened from "SAP material number if mentioned" to also capture
+    a manual's own parts-list number when the manual provides one --
+    it was previously easy for Claude to leave this blank on manuals
+    that don't use SAP terminology even when they clearly list part
+    numbers (e.g. "341047").
+  - fetch_all_manual_chunks now also handles the 4-segment content
+    prefix ("equipment_id | doc_id | bom_items | text") written by the
+    updated ingest_document.py, in addition to the older 2- and
+    3-segment formats, so this keeps working against both old and
+    newly-ingested chunks without a backfill.
 """
 
 import io
 import json
 import logging
 import asyncio
+import re
 from typing import Optional
 
-import httpx
 import boto3
 import os
 from openpyxl import Workbook
@@ -102,7 +122,15 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
     Fetch ALL manual chunks for this equipment node and concatenate
     them into a single text block for Claude to reason over.
     No vector search -- full recall by equipment_id prefix match.
-    Handles both old and new content prefix formats.
+
+    Handles three content prefix formats, oldest to newest:
+      1. "equipment_id:{id} | {text}"                                (2 segments)
+      2. "equipment_id:{id} | doc_id:{uuid} | {text}"                (3 segments)
+      3. "equipment_id:{id} | doc_id:{uuid} | bom_items:... | {text}" (4 segments, current)
+    Splitting on " | " with no maxsplit and taking everything after the
+    last recognized "key:value" metadata segment keeps this working
+    against whichever format a given chunk happens to be in, without
+    needing to touch previously-ingested rows.
     """
     conn = get_db_connection()
     try:
@@ -125,19 +153,28 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
             "Please upload and ingest a document for this node first."
         )
 
+    known_prefix_keys = ("equipment_id:", "doc_id:", "bom_items:")
+
     clean_chunks = []
     for r in rows:
         content = r["content"]
-        # Split on " | " to strip prefixes
-        # Old format: "equipment_id:{id} | actual content"
-        # New format: "equipment_id:{id} | doc_id:{uuid} | actual content"
-        parts = content.split(" | ", 2)
-        if len(parts) == 3:
-            clean_chunks.append(parts[2])   # new format
-        elif len(parts) == 2:
-            clean_chunks.append(parts[1])   # old format
+        parts = content.split(" | ")
+
+        # Consume leading "key:value" segments (in the known set) as
+        # metadata; the first segment that isn't one of those starts the
+        # actual chunk text. Rejoin the remainder with " | " in case the
+        # chunk's own text legitimately contains that substring further in.
+        split_at = 0
+        for part in parts:
+            if part.startswith(known_prefix_keys):
+                split_at += 1
+            else:
+                break
+
+        if split_at == 0:
+            clean_chunks.append(content)  # no recognized prefix at all
         else:
-            clean_chunks.append(content)    # fallback
+            clean_chunks.append(" | ".join(parts[split_at:]))
 
     full_text = "\n\n".join(clean_chunks)
     log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
@@ -240,7 +277,7 @@ For each task you find, extract the following fields:
 - hrs: estimated TECHNICIAN TIME to perform this specific task, as a decimal number of hours (e.g. 0.1, 0.5, 1.0). This is NOT the maintenance interval -- if the manual says "every 1000 hours," that 1000 belongs in frequency, never here. Leave blank if no time estimate is given.
 - work_needed: 1 if active work is required, 0 if observation only. Default to 1.
 - system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
-- material_number: SAP material number if mentioned, otherwise leave blank.
+- material_number: the manual's OWN part/component number for this item, if the manual provides one -- this includes a formal SAP material number, but just as importantly it includes any parts-list, drawing, or catalog number the manual itself prints next to this component (e.g. "341047", "992-03377", "8-110-626-107"). Copy it exactly as printed, including hyphens/periods. Leave blank only if the manual truly gives no such number for this component.
 - component: the specific component name only (without the assembly hierarchy), e.g. "Bearings x8"
 - instruction: step-by-step work instruction a technician can follow. Number each step starting at 1. Put EACH numbered step on its own line, with a blank line between steps -- use a literal "\\n\\n" (newline, newline) between step N and step N+1, never a space. Be specific.
 - failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
@@ -268,14 +305,190 @@ EQUIPMENT MANUAL:
 {manual_text}"""
 
 
+# ── Component image lookup ───────────────────────────────────────────────────
+#
+# Images come ONLY from this equipment's own ingested manual
+# (equipment_manual_images table, populated at ingestion time by
+# ingest_document.py's PDF image extraction). No external image search
+# (Openverse or otherwise) -- if the manual has no relevant image, the
+# cell is left blank for the reviewer to fill, rather than substituting
+# a generic stock photo that isn't actually this equipment's part.
+#
+# Matching is now two-tier:
+#   1. Exact match on material_number (the manual's own part number, e.g.
+#      "341047") against a drawing page's extracted text. This is a much
+#      stronger, lower-false-positive signal than a keyword match, since
+#      part numbers are specific tokens rather than descriptive words that
+#      might appear on several unrelated pages ("bearing" turning up on
+#      six different drawings). It only fires when Claude actually
+#      populated material_number for that step AND that exact string
+#      appears on some page's extracted text -- otherwise it's a silent
+#      no-op and behavior falls through to tier 2, unchanged from before.
+#   2. Fallback: keyword-in-page-text match on the component description,
+#      same coarse approach as before.
+#
+# This is a fully local operation: the S3 key is already in the DB, and
+# generating a presigned URL is a local signing call, not a network
+# request. There's no timeout, retry, or concurrency-limiting logic
+# needed here because there's nothing that can hang or rate-limit.
+#
+# Image lookup happens INLINE inside call_claude_for_pm_type(), right
+# after each PM/WP type's steps come back from Claude. WP is included:
+# its "component" field names real physical parts (e.g. "Airend",
+# "Pressure Regulator"), same as PM1-PM9's.
+#
+# Known limitation, by design: match quality depends on the ingested
+# manual actually having a relevant image AND that image's page text
+# mentioning the component (by part number or by name). A manual with
+# no images, or a components section whose images sit on pages that
+# don't share the component's wording or number, will come back blank --
+# there's no fallback beyond tier 2.
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
+MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
+
+_QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
+
+# Guard against spurious substring matches on short/generic material
+# numbers (e.g. a stray "24" matching all over a page of tables). Real
+# manual part numbers in the manuals we've seen are consistently longer
+# than this, so it's a cheap, conservative filter rather than a tuned one.
+MIN_PART_NUMBER_MATCH_LENGTH = 4
+
+
+def normalize_component_for_image_search(component: str) -> Optional[str]:
+    """
+    Turn a Component field value into a bare search keyword.
+    "Main Drive assembly - Bearings x4"  -> "bearings"
+    "Compressor Oil Filter Element"      -> "compressor oil filter element"
+    "Bearings x8"                       -> "bearings"
+    Returns None for empty/unusable input so callers can skip the lookup.
+    """
+    if not component:
+        return None
+
+    # Strip assembly/subassembly hierarchy -- keep only the last segment
+    # after " - ", since that's the actual component, not its location.
+    term = component.split(" - ")[-1]
+
+    # Strip trailing quantity markers like "x4", "X12"
+    term = _QUANTITY_SUFFIX_RE.sub("", term)
+
+    term = term.strip()
+    return term.lower() if term else None
+
+
+def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> list:
+    """
+    Pulls every extracted manual image row for this equipment ONCE, up
+    front, so matching against many components doesn't mean many DB
+    round-trips. Returns a list of {s3_key, context_text, page_number}
+    dicts. Empty list if the equipment has no ingested images (e.g. a
+    DOCX manual, or a PDF with no images that cleared the size filter).
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s3_key, context_text, page_number
+                FROM equipment_manual_images
+                WHERE equipment_id = %s::uuid
+                AND company_id = %s::uuid
+            """, (equipment_id, company_id))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    log.info(f"Loaded {len(rows)} manual images for equipment {equipment_id}")
+    return [
+        {"s3_key": r["s3_key"], "context_text": (r["context_text"] or "").lower(), "page_number": r["page_number"]}
+        for r in rows
+    ]
+
+
+def match_manual_image(component_keyword: str, material_number: str, manual_images: list) -> tuple:
+    """
+    Two-tier match against this equipment's own ingested manual images.
+    Returns (s3_key, match_method) where match_method is "part_number",
+    "keyword", or None if nothing matched. Returning the method alongside
+    the key is just for the summary logging in call_claude_for_pm_type --
+    callers that don't care can ignore it.
+    """
+    if not manual_images:
+        return None, None
+
+    part_no = (material_number or "").strip().lower()
+    if len(part_no) >= MIN_PART_NUMBER_MATCH_LENGTH:
+        for img in manual_images:
+            if part_no in img["context_text"]:
+                return img["s3_key"], "part_number"
+
+    if component_keyword:
+        for img in manual_images:
+            if component_keyword in img["context_text"]:
+                return img["s3_key"], "keyword"
+
+    return None, None
+
+
+def presign_manual_image_url(s3_key: str) -> Optional[str]:
+    """
+    Generate a presigned GET URL for a manual image. Images are stored
+    privately (see ingest_document.py) since manuals may be confidential
+    OEM documents -- this is a local signing operation, not a network
+    call, so it can't hang or fail on connectivity.
+    """
+    try:
+        s3 = boto3.client("s3", region_name=BEDROCK_REGION)
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": s3_key},
+            ExpiresIn=MANUAL_IMAGE_URL_EXPIRY_SECONDS,
+        )
+    except Exception as e:
+        log.warning(f"Failed to presign manual image URL for key {s3_key}: {type(e).__name__}: {e}")
+        return None
+
+
+def resolve_component_image_url(component_keyword: str, material_number: str, manual_images: list) -> tuple:
+    """
+    Fully synchronous and local -- no network call, so nothing here can
+    hang or need a timeout. Returns (url, match_method); url is "" if
+    the equipment's manual has no matching image, in which case the
+    Excel cell is simply left blank.
+    """
+    manual_key, method = match_manual_image(component_keyword, material_number, manual_images)
+    if not manual_key:
+        return "", None
+    return presign_manual_image_url(manual_key) or "", method
+
+
+def attach_images_to_steps(steps: list, manual_images: list) -> dict:
+    """
+    Mutates each step dict in place with an "image_url" key, matched
+    against this equipment's own ingested manual images. Purely
+    synchronous -- no async/await needed since there's no network call
+    involved anywhere in this path.
+
+    Returns a small {"part_number": n, "keyword": n} tally for logging.
+    """
+    tally = {"part_number": 0, "keyword": 0}
+    for step in steps:
+        keyword = normalize_component_for_image_search(step.get("component", ""))
+        material_number = step.get("material_number", "")
+        url, method = resolve_component_image_url(keyword or "", material_number, manual_images)
+        step["image_url"] = url
+        if method:
+            tally[method] += 1
+    return tally
 
 
 async def call_claude_for_pm_type(
-    client: httpx.AsyncClient,
     bedrock,
     pm_code: str,
     pm_name: str,
     manual_text: str,
+    manual_images: list,
 ) -> tuple[str, str, list]:
     log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
     if pm_code == "WP":
@@ -345,11 +558,27 @@ async def call_claude_for_pm_type(
             steps = []
 
         log.info(f"{pm_code} ({pm_name}): {len(steps)} steps extracted")
+
+        # Resolve manual images for this type's steps now. Purely local
+        # (DB already fetched, presigning is local signing) -- no network
+        # call, so this can't hang. Runs for WP too -- its components
+        # (e.g. "Airend", "Pressure Regulator") are genuine physical
+        # parts, same as PM1-PM9's.
+        tally = attach_images_to_steps(steps, manual_images)
+        matched = tally["part_number"] + tally["keyword"]
+        if steps:
+            log.info(
+                f"{pm_code} images: {matched}/{len(steps)} steps matched "
+                f"({tally['part_number']} by part number, {tally['keyword']} by keyword)"
+            )
+
         return pm_code, pm_name, steps
 
     except Exception as e:
         log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
-        return pm_code, pm_name, []   
+        return pm_code, pm_name, []
+
+
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
 def _estimate_row_height(instruction: str) -> int:
@@ -417,6 +646,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
         # Data rows -- skipped naturally if steps is empty
         for step in steps:
             instruction = step.get("instruction", "")
+            image_url = step.get("image_url", "")
             row_values = [
                 step.get("operation", ""),
                 step.get("task_list_description", ""),
@@ -428,12 +658,15 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("component", ""),
                 instruction,
                 step.get("failure_modes", ""),
-                "",  # Image -- left blank for reviewer to fill
+                image_url,  # manual reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
             ]
             for col_idx, value in enumerate(row_values, 1):
                 cell           = ws.cell(row=current_row, column=col_idx, value=value)
                 cell.font      = DATA_FONT
                 cell.alignment = WRAP_ALIGN
+                if col_idx == len(COLUMNS) and image_url:
+                    cell.hyperlink = image_url
+                    cell.font = Font(name="Arial", size=10, color="0563C1", underline="single")
             ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
             current_row += 1
 
@@ -489,7 +722,6 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
     than failing.
     """
     from datetime import date
-    import re
 
     label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
     if not label:
@@ -508,7 +740,8 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     """
     Full pipeline called from the FastAPI endpoint.
     1. Fetch all manual chunks for the equipment
-    2. Run nine parallel Claude calls (one per PM type)
+    2. Run ten parallel Claude calls (Working Principle + nine PM types),
+       each resolving its own stock component images inline
     3. Build and return the Excel file as bytes
        -- always returns a valid file even if all PM types are empty
 
@@ -531,12 +764,17 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
 
     bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            call_claude_for_pm_type(client, bedrock, pm_code, pm_name, manual_text)
-            for pm_code, pm_name in PM_TYPES
-        ]
-        results = await asyncio.gather(*tasks)
+    # Fetched once, up front -- this equipment's own manual images are
+    # matched in-memory against every step's component keyword, rather
+    # than one DB round-trip per keyword. No network client needed for
+    # image lookup anymore: it's a local list match + local S3 presign.
+    manual_images = fetch_manual_images_for_equipment(equipment_id, company_id)
+
+    tasks = [
+        call_claude_for_pm_type(bedrock, pm_code, pm_name, manual_text, manual_images)
+        for pm_code, pm_name in PM_TYPES
+    ]
+    results = await asyncio.gather(*tasks)
 
     pm_results = list(results)
 
