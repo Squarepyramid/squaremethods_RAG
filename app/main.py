@@ -18,7 +18,7 @@ from app.services.ingest_document import (
     ingest as ingest_document_service,
     run_ingest_job,
 )
-from app.services.generate_pm_strategy import generate as generate_pm_strategy_service
+from app.services.generate_pm_strategy import generate_with_filename as generate_pm_strategy_with_filename_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_pm_strategy import ingest as import_pm_strategy_service
 from app.services.import_equipment_master_data import ingest as import_equipment_master_data_service
@@ -418,10 +418,27 @@ def job_status(job_id: str, company_id: str):
 
     # ready
     if job["job_type"] == "pm_strategy" and job["s3_key"]:
+        # The S3 object key is an opaque, collision-safe internal id
+        # (pm-strategy/{company_id}/{job_id}.xlsx) -- it was never meant
+        # to be human-readable. The actual filename the user sees on
+        # download comes from ResponseContentDisposition below, which
+        # overrides it without needing to rename/copy the S3 object.
+        # Real filename (e.g. "PM_Strategy_Compressor_1_A102_2026-08-05.xlsx")
+        # is stored in `result` by run_pm_strategy_job() when the job
+        # completes. Older jobs finished before that change won't have
+        # it, hence the fallback.
+        filename = (job["result"] or {}).get("filename") if job["result"] else None
+        if not filename:
+            filename = f"PM_Strategy_{job_id}.xlsx"
+
         s3 = boto3.client("s3", region_name=AWS_REGION)
         download_url = s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": job["s3_key"]},
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": job["s3_key"],
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
             ExpiresIn=300
         )
         return {"status": "ready", "download_url": download_url}
@@ -464,11 +481,20 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
     Called when Lambda is triggered by SQS for a pm_strategy job.
     Generates the PM strategy Excel and uploads it to S3.
     Updates pm_strategy_jobs when done.
+
+    Uses generate_with_filename() (not generate()) so the reviewer-facing
+    filename (e.g. "PM_Strategy_Compressor_1_A102_2026-08-05.xlsx") is
+    computed here and stored in `result`, for job_status() to hand back
+    as the download's Content-Disposition filename. The S3 key itself
+    stays job_id-based -- that's just internal storage naming, not what
+    the user ever sees.
     """
     import asyncio
 
     try:
-        excel_bytes = asyncio.run(generate_pm_strategy_service(equipment_id, company_id))
+        excel_bytes, filename = asyncio.run(
+            generate_pm_strategy_with_filename_service(equipment_id, company_id)
+        )
 
         s3_key = f"pm-strategy/{company_id}/{job_id}.xlsx"
         s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -484,14 +510,14 @@ def run_pm_strategy_job(job_id: str, equipment_id: str, company_id: str):
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE pm_strategy_jobs
-                    SET status = 'ready', s3_key = %s, updated_at = NOW()
+                    SET status = 'ready', s3_key = %s, result = %s::jsonb, updated_at = NOW()
                     WHERE id = %s::uuid
-                """, (s3_key, job_id))
+                """, (s3_key, psycopg2.extras.Json({"filename": filename}), job_id))
             conn.commit()
         finally:
             conn.close()
 
-        print(f"PM STRATEGY JOB COMPLETE [{job_id}]")
+        print(f"PM STRATEGY JOB COMPLETE [{job_id}] filename={filename}")
 
     except Exception as e:
         print(f"PM STRATEGY JOB ERROR [{job_id}]: {str(e)}")
@@ -815,8 +841,6 @@ def delete_session(session_id: str, request: SessionRequest):
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
-# ── Lambda handler ────────────────────────────────────────────────────────────
-
 _mangum_handler = Mangum(app, lifespan="off")
 
 
@@ -858,6 +882,3 @@ def handler(event, context):
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     return _mangum_handler(event, context)
-
-
- 
