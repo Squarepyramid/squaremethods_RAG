@@ -18,31 +18,60 @@ re-enabling it requires re-ingesting already-processed documents' TEXT
 chunks; only documents ingested while the flag is off will be missing
 images until they're re-ingested.
 
-*** OCR FALLBACK FOR SCANNED PDFS (NEW) ***
+*** SCANNED-PDF FALLBACK: AMAZON TEXTRACT (NOT LOCAL OCR) ***
 A meaningful fraction of manufacturer-supplied manuals are flat scans --
 every page is a raster image with no text layer at all (pypdf's
 extract_text() returns "" for every page). Previously that made
 extract_text() raise "No text could be extracted from the document." and
 the whole ingest job would fail, even though the pages are perfectly
-readable to a human. See OCR_ENABLED below: each page's native text is
-now checked, and any page that comes back empty/near-empty is rendered
-to an image and OCR'd with Tesseract, page-by-page, so manuals that mix
-real text pages with scanned drawing pages only pay OCR's cost on the
-pages that actually need it.
+readable to a human.
 
-DEPLOYMENT REQUIREMENT for OCR: the `tesseract` binary + English language
-data must be present in the runtime, plus the `pymupdf` and `pytesseract`
-Python packages (add both to requirements.txt). On Lambda this means
-attaching a layer that bundles the tesseract binary (e.g.
-https://github.com/bweigel/aws-lambda-tesseract-layer, or a custom layer
-built for your runtime/arch) -- `pip install pytesseract` alone is NOT
-enough, it just calls out to a `tesseract` executable that has to already
-be on PATH. Until that layer is attached, OCR is skipped automatically
-and safely (see _ocr_available()): scanned pages come back empty and a
-document that is ENTIRELY scanned will still raise "No text could be
-extracted", same as before, with a log line explaining OCR wasn't
-available. No code change is needed to turn OCR on once the layer is
-in place -- OCR_ENABLED just needs the binary to actually be there.
+We tried a local-OCR fix first (pymupdf to render pages + pytesseract +
+a `tesseract` binary in the Lambda image) and deliberately backed out of
+it in favor of Amazon Textract. Not because local OCR can't work in
+principle, but because of what actually happened trying to deploy it on
+this Lambda's base image (public.ecr.aws/lambda/python:3.11, Amazon
+Linux 2): AL2's EPEL7 repo -- the only yum source for `tesseract` -- is
+frozen at a decade-old 3.04.00 build (EL7 went EOL mid-2024) that
+predates Tesseract's modern LSTM engine and that pytesseract can't even
+reliably parse the version string of; AL2023 doesn't package tesseract
+at all; and the version-string failure took down the whole Lambda
+invocation via an uncaught SystemExit (pytesseract raises SystemExit,
+not Exception, when it can't parse `tesseract --version` output) before
+we even got to figure out the OCR quality question. Getting a real
+tesseract binary onto this image was going to mean either compiling it
+from source against AL2's old glibc/gcc (fragile, slow CI builds, needs
+a modern-enough C++ toolchain that AL2 also doesn't ship) or pulling
+prebuilt binaries from a third party layer project.
+
+Textract sidesteps all of that: it's a plain boto3 API call (`boto3` was
+already a dependency), so there is no OS package, no binary, no Docker
+build step, and nothing that can break in CI for glibc/version reasons.
+See TEXTRACT_ENABLED below.
+
+How it's used: Textract's async document-text-detection API only takes
+input from S3 (not raw bytes), and it always processes the ENTIRE
+submitted document -- there's no way to ask it to OCR just specific
+pages, and there's no billing difference between submitting the whole
+file vs. a subset (you're charged per page of whatever you submit
+either way). So the design is: try native pypdf extraction first (free,
+instant, and the common case for a normal digitally-generated manual --
+Textract is never called at all if every page already has real text).
+Only if at least one page comes back with no usable native text does
+the WHOLE document get submitted to Textract once, and its output is
+used for every page it covers (see _textract_extract_document's
+docstring for why "whole document" instead of "just the missing
+pages").
+
+DEPLOYMENT REQUIREMENT for Textract: the Lambda's execution role needs
+    textract:StartDocumentTextDetection
+    textract:GetDocumentTextDetection
+    s3:GetObject on the bucket manuals are uploaded to
+file_url is expected to already be an S3 URL (that's how every document
+reaches _run_ingest today) and is used directly as Textract's input --
+no re-upload needed in the common case. If a future caller passes a
+non-S3 URL, the already-downloaded bytes are uploaded to a scratch S3
+key under S3_BUCKET for the Textract call and deleted afterward.
 
 Key design decisions:
   - Each chunk gets a stable UUID derived from (doc_uuid, chunk_index)
@@ -54,12 +83,10 @@ Key design decisions:
   - Ingest runs as an async background job via SQS (see run_ingest_job)
   - Embeddings are generated concurrently in bounded batches to handle
     large documents (50+ pages) within the Lambda timeout window
-  - NEW: PDF text extraction falls back to OCR (Tesseract) on a
-    per-page basis for pages with no usable native text layer, so
-    scanned/flatbed-scanned manuals ingest instead of failing outright.
-    OCR pages are also run with bounded concurrency (tesseract runs as
-    a subprocess, so threads genuinely parallelize it) to keep a
-    fully-scanned 50-100 page manual within the Lambda timeout window.
+  - PDF text extraction falls back to Amazon Textract for pages with no
+    usable native text layer, so scanned/flatbed-scanned manuals ingest
+    instead of failing outright -- see the module docstring section above
+    for why Textract instead of local OCR.
   - Extracted manual images are associated with their PAGE's text as
     "context_text" (not a precise per-figure caption) -- OEM manuals
     rarely have clean one-image-per-component layouts; a parts-list
@@ -67,9 +94,9 @@ Key design decisions:
     with a table of callouts below it. Page-level association is a
     reasonable middle ground: coarser than a true caption match, but
     still specific to the actual equipment, not a generic web photo.
-    That page text now goes through the same native-or-OCR extraction
-    as the main text pass, so scanned pages get real context_text too
-    once IMAGE_EXTRACTION_ENABLED is turned back on.
+    That page text now goes through the same native-or-Textract
+    extraction as the main text pass, so scanned pages get real
+    context_text too once IMAGE_EXTRACTION_ENABLED is turned back on.
   - Extracted images are size-filtered (MIN_IMAGE_BYTES) as a first-pass
     heuristic to skip small logos/watermarks/icons -- not perfect, but
     avoids flooding storage with dozens of duplicate section-header
@@ -79,9 +106,9 @@ Key design decisions:
     whenever an image is actually referenced (e.g. during PM strategy
     generation), since these manuals may be confidential OEM documents
     and shouldn't be permanently public on the open internet.
-  - NEW: each text chunk is additionally scanned (regex, no model call)
-    for OEM-style parts-list rows ("Lv Item Component-no Description
-    Qty Un", e.g. "2 0001 341047 02 RAIL-TOP-RH 1.000 EA") and any
+  - Each text chunk is additionally scanned (regex, no model call) for
+    OEM-style parts-list rows ("Lv Item Component-no Description Qty
+    Un", e.g. "2 0001 341047 02 RAIL-TOP-RH 1.000 EA") and any
     (item_no, part_no) pairs found are captured in the chunk's content
     prefix as "bom_items:...". This costs nothing at ingest time and
     is a no-op (empty field) for manuals that don't use this table
@@ -89,9 +116,12 @@ Key design decisions:
     future item-number-precise image-linking feature doesn't require
     re-ingesting every manual to backfill it. See extract_bom_items()
     docstring for the matching caveat. Note this regex is matched
-    against extracted text, so on OCR'd pages its hit rate depends on
-    OCR quality -- garbled OCR output on a low-quality scan simply
-    won't match the row shape, which is a safe no-op, not an error.
+    against extracted text, so on Textract'd pages its hit rate depends
+    on Textract's read quality on that particular scan -- a bad match
+    is a safe no-op, not an error. (Textract also has a native table-
+    extraction mode that would read these rows as structured cells
+    instead of guessing at row shapes with a regex -- worth considering
+    for a future pass, not part of this change.)
 
 REQUIRES A DB MIGRATION before this will work -- see the
 equipment_manual_images table DDL in the module docstring below the
@@ -117,10 +147,12 @@ your database before deploying this file.
 import io
 import os
 import re
+import time
 import uuid
 import hashlib
 import logging
 import asyncio
+import urllib.parse
 import requests
 
 import boto3
@@ -179,184 +211,218 @@ def url_to_uuid(file_url: str) -> str:
     return str(uuid.UUID(hashlib.md5(file_url.encode()).hexdigest()))
 
 
-# ── OCR fallback (scanned / image-only PDFs) ──────────────────────────────────
+# ── Scanned-PDF fallback: Amazon Textract ─────────────────────────────────────
 #
-# Some manufacturers submit manuals as flat scans -- every page is a raster
-# image with no embedded text layer at all, so pypdf's extract_text()
-# returns "" for every page. The fix is page-level, not whole-document:
-# each page's native extract_text() result is checked against
-# OCR_MIN_TEXT_CHARS, and only pages that come back empty/near-empty are
-# rendered to an image (via PyMuPDF) and OCR'd (via pytesseract/tesseract).
-# Manuals that mix real text pages with scanned drawing pages get native
-# extraction on the pages that have it and OCR only on the pages that need
-# it, instead of paying OCR's cost (and quality loss vs. a real text
-# layer) on every page unconditionally.
-#
-# See the module docstring's "DEPLOYMENT REQUIREMENT" note for the
-# tesseract binary/layer this needs on Lambda. _ocr_available() detects a
-# missing binary at call time (not import time) so a deployment without
-# the layer still imports this module fine and just skips OCR.
-#
-# OCR is also meaningfully slower than native extraction (roughly ~2
-# seconds/page at OCR_DPI=300 on modest hardware, confirmed against a
-# real 66-page fully-scanned manual during testing). For a fully-scanned
-# manual that's real wall-clock time against the Lambda timeout, hence
-# OCR_CONCURRENCY -- pytesseract shells out to the tesseract binary as a
-# subprocess, so concurrent OCR calls from a thread pool genuinely run in
-# parallel (unlike CPU-bound pure-Python work, which the GIL would
-# otherwise serialize).
+# See the module docstring for why this is Textract and not local OCR.
+# Only pages with no usable native text layer trigger a Textract call,
+# and only once per document (the whole file, not per page -- see
+# _textract_extract_document's docstring).
 
-OCR_ENABLED        = True   # requires the tesseract binary in the runtime -- see module docstring
-OCR_DPI             = 300   # render resolution for OCR; higher = better accuracy, slower
-OCR_MIN_TEXT_CHARS  = 20    # native-extracted chars below this -> treat the page as scanned
-OCR_CONCURRENCY     = 4     # max simultaneous tesseract subprocesses
+TEXTRACT_ENABLED               = True   # requires the IAM permissions in the module docstring
+TEXTRACT_MIN_TEXT_CHARS        = 20     # native-extracted chars below this -> treat the page as scanned
+TEXTRACT_POLL_INTERVAL_SECONDS = 3      # how often to check job status while waiting
+TEXTRACT_MAX_WAIT_SECONDS      = 300    # give up waiting after this long (leaves headroom under the Lambda timeout for download/chunk/embed)
 
-_ocr_unavailable_logged = False  # log the "OCR unavailable" warning once per process, not once per page
+_S3_VIRTUAL_HOSTED_RE = re.compile(r"^(?P<bucket>[^.]+)\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
+_S3_PATH_STYLE_RE     = re.compile(r"^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
 
 
-def _ocr_available() -> bool:
+def _parse_s3_url(file_url: str):
     """
-    True if OCR's dependencies (pymupdf + pytesseract + the tesseract
-    binary itself) are actually importable/callable in this runtime.
-    Checked lazily at call time, not at module import time, so a
-    deployment that hasn't attached the tesseract Lambda layer yet still
-    imports this module and ingests text-layer PDFs fine -- it just runs
-    without the OCR fallback until the layer is added, instead of
-    crashing the whole module on import.
+    Best-effort parse of an S3 HTTPS URL into (bucket, key). Handles both
+    virtual-hosted-style (https://bucket.s3.amazonaws.com/key) and
+    path-style (https://s3.amazonaws.com/bucket/key) URLs, with or
+    without a region segment, and strips any query string (e.g. from a
+    presigned URL) before treating the rest as the key.
+
+    Returns None if file_url doesn't look like an S3 URL -- callers fall
+    back to uploading the already-downloaded bytes to S3_BUCKET instead
+    of failing outright.
     """
-    global _ocr_unavailable_logged
-    if not OCR_ENABLED:
-        return False
     try:
-        import fitz  # noqa: F401  (PyMuPDF)
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        return True
-    # NOTE: pytesseract.get_tesseract_version() raises SystemExit (not a
-    # normal Exception) when it can't parse the installed tesseract's
-    # version string -- which happens for very old tesseract builds (e.g.
-    # EPEL7's packaged 3.04.00, a decade-old pre-LSTM release). SystemExit
-    # inherits from BaseException, not Exception, so a bare
-    # "except Exception" here does NOT catch it -- it was propagating all
-    # the way up and killing the whole Lambda invocation (visible in
-    # CloudWatch as "Runtime.ExitError"), which also meant run_ingest_job's
-    # own try/except never ran and the job's DB row never got marked
-    # 'failed'. Catching SystemExit explicitly is what makes this function
-    # actually safe to call unconditionally, which was the whole point.
-    except (Exception, SystemExit) as e:
-        if not _ocr_unavailable_logged:
-            log.warning(
-                f"OCR fallback unavailable (pymupdf/pytesseract/tesseract not "
-                f"usable in this runtime: {e}). Scanned/image-only PDF pages "
-                f"will be skipped instead of OCR'd until a working tesseract "
-                f"build is deployed -- see module docstring."
-            )
-            _ocr_unavailable_logged = True
-        return False
+        parsed = urllib.parse.urlparse(file_url)
+        host   = parsed.netloc
+        path   = parsed.path.lstrip("/")
+        if not host or not path:
+            return None
+
+        m = _S3_VIRTUAL_HOSTED_RE.match(host)
+        if m:
+            return m.group("bucket"), urllib.parse.unquote(path)
+
+        if _S3_PATH_STYLE_RE.match(host):
+            bucket, _, key = path.partition("/")
+            if bucket and key:
+                return bucket, urllib.parse.unquote(key)
+
+        return None
+    except Exception:
+        return None
 
 
-def _ocr_page(fitz_doc, page_index: int) -> str:
-    """OCR a single page: render it to an image via PyMuPDF, then run tesseract."""
-    import pytesseract
-    from PIL import Image
-
-    page  = fitz_doc[page_index]
-    pix   = page.get_pixmap(dpi=OCR_DPI)
-    image = Image.open(io.BytesIO(pix.tobytes("png")))
-    try:
-        return pytesseract.image_to_string(image) or ""
-    except Exception as e:
-        log.warning(f"OCR failed for page {page_index + 1}: {e}")
-        return ""
+def _textract_client():
+    return boto3.client("textract", region_name=AWS_REGION)
 
 
-def _ocr_pages_concurrently(file_bytes: bytes, page_indices: list) -> dict:
+def _textract_extract_document(file_bytes: bytes, file_url: str) -> dict:
     """
-    OCR a specific set of 0-indexed pages, bounded by OCR_CONCURRENCY
-    concurrent tesseract subprocess calls. Returns {page_index: text}.
+    Run the whole PDF through Textract's async document-text-detection
+    API and return {page_number (1-indexed): text}.
 
-    Only called with the pages that actually need it (see
-    _extract_pdf_page_texts) -- pages with a usable native text layer
-    never reach here, so a manual that's mostly real text with a few
-    scanned drawing pages only OCRs those few pages.
+    Textract's async API only accepts input from S3, and it always
+    processes the entire submitted document -- there's no per-page
+    dispatch and no cost difference between submitting the whole file
+    vs. a subset (billing is per page of whatever's submitted either
+    way). So unlike a local-OCR approach (where CPU time made
+    per-page selectivity worth the complexity), this always submits the
+    full document once ANY page needs it, and uses Textract's text for
+    every page it covers -- simpler, and Textract's LINE-level output is
+    generally at least as clean as pypdf's raw text for pages that
+    already had a text layer too.
+
+    file_url is expected to already point at an S3 object -- that's how
+    every document reaches _run_ingest today (see the S3 URL logged in
+    _run_ingest). If it doesn't parse as one, the already-downloaded
+    bytes are uploaded to a scratch key under S3_BUCKET instead, used
+    for the Textract call, then deleted.
     """
-    import fitz
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    textract = _textract_client()
 
-    results  = {}
-    fitz_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    parsed = _parse_s3_url(file_url)
+    scratch_bucket = scratch_key = None
+    if parsed:
+        bucket, key = parsed
+    else:
+        log.warning(
+            f"file_url doesn't look like an S3 URL ({file_url!r}); "
+            f"uploading a scratch copy to S3_BUCKET for Textract instead."
+        )
+        scratch_bucket = bucket = S3_BUCKET
+        scratch_key    = key    = f"textract-scratch/{uuid.uuid4()}.pdf"
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=file_bytes)
+
     try:
-        with ThreadPoolExecutor(max_workers=OCR_CONCURRENCY) as executor:
-            futures = {
-                executor.submit(_ocr_page, fitz_doc, i): i
-                for i in page_indices
-            }
-            for future in as_completed(futures):
-                i = futures[future]
-                try:
-                    results[i] = future.result()
-                except Exception as e:
-                    log.warning(f"OCR task failed for page {i + 1}: {e}")
-                    results[i] = ""
+        start_response = textract.start_document_text_detection(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
+        )
+        job_id = start_response["JobId"]
+
+        waited = 0
+        result = None
+        while True:
+            result = textract.get_document_text_detection(JobId=job_id)
+            status = result["JobStatus"]
+            if status in ("SUCCEEDED", "PARTIAL_SUCCESS"):
+                break
+            if status == "FAILED":
+                raise RuntimeError(
+                    f"Textract job {job_id} failed: {result.get('StatusMessage')}"
+                )
+            if waited >= TEXTRACT_MAX_WAIT_SECONDS:
+                raise TimeoutError(
+                    f"Textract job {job_id} still {status} after "
+                    f"{TEXTRACT_MAX_WAIT_SECONDS}s -- giving up for this ingest."
+                )
+            time.sleep(TEXTRACT_POLL_INTERVAL_SECONDS)
+            waited += TEXTRACT_POLL_INTERVAL_SECONDS
+
+        # Collect every LINE block across all result pages. Textract
+        # paginates the Blocks array itself via NextToken -- unrelated to
+        # the document's own page numbers, which come from each block's
+        # "Page" field.
+        pages_lines = {}
+        next_token  = None
+        while True:
+            if next_token:
+                result = textract.get_document_text_detection(
+                    JobId=job_id, NextToken=next_token
+                )
+            for block in result.get("Blocks", []):
+                if block.get("BlockType") == "LINE" and block.get("Text"):
+                    page_num = block.get("Page", 1)
+                    pages_lines.setdefault(page_num, []).append(block["Text"])
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+
+        return {page_num: "\n".join(lines) for page_num, lines in pages_lines.items()}
     finally:
-        fitz_doc.close()
-    return results
+        if scratch_key:
+            try:
+                _s3_client().delete_object(Bucket=scratch_bucket, Key=scratch_key)
+            except Exception as e:
+                log.warning(f"Failed to delete Textract scratch object {scratch_key}: {e}")
 
 
-def _extract_pdf_page_texts(file_bytes: bytes) -> list:
+def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
     """
     Returns a list of per-page text, one entry per page, in page order.
-    Native pypdf extraction is used first; any page whose native text
-    comes back under OCR_MIN_TEXT_CHARS is OCR'd instead, if OCR is
-    available (see _ocr_available()). Pages with neither a usable native
-    text layer nor OCR available come back as "".
+    Native pypdf extraction is used first (free, instant); if every page
+    already has usable text, Textract is never called at all -- this
+    keeps the common case (a normal digitally-generated manual) exactly
+    as fast and free as before. Only if at least one page comes back
+    with no usable text (TEXTRACT_MIN_TEXT_CHARS) does the whole
+    document get submitted to Textract once (see
+    _textract_extract_document for why it's the whole document, not
+    just the missing pages).
 
-    Shared by extract_text_from_pdf() (joins the non-empty pages into the
-    document's full text) and extract_images_from_pdf() (uses each page's
-    text as that image's context_text), so both get OCR'd text for
-    scanned pages instead of extract_images_from_pdf silently falling
-    back to native-only extraction and getting blank context_text on
-    pages extract_text_from_pdf had to OCR.
+    Shared by extract_text_from_pdf() (joins the non-empty pages into
+    the document's full text) and extract_images_from_pdf() (uses each
+    page's text as that image's context_text), so both get Textract'd
+    text for scanned pages instead of extract_images_from_pdf silently
+    falling back to native-only extraction and getting blank
+    context_text on pages extract_text_from_pdf had to send to Textract.
     """
     import pypdf
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
 
     native_texts = [(page.extract_text() or "").strip() for page in reader.pages]
-    needs_ocr    = [i for i, t in enumerate(native_texts) if len(t) < OCR_MIN_TEXT_CHARS]
+    needs_ocr    = [i for i, t in enumerate(native_texts) if len(t) < TEXTRACT_MIN_TEXT_CHARS]
 
     if not needs_ocr:
         return native_texts
 
-    if not _ocr_available():
+    if not TEXTRACT_ENABLED:
         log.info(
             f"{len(needs_ocr)}/{len(native_texts)} page(s) have no usable "
-            f"text layer and OCR is unavailable in this runtime; they will "
-            f"be skipped."
+            f"text layer and Textract is disabled (TEXTRACT_ENABLED=False); "
+            f"they will be skipped."
         )
         return native_texts
 
     log.info(
         f"{len(needs_ocr)}/{len(native_texts)} page(s) have no usable text "
-        f"layer -- OCR'ing them (concurrency={OCR_CONCURRENCY}, dpi={OCR_DPI})."
+        f"layer -- sending the document to Textract."
     )
-    ocr_results = _ocr_pages_concurrently(file_bytes, needs_ocr)
+    try:
+        textract_pages = _textract_extract_document(file_bytes, file_url)
+    except Exception as e:
+        log.error(
+            f"Textract extraction failed ({e}); continuing with native text "
+            f"only -- pages without a text layer will be missing from this "
+            f"ingest. If this keeps happening, check the Lambda execution "
+            f"role has textract:StartDocumentTextDetection, "
+            f"textract:GetDocumentTextDetection, and s3:GetObject on the "
+            f"source bucket."
+        )
+        return native_texts
 
     page_texts = list(native_texts)
-    ocr_hits   = 0
-    for i, text in ocr_results.items():
-        text = text.strip()
-        if text:
-            ocr_hits += 1
-        page_texts[i] = text
-    log.info(f"OCR recovered text on {ocr_hits}/{len(needs_ocr)} scanned page(s).")
+    filled = 0
+    for i in range(len(page_texts)):
+        textract_text = textract_pages.get(i + 1, "").strip()
+        if textract_text:
+            page_texts[i] = textract_text
+            filled += 1
+    log.info(f"Textract returned text for {filled}/{len(page_texts)} page(s).")
     return page_texts
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
+def extract_text_from_pdf(file_bytes: bytes, file_url: str) -> str:
     try:
-        page_texts = _extract_pdf_page_texts(file_bytes)
+        page_texts = _extract_pdf_page_texts(file_bytes, file_url)
         return "\n\n".join(t for t in page_texts if t)
     except Exception as e:
         log.error(f"PDF extraction error: {e}")
@@ -373,10 +439,10 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         raise
 
 
-def extract_text(file_bytes: bytes, filename: str) -> str:
+def extract_text(file_bytes: bytes, filename: str, file_url: str) -> str:
     filename_lower = filename.lower()
     if filename_lower.endswith(".pdf"):
-        return extract_text_from_pdf(file_bytes)
+        return extract_text_from_pdf(file_bytes, file_url)
     elif filename_lower.endswith(".docx") or filename_lower.endswith(".doc"):
         return extract_text_from_docx(file_bytes)
     else:
@@ -385,7 +451,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # ── Image extraction (PDF only for now) ──────────────────────────────────────
 
-def extract_images_from_pdf(file_bytes: bytes) -> list:
+def extract_images_from_pdf(file_bytes: bytes, file_url: str) -> list:
     """
     Extract embedded images from a PDF, paired with the extracted text
     of the page they appear on (used as coarse "context_text" for later
@@ -395,12 +461,12 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
     Skips images smaller than MIN_IMAGE_BYTES (logos/icons/watermarks).
 
     Page text now comes from _extract_pdf_page_texts(), the same
-    native-or-OCR extraction extract_text_from_pdf() uses, so a scanned
-    page's images still get real context_text instead of "" -- note this
-    means the PDF gets parsed twice (once here via pypdf for the image
-    objects themselves, once inside _extract_pdf_page_texts for text/OCR).
-    That redundancy is harmless correctness-wise and not worth optimizing
-    away while this whole function is gated behind
+    native-or-Textract extraction extract_text_from_pdf() uses, so a
+    scanned page's images still get real context_text instead of "" --
+    note this means the PDF gets parsed twice (once here via pypdf for
+    the image objects themselves, once inside _extract_pdf_page_texts
+    for text/Textract). That redundancy is harmless correctness-wise and
+    not worth optimizing away while this whole function is gated behind
     IMAGE_EXTRACTION_ENABLED = False; revisit if/when it's turned back on.
 
     NOTE: DOCX image extraction is not implemented yet -- extract_text_from_docx
@@ -411,7 +477,7 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
     import pypdf
 
     reader     = pypdf.PdfReader(io.BytesIO(file_bytes))
-    page_texts = _extract_pdf_page_texts(file_bytes)
+    page_texts = _extract_pdf_page_texts(file_bytes, file_url)
     images     = []
 
     for page_number, page in enumerate(reader.pages, start=1):
@@ -461,9 +527,9 @@ def extract_images_from_pdf(file_bytes: bytes) -> list:
 # lost. It does nothing else: no image is linked, no balloon is detected,
 # no assumption is made about what the item number means for any given
 # manual. For manuals that don't use this table format, extract_bom_items
-# simply returns an empty list -- safe to call unconditionally. On OCR'd
-# (scanned) pages, matching also depends on OCR quality -- garbled OCR
-# output simply won't match the row shape, which is a safe no-op.
+# simply returns an empty list -- safe to call unconditionally. On
+# Textract'd (scanned) pages, matching also depends on Textract's read
+# quality on that scan -- a bad match is a safe no-op, not an error.
 
 _BOM_LINE_RE = re.compile(
     r"^\d+\s+(?P<item>\d{4})\s+(?P<part>[\w./\"-]+)\s+(?P<rest>.+)$"
@@ -833,15 +899,17 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     file_bytes = response.content
     log.info(f"Downloaded {len(file_bytes)} bytes from {filename}")
 
-    text = extract_text(file_bytes, filename)
+    text = extract_text(file_bytes, filename, file_url)
     if not text.strip():
-        if filename.lower().endswith(".pdf") and not _ocr_available():
+        if filename.lower().endswith(".pdf"):
             raise ValueError(
-                "No text could be extracted from the document. This PDF "
-                "appears to be scanned (no embedded text layer) and OCR "
-                "is not available in this runtime -- see OCR_ENABLED / "
-                "_ocr_available() in the module docstring for the "
-                "tesseract layer this needs on Lambda."
+                "No text could be extracted from the document. If this PDF "
+                "is scanned (no embedded text layer), check the CloudWatch "
+                "logs above for a Textract error -- this can mean the job "
+                "failed, timed out, TEXTRACT_ENABLED is False, or the "
+                "Lambda execution role is missing "
+                "textract:StartDocumentTextDetection / "
+                "textract:GetDocumentTextDetection / s3:GetObject."
             )
         raise ValueError("No text could be extracted from the document.")
     log.info(f"Extracted {len(text.split())} words.")
@@ -858,7 +926,7 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     images = []
     if IMAGE_EXTRACTION_ENABLED and filename.lower().endswith(".pdf"):
         try:
-            images = extract_images_from_pdf(file_bytes)
+            images = extract_images_from_pdf(file_bytes, file_url)
         except Exception as e:
             # Image extraction failing should never block text ingestion --
             # log and continue with an empty image set.
