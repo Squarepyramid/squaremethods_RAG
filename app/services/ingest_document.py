@@ -232,13 +232,24 @@ def _ocr_available() -> bool:
         import pytesseract
         pytesseract.get_tesseract_version()
         return True
-    except Exception as e:
+    # NOTE: pytesseract.get_tesseract_version() raises SystemExit (not a
+    # normal Exception) when it can't parse the installed tesseract's
+    # version string -- which happens for very old tesseract builds (e.g.
+    # EPEL7's packaged 3.04.00, a decade-old pre-LSTM release). SystemExit
+    # inherits from BaseException, not Exception, so a bare
+    # "except Exception" here does NOT catch it -- it was propagating all
+    # the way up and killing the whole Lambda invocation (visible in
+    # CloudWatch as "Runtime.ExitError"), which also meant run_ingest_job's
+    # own try/except never ran and the job's DB row never got marked
+    # 'failed'. Catching SystemExit explicitly is what makes this function
+    # actually safe to call unconditionally, which was the whole point.
+    except (Exception, SystemExit) as e:
         if not _ocr_unavailable_logged:
             log.warning(
                 f"OCR fallback unavailable (pymupdf/pytesseract/tesseract not "
                 f"usable in this runtime: {e}). Scanned/image-only PDF pages "
-                f"will be skipped instead of OCR'd until the tesseract layer "
-                f"is deployed -- see module docstring."
+                f"will be skipped instead of OCR'd until a working tesseract "
+                f"build is deployed -- see module docstring."
             )
             _ocr_unavailable_logged = True
         return False
