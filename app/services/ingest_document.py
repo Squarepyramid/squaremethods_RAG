@@ -223,6 +223,25 @@ TEXTRACT_MIN_TEXT_CHARS        = 20     # native-extracted chars below this -> t
 TEXTRACT_POLL_INTERVAL_SECONDS = 3      # how often to check job status while waiting
 TEXTRACT_MAX_WAIT_SECONDS      = 300    # give up waiting after this long (leaves headroom under the Lambda timeout for download/chunk/embed)
 
+# What fraction of a document's pages must look scanned (< TEXTRACT_MIN_TEXT_CHARS)
+# before the whole document gets submitted to Textract at all. Real manuals
+# routinely have a handful of pages that are naturally sparse without being
+# scanned -- cover pages, section dividers, blank backs of double-sided
+# pages, an index page that's mostly whitespace -- and treating even ONE such
+# page as "needs OCR" used to send the ENTIRE document through a 30s-5min
+# Textract round trip for no benefit, which is what made ordinary
+# digitally-generated manuals slower (and, via the overwrite bug this
+# replaced -- see _extract_pdf_page_texts -- also lower quality, since
+# Textract's plain per-line text was overwriting perfectly good native text
+# on pages that never needed it). A genuinely scanned document fails this
+# check by a wide margin in practice (100% of pages, confirmed against a
+# real 66-page fully-scanned manual) vs. a normal document's occasional
+# sparse page (typically low single-digit %), so 30% leaves a comfortable
+# gap between the two. Tunable: lower this if a real manual turns out to
+# have a large block of genuinely scanned pages (e.g. photocopied drawings)
+# mixed into mostly-native-text content at a lower ratio than 30%.
+TEXTRACT_TRIGGER_MIN_FRACTION  = 0.3
+
 _S3_VIRTUAL_HOSTED_RE = re.compile(r"^(?P<bucket>[^.]+)\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
 _S3_PATH_STYLE_RE     = re.compile(r"^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
 
@@ -360,11 +379,26 @@ def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
     Native pypdf extraction is used first (free, instant); if every page
     already has usable text, Textract is never called at all -- this
     keeps the common case (a normal digitally-generated manual) exactly
-    as fast and free as before. Only if at least one page comes back
-    with no usable text (TEXTRACT_MIN_TEXT_CHARS) does the whole
-    document get submitted to Textract once (see
-    _textract_extract_document for why it's the whole document, not
-    just the missing pages).
+    as fast and free as before.
+
+    Textract is only invoked if a large-enough FRACTION of pages look
+    scanned (see TEXTRACT_TRIGGER_MIN_FRACTION) -- not just "at least
+    one." A handful of naturally sparse pages (covers, dividers, blank
+    backs) in an otherwise normal manual used to be enough to trigger a
+    slow whole-document Textract round trip for zero benefit; this way,
+    a normal manual with the odd sparse page stays on the fast, free
+    native-only path, while a genuinely scanned document (which fails
+    this check by a wide margin -- 100% of pages, in the real manual
+    this was tested against) still gets sent through Textract.
+
+    When Textract IS invoked, it still processes the WHOLE document (see
+    _textract_extract_document for why), but only the pages that
+    actually lacked native text get their entry replaced with Textract's
+    output below -- pages that already had good native text keep it,
+    rather than being overwritten by Textract's plain per-line text
+    (which can reorder or mangle tables/multi-column layouts differently
+    than pypdf, so blanket-replacing already-good text was a quality
+    regression, not an improvement).
 
     Shared by extract_text_from_pdf() (joins the non-empty pages into
     the document's full text) and extract_images_from_pdf() (uses each
@@ -382,6 +416,19 @@ def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
     if not needs_ocr:
         return native_texts
 
+    scanned_fraction = len(needs_ocr) / len(native_texts)
+    if scanned_fraction < TEXTRACT_TRIGGER_MIN_FRACTION:
+        log.info(
+            f"{len(needs_ocr)}/{len(native_texts)} page(s) ({scanned_fraction:.0%}) "
+            f"have no usable text layer, but that's below "
+            f"TEXTRACT_TRIGGER_MIN_FRACTION ({TEXTRACT_TRIGGER_MIN_FRACTION:.0%}) -- "
+            f"treating this as a normal document with a few naturally sparse "
+            f"pages (covers, dividers, blank backs) rather than a scanned one, "
+            f"and skipping Textract for it. Those {len(needs_ocr)} page(s) will "
+            f"be missing from the extracted text."
+        )
+        return native_texts
+
     if not TEXTRACT_ENABLED:
         log.info(
             f"{len(needs_ocr)}/{len(native_texts)} page(s) have no usable "
@@ -391,8 +438,8 @@ def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
         return native_texts
 
     log.info(
-        f"{len(needs_ocr)}/{len(native_texts)} page(s) have no usable text "
-        f"layer -- sending the document to Textract."
+        f"{len(needs_ocr)}/{len(native_texts)} page(s) ({scanned_fraction:.0%}) "
+        f"have no usable text layer -- sending the document to Textract."
     )
     try:
         textract_pages = _textract_extract_document(file_bytes, file_url)
@@ -409,12 +456,12 @@ def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
 
     page_texts = list(native_texts)
     filled = 0
-    for i in range(len(page_texts)):
+    for i in needs_ocr:
         textract_text = textract_pages.get(i + 1, "").strip()
         if textract_text:
             page_texts[i] = textract_text
             filled += 1
-    log.info(f"Textract returned text for {filled}/{len(page_texts)} page(s).")
+    log.info(f"Textract returned text for {filled}/{len(needs_ocr)} previously-blank page(s).")
     return page_texts
 
 

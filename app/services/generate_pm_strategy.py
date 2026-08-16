@@ -3,10 +3,10 @@ SquareMethods - PM Strategy Generation Service
 ==============================================
 Place this file at: app/services/generate_pm_strategy.py
 
-Pulls all manual chunks for an equipment node, then runs ten
-parallel async Claude calls (Working Principle + nine PM types) to
-extract and structure maintenance tasks into a downloadable Excel
-file.
+Pulls the manual chunks most relevant to each PM type for an equipment
+node, then runs ten parallel async Claude calls (Working Principle +
+nine PM types) to extract and structure maintenance tasks into a
+downloadable Excel file.
 
 *** IMAGE MATCHING IS CURRENTLY DISABLED (IMAGE_MATCHING_ENABLED = False) ***
 This mirrors ingest_document.py's IMAGE_EXTRACTION_ENABLED flag -- since
@@ -42,6 +42,37 @@ PM Types:
   PM9 - Software Back-up
 
 CHANGE LOG (this revision):
+  - RETRIEVAL REWORK (fixes slow/unreliable generation on large, normal
+    -- i.e. non-scanned -- manuals): fetch_all_manual_chunks() used to
+    pull EVERY chunk ever ingested for the equipment node, uncapped, and
+    paste that single blob into all ten prompts unconditionally ("no
+    vector search -- full recall", per the old docstring). A small
+    scanned manual (a few thousand words) stayed fast; a large,
+    genuinely dense native-text manual (tens of thousands of words, or
+    an equipment node with more than one manual attached, since the old
+    query wasn't even scoped to a single doc_id) turned into a huge
+    prompt on all ten concurrent Bedrock calls -- slower, more likely to
+    hit a timeout somewhere in the chain, and worse extraction quality
+    from a small model (Haiku) reasoning over a much larger, noisier
+    context. Replaced with fetch_relevant_manual_chunks(): a real
+    pgvector similarity search, one per PM type, against a short
+    type-specific query (see PM_QUERY_TEXT), capped at
+    RETRIEVAL_TOP_K chunks. This uses the SAME embeddings already
+    generated and stored per chunk at ingest time (see save_chunks() in
+    ingest_document.py) -- they were always intended for retrieval, just
+    not previously queried by vector similarity here. For a manual small
+    enough that its total chunk count is under RETRIEVAL_TOP_K, this
+    returns everything anyway, so small manuals (including the scanned
+    ones going through Textract) see no behavior change at all.
+  - Bedrock client now has an explicit timeout/retry Config
+    (BEDROCK_CLIENT_CONFIG) instead of relying on botocore's undocumented
+    default. Previously, a slow invoke_model call (more likely with the
+    old unbounded context) would silently hit that default and get
+    swallowed by call_claude_for_pm_type's broad except-clause, coming
+    back as an empty PM type with no visible error -- indistinguishable
+    from "Claude found nothing in this manual." The explicit
+    read_timeout/connect_timeout below are sized for the now much
+    smaller, bounded prompts this revision produces.
   - Image matching now tries an exact match on the manual's own part
     number (material_number) before falling back to the fuzzy
     keyword-in-page-text match on the component description. This is
@@ -53,17 +84,39 @@ CHANGE LOG (this revision):
     it was previously easy for Claude to leave this blank on manuals
     that don't use SAP terminology even when they clearly list part
     numbers (e.g. "341047").
-  - fetch_all_manual_chunks now also handles the 4-segment content
-    prefix ("equipment_id | doc_id | bom_items | text") written by the
-    updated ingest_document.py, in addition to the older 2- and
-    3-segment formats, so this keeps working against both old and
-    newly-ingested chunks without a backfill.
+  - fetch_all_manual_chunks / fetch_relevant_manual_chunks both handle
+    the 4-segment content prefix ("equipment_id | doc_id | bom_items |
+    text") written by the updated ingest_document.py, in addition to the
+    older 2- and 3-segment formats, so this keeps working against both
+    old and newly-ingested chunks without a backfill.
   - Image matching disabled via IMAGE_MATCHING_ENABLED (see note above).
   - Added generate_with_filename(), a thin wrapper around generate()
     that also returns a real filename instead of leaving that as a
     separate step for the caller to remember. generate() itself is
-    unchanged (still returns bytes only) so nothing already calling it
-    directly breaks.
+    unchanged in its return type (still bytes only) so nothing already
+    calling it directly breaks.
+
+NOTE ON WHERE THE "TIMEOUT SOMETIMES" WAS ACTUALLY COMING FROM: generation
+already runs off a queue once the job is submitted -- API Gateway's 29s
+ceiling only bounds the initial submit call, not this function, so it was
+never the source of the reported timeouts. The real exposure was inside
+this module itself: call_claude_for_pm_type()'s ten concurrent
+invoke_model calls had no explicit timeout, so they inherited botocore's
+undocumented default, and a slow call (more likely with the old unbounded,
+full-recall prompt) would eventually hit that default and get swallowed by
+the broad except-clause -- coming back as an empty PM type with no visible
+error, indistinguishable from "Claude found nothing in this manual." That
+still counts as a timeout from the caller's point of view even with no
+API Gateway involved. The retrieval rework above shrinks and bounds every
+prompt, and BEDROCK_CLIENT_CONFIG below makes the timeout explicit and
+sized for that smaller prompt, so a genuinely slow call now fails fast and
+visibly (logged, retried by botocore) instead of silently stalling out to
+an empty result. Whatever timeout wraps the worker Lambda/consumer that
+runs this job (its own function timeout, SQS visibility timeout, etc.)
+should stay comfortably above BEDROCK_CLIENT_CONFIG's read_timeout * the
+retry count, so a legitimately slow Bedrock call doesn't get killed by the
+outer timeout before botocore's own retry/timeout logic has a chance to
+resolve it.
 """
 
 import io
@@ -75,10 +128,12 @@ from typing import Optional
 
 import boto3
 import os
+from botocore.config import Config
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.utils.db import get_db_connection
+from app.services.embeddings import get_embedding
 
 log = logging.getLogger(__name__)
 
@@ -103,9 +158,54 @@ PM_TYPES = [
     ("PM9", "Software Back-up"),
 ]
 
+# Short, type-specific queries used to retrieve the manual chunks most
+# relevant to each PM type (see fetch_relevant_manual_chunks). These are
+# deliberately written as a bag of concrete keywords/synonyms rather than
+# a natural-language question -- they're only ever used to produce an
+# embedding for similarity search, not read by a model, so density of
+# relevant vocabulary matters more than grammar.
+PM_QUERY_TEXT = {
+    "WP":  "working principle theory of operation how the machine physically functions mechanism stages",
+    "PM1": "inspection checking visual physical condition leaks tightness fluid level wear",
+    "PM2": "lubrication greasing oil change lubricant grease coolant top up nipple",
+    "PM3": "calibration adjustment pressure regulator governor engine speed torque specification setting",
+    "PM4": "replacement scheduled part filter element belt fluid fastener consumable change interval",
+    "PM5": "overhaul rebuild teardown reconditioning major internal assembly bearings rotors gears",
+    "PM6": "condition monitoring measurement gauge sensor instrument threshold vibration temperature oil analysis",
+    "PM7": "cleaning removing dirt grease debris buildup housing cooler core exterior wipe",
+    "PM8": "safety inspection guard safety valve emergency stop decal label fastener panel",
+    "PM9": "software backup firmware configuration PLC controller electronic control module restore",
+}
+
 BEDROCK_MODEL   = "anthropic.claude-3-haiku-20240307-v1:0"
 BEDROCK_REGION  = os.environ.get("AWS_REGION", "ca-central-1")
 MAX_TOKENS      = 4096
+
+# Explicit timeout/retry config for the bedrock-runtime client. Previously
+# there was no Config at all here, which meant a slow invoke_model call
+# (much more likely under the old unbounded-context prompts) rode on
+# botocore's undocumented default read timeout, failed silently, and got
+# swallowed by call_claude_for_pm_type's broad except-clause -- coming
+# back indistinguishable from "Claude legitimately found nothing in this
+# manual." read_timeout is sized generously above what a bounded,
+# RETRIEVAL_TOP_K-limited prompt should ever need; if it's still being
+# hit regularly, that's a real signal worth surfacing, not something to
+# raise further without checking why.
+BEDROCK_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=90,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+# How many of the most relevant chunks (by embedding similarity) to pull
+# per PM type. ~40 chunks at ~500 words/chunk is roughly 20k words --
+# generous headroom for a single maintenance category from most manuals,
+# while still bounding worst-case prompt size on very large documents.
+# For a manual with fewer than this many chunks total (true for every
+# manual tested so far, including the scanned ones going through
+# Textract), this simply returns everything -- no behavior change for
+# the currently-working case.
+RETRIEVAL_TOP_K = 40
 
 COLUMNS = [
     "Operation",
@@ -137,20 +237,66 @@ LINE_HEIGHT = 14  # points per wrapped line, Arial 10
 
 # ── Knowledge retrieval ───────────────────────────────────────────────────────
 
-def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
-    """
-    Fetch ALL manual chunks for this equipment node and concatenate
-    them into a single text block for Claude to reason over.
-    No vector search -- full recall by equipment_id prefix match.
+_KNOWN_PREFIX_KEYS = ("equipment_id:", "doc_id:", "bom_items:")
 
-    Handles three content prefix formats, oldest to newest:
+
+def _strip_chunk_prefix(content: str) -> str:
+    """
+    Strip the leading "key:value | key:value | ..." metadata segments
+    ingest_document.py writes into each chunk's content column, returning
+    just the chunk's own text. Handles all three prefix shapes that exist
+    across old and newly-ingested rows, oldest to newest:
       1. "equipment_id:{id} | {text}"                                (2 segments)
       2. "equipment_id:{id} | doc_id:{uuid} | {text}"                (3 segments)
       3. "equipment_id:{id} | doc_id:{uuid} | bom_items:... | {text}" (4 segments, current)
-    Splitting on " | " with no maxsplit and taking everything after the
-    last recognized "key:value" metadata segment keeps this working
-    against whichever format a given chunk happens to be in, without
-    needing to touch previously-ingested rows.
+    Splitting on " | " with no maxsplit and consuming only the leading
+    segments that match a known "key:" prefix keeps this working against
+    whichever format a given chunk happens to be in, without needing to
+    touch previously-ingested rows. Rejoins the remainder with " | " in
+    case the chunk's own text legitimately contains that substring.
+    """
+    parts = content.split(" | ")
+    split_at = 0
+    for part in parts:
+        if part.startswith(_KNOWN_PREFIX_KEYS):
+            split_at += 1
+        else:
+            break
+    if split_at == 0:
+        return content  # no recognized prefix at all
+    return " | ".join(parts[split_at:])
+
+
+def _has_any_manual_chunks(equipment_id: str, company_id: str) -> bool:
+    """
+    Cheap existence check used to fail fast with a clear error before
+    kicking off ten parallel embedding + retrieval + Bedrock calls for an
+    equipment node that has no ingested manual at all.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1
+                FROM knowledge_embeddings
+                WHERE source_type = 'manual'
+                AND company_id = %s::uuid
+                AND content LIKE %s
+                LIMIT 1
+            """, (company_id, f"equipment_id:{equipment_id}%"))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
+    """
+    Fetch ALL manual chunks for this equipment node and concatenate them
+    into a single text block. Kept for any direct/internal callers that
+    want true full recall (e.g. a debugging tool, or a future feature
+    that isn't per-PM-type) -- generate() itself no longer calls this;
+    see fetch_relevant_manual_chunks() for what it uses instead, and the
+    CHANGE LOG above for why.
     """
     conn = get_db_connection()
     try:
@@ -173,31 +319,59 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
             "Please upload and ingest a document for this node first."
         )
 
-    known_prefix_keys = ("equipment_id:", "doc_id:", "bom_items:")
-
-    clean_chunks = []
-    for r in rows:
-        content = r["content"]
-        parts = content.split(" | ")
-
-        # Consume leading "key:value" segments (in the known set) as
-        # metadata; the first segment that isn't one of those starts the
-        # actual chunk text. Rejoin the remainder with " | " in case the
-        # chunk's own text legitimately contains that substring further in.
-        split_at = 0
-        for part in parts:
-            if part.startswith(known_prefix_keys):
-                split_at += 1
-            else:
-                break
-
-        if split_at == 0:
-            clean_chunks.append(content)  # no recognized prefix at all
-        else:
-            clean_chunks.append(" | ".join(parts[split_at:]))
-
+    clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
     full_text = "\n\n".join(clean_chunks)
     log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
+    return full_text
+
+
+def fetch_relevant_manual_chunks(equipment_id: str, company_id: str, query_text: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+    """
+    Vector-similarity retrieval of the top_k manual chunks most relevant
+    to query_text, instead of dumping every chunk ever ingested for the
+    equipment node into the prompt unconditionally. Uses the SAME
+    embeddings already generated and stored per chunk at ingest time
+    (see save_chunks() in ingest_document.py) -- this was always their
+    intended purpose, just not previously queried here.
+
+    Uses pgvector's cosine-distance operator (<=>), the standard choice
+    for most text-embedding models. If the embeddings this deployment
+    generates are tuned for a different distance metric, swap the
+    operator below (<-> for Euclidean, <#> for inner product) to match.
+
+    Falls back to an empty string (not an error) if this equipment has
+    chunks but none happen to match well -- callers already handle an
+    empty manual_text gracefully (Claude just returns an empty step list
+    for that PM type, same as "the manual doesn't cover this category").
+    The one-time upfront existence check in generate() is what catches
+    "no manual ingested at all" -- this function assumes that's already
+    been verified.
+    """
+    query_embedding = get_embedding(query_text)
+    emb_str = "[" + ",".join(map(str, query_embedding)) + "]"
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT content
+                FROM knowledge_embeddings
+                WHERE source_type = 'manual'
+                AND company_id = %s::uuid
+                AND content LIKE %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (company_id, f"equipment_id:{equipment_id}%", emb_str, top_k))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
+    full_text = "\n\n".join(clean_chunks)
+    log.info(
+        f"Retrieved {len(clean_chunks)}/{top_k} chunks ({len(full_text.split())} words) "
+        f"for equipment {equipment_id}, query={query_text[:60]!r}"
+    )
     return full_text
 
 
@@ -519,10 +693,27 @@ async def call_claude_for_pm_type(
     bedrock,
     pm_code: str,
     pm_name: str,
-    manual_text: str,
+    equipment_id: str,
+    company_id: str,
     manual_images: list,
 ) -> tuple[str, str, list]:
-    log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, prompt building now")
+    log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
+    loop = asyncio.get_event_loop()
+
+    # Retrieval runs per-PM-type and concurrently with the other nine
+    # (via run_in_executor, since get_embedding()/psycopg2 are blocking
+    # calls) rather than once upfront for the whole document -- see the
+    # CHANGE LOG at the top of this file for why full-recall was replaced
+    # with per-type similarity search.
+    query_text = PM_QUERY_TEXT.get(pm_code, pm_name)
+    try:
+        manual_text = await loop.run_in_executor(
+            None, fetch_relevant_manual_chunks, equipment_id, company_id, query_text
+        )
+    except Exception as retrieval_err:
+        log.error(f"{pm_code} RETRIEVAL FAILED: {type(retrieval_err).__name__}: {retrieval_err}")
+        return pm_code, pm_name, []
+
     if pm_code == "WP":
         prompt = build_working_principle_prompt(manual_text)
     else:
@@ -540,8 +731,6 @@ async def call_claude_for_pm_type(
     log.info(f"{pm_code} PROMPT LENGTH (chars): {len(prompt)}")
 
     try:
-        loop = asyncio.get_event_loop()
-
         try:
             response = await loop.run_in_executor(
                 None,
@@ -771,9 +960,11 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
 async def generate(equipment_id: str, company_id: str) -> bytes:
     """
     Full pipeline called from the FastAPI endpoint.
-    1. Fetch all manual chunks for the equipment
+    1. Fail fast if this equipment has no ingested manual at all
     2. Run ten parallel Claude calls (Working Principle + nine PM types),
-       each resolving its own stock component images inline
+       each retrieving its own most-relevant manual chunks (see
+       fetch_relevant_manual_chunks) and resolving its own stock
+       component images inline
     3. Build and return the Excel file as bytes
        -- always returns a valid file even if all PM types are empty
 
@@ -790,9 +981,13 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     """
-    manual_text = fetch_all_manual_chunks(equipment_id, company_id)
+    if not _has_any_manual_chunks(equipment_id, company_id):
+        raise ValueError(
+            f"No manual chunks found for equipment {equipment_id}. "
+            "Please upload and ingest a document for this node first."
+        )
 
-    bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+    bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION, config=BEDROCK_CLIENT_CONFIG)
 
     # Fetched once, up front -- this equipment's own manual images are
     # matched in-memory against every step's component keyword, rather
@@ -808,7 +1003,7 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     manual_images = fetch_manual_images_for_equipment(equipment_id, company_id) if IMAGE_MATCHING_ENABLED else []
 
     tasks = [
-        call_claude_for_pm_type(bedrock, pm_code, pm_name, manual_text, manual_images)
+        call_claude_for_pm_type(bedrock, pm_code, pm_name, equipment_id, company_id, manual_images)
         for pm_code, pm_name in PM_TYPES
     ]
     results = await asyncio.gather(*tasks)
