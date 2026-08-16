@@ -95,20 +95,6 @@ CHANGE LOG (this revision):
     separate step for the caller to remember. generate() itself is
     unchanged in its return type (still bytes only) so nothing already
     calling it directly breaks.
-  - Added run_generate_pm_job(job_id, equipment_id, company_id): the
-    actual SQS/queue entry point for PM generation, mirroring
-    run_ingest_job() in ingest_document.py -- same pm_strategy_jobs
-    table, same status='ready'/'failed' + result/error column shape.
-    Previously this file only exposed generate()/generate_with_filename(),
-    which return xlsx bytes directly -- fine for a synchronous caller,
-    but nothing a queue worker can hand bytes back to. run_generate_pm_job
-    uploads the finished file to S3 (see _upload_pm_strategy_and_presign)
-    and writes a presigned download_url + filename into the job row's
-    result instead. This is what actually puts PM generation on the same
-    footing as ingest: no synchronous request/response window to fit
-    ten concurrent Bedrock calls (plus retrieval) into, and the same
-    worker Lambda / job-polling logic already built for ingest works for
-    generation too.
 
 NOTE ON WHERE THE "TIMEOUT SOMETIMES" WAS ACTUALLY COMING FROM: generation
 already runs off a queue once the job is submitted -- API Gateway's 29s
@@ -138,12 +124,10 @@ import json
 import logging
 import asyncio
 import re
-import uuid
 from typing import Optional
 
 import boto3
 import os
-import psycopg2.extras
 from botocore.config import Config
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -569,15 +553,6 @@ IMAGE_MATCHING_ENABLED = False
 S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
 MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
 
-# Where a generated Excel file is uploaded so the queue worker (see
-# run_generate_pm_job below) can hand back a download link instead of
-# trying to return xlsx bytes from an SQS-triggered invocation with
-# nothing listening for an HTTP response. Same private-by-default,
-# presign-on-demand pattern as manual images -- these can contain
-# proprietary equipment/maintenance detail, so no permanent public URL.
-PM_STRATEGY_S3_PREFIX = "pm-strategy-output"
-PM_STRATEGY_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max
-
 _QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
 
 # Guard against spurious substring matches on short/generic material
@@ -980,39 +955,6 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
     return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
 
 
-# ── Output delivery: S3 upload + presigned URL (for the queue worker) ─────────
-
-def _upload_pm_strategy_and_presign(excel_bytes: bytes, filename: str, equipment_id: str, company_id: str) -> str:
-    """
-    Upload a generated Excel file to S3 and return a presigned download
-    URL. Used only by the queue entry point (run_generate_pm_job) below --
-    a synchronous caller of generate()/generate_with_filename() already
-    gets the bytes directly and has no need for this.
-
-    Key is namespaced by company/equipment/uuid so re-running generation
-    for the same equipment doesn't collide with or overwrite a previous
-    run's output -- each job's file is independently addressable and
-    independently expiring. Same private-by-default pattern as manual
-    images (see presign_manual_image_url): the object itself is never
-    public, only a time-limited signed URL is handed back.
-    """
-    s3 = boto3.client("s3", region_name=BEDROCK_REGION)
-    s3_key = f"{PM_STRATEGY_S3_PREFIX}/{company_id}/{equipment_id}/{uuid.uuid4()}/{filename}"
-
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=s3_key,
-        Body=excel_bytes,
-        ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": s3_key},
-        ExpiresIn=PM_STRATEGY_URL_EXPIRY_SECONDS,
-    )
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def generate(equipment_id: str, company_id: str) -> bytes:
@@ -1092,78 +1034,3 @@ async def generate_with_filename(equipment_id: str, company_id: str) -> tuple:
     equipment_info = fetch_equipment_info(equipment_id, company_id)
     filename = build_output_filename(equipment_id, equipment_info)
     return excel_bytes, filename
-
-
-# ── Queue entry point ─────────────────────────────────────────────────────────
-
-def run_generate_pm_job(job_id: str, equipment_id: str, company_id: str):
-    """
-    Called when Lambda is triggered by SQS for a generate_pm_strategy job --
-    the same queue/job pattern ingest_document.py's run_ingest_job already
-    runs on, via the same pm_strategy_jobs table. PM generation was always
-    submitted as a job rather than answered inline (see the module
-    docstring's "NOTE ON WHERE THE TIMEOUT WAS ACTUALLY COMING FROM"), but
-    up to now nothing in this file was actually shaped as the queue's
-    entry point -- generate()/generate_with_filename() return xlsx bytes
-    in memory, which is fine for a synchronous caller but has nothing to
-    hand bytes back to when invoked off SQS. This function is that entry
-    point: same job_id/status/result/error shape as run_ingest_job, so
-    the same worker Lambda and the same pm_strategy_jobs polling logic on
-    the frontend work for both ingest and generation without needing to
-    special-case which kind of job it's looking at.
-
-    Because ten concurrent Bedrock calls plus (optionally) ten retrieval
-    round-trips can genuinely take a few minutes on a large manual, this
-    runs with the same freedom from a synchronous request/response window
-    that made ingest's up-to-15-minute runs possible -- whatever SQS
-    visibility timeout and Lambda function timeout you have configured
-    for the ingest consumer should also comfortably cover a generation
-    run; there's nothing generation-specific that needs a different
-    ceiling.
-
-    Unlike run_ingest_job's result (a small JSON summary with no binary
-    payload to move), a generated strategy IS a binary file, so this
-    uploads it to S3 first (see _upload_pm_strategy_and_presign) and
-    writes only a presigned download_url + filename into the job's
-    result JSON -- the job row itself never carries the xlsx bytes.
-    """
-    try:
-        excel_bytes, filename = asyncio.run(generate_with_filename(equipment_id, company_id))
-        download_url = _upload_pm_strategy_and_presign(excel_bytes, filename, equipment_id, company_id)
-
-        result = {
-            "equipment_id":  equipment_id,
-            "company_id":    company_id,
-            "filename":      filename,
-            "download_url":  download_url,
-            "expires_in":    PM_STRATEGY_URL_EXPIRY_SECONDS,
-            "status":        "generated",
-        }
-
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE pm_strategy_jobs
-                    SET status = 'ready', result = %s::jsonb, updated_at = NOW()
-                    WHERE id = %s::uuid
-                """, (psycopg2.extras.Json(result), job_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-        log.info(f"PM STRATEGY GENERATION JOB COMPLETE [{job_id}]")
-
-    except Exception as e:
-        log.error(f"PM STRATEGY GENERATION JOB ERROR [{job_id}]: {str(e)}")
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE pm_strategy_jobs
-                    SET status = 'failed', error = %s, updated_at = NOW()
-                    WHERE id = %s::uuid
-                """, (str(e), job_id))
-            conn.commit()
-        finally:
-            conn.close()
