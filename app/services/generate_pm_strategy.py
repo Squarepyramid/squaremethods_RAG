@@ -95,6 +95,34 @@ CHANGE LOG (this revision):
     separate step for the caller to remember. generate() itself is
     unchanged in its return type (still bytes only) so nothing already
     calling it directly breaks.
+  - CONCURRENCY CAP (fixes a real ServiceUnavailableException seen in
+    production CloudWatch logs): all 10 PM types previously fired their
+    invoke_model call (and their get_embedding call) fully concurrently,
+    uncapped. A real log showed PM2/PM3/WP failing with
+    "ServiceUnavailableException ... reached max retries: 2" within ~1.2
+    seconds of each other, while the job itself completed in 38s -- i.e.
+    NOT a hang/timeout, but Bedrock rejecting requests under a burst of
+    10 simultaneous invoke_model calls exceeding on-demand throughput for
+    this model. Added BEDROCK_INVOKE_CONCURRENCY (semaphore, default 4)
+    around invoke_model and RETRIEVAL_CONCURRENCY (semaphore, default 5)
+    around retrieval, so PM types run in a few concurrent waves instead
+    of all 10 at once. Also raised BEDROCK_CLIENT_CONFIG's max_attempts
+    from 2 to 5 as a second layer, so a transient 503 that still gets
+    through the concurrency cap has more room to retry before giving up.
+  - Added run_generate_pm_job(job_id, equipment_id, company_id): the
+    actual SQS/queue entry point for PM generation, mirroring
+    run_ingest_job() in ingest_document.py -- same pm_strategy_jobs
+    table, same status='ready'/'failed' + result/error column shape.
+    Previously this file only exposed generate()/generate_with_filename(),
+    which return xlsx bytes directly -- fine for a synchronous caller,
+    but nothing a queue worker can hand bytes back to. run_generate_pm_job
+    uploads the finished file to S3 (see _upload_pm_strategy_and_presign)
+    and writes a presigned download_url + filename into the job row's
+    result instead. This is what actually puts PM generation on the same
+    footing as ingest: no synchronous request/response window to fit
+    ten concurrent Bedrock calls (plus retrieval) into, and the same
+    worker Lambda / job-polling logic already built for ingest works for
+    generation too.
 
 NOTE ON WHERE THE "TIMEOUT SOMETIMES" WAS ACTUALLY COMING FROM: generation
 already runs off a queue once the job is submitted -- API Gateway's 29s
@@ -124,10 +152,12 @@ import json
 import logging
 import asyncio
 import re
+import uuid
 from typing import Optional
 
 import boto3
 import os
+import psycopg2.extras
 from botocore.config import Config
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -188,14 +218,43 @@ MAX_TOKENS      = 4096
 # swallowed by call_claude_for_pm_type's broad except-clause -- coming
 # back indistinguishable from "Claude legitimately found nothing in this
 # manual." read_timeout is sized generously above what a bounded,
-# RETRIEVAL_TOP_K-limited prompt should ever need; if it's still being
-# hit regularly, that's a real signal worth surfacing, not something to
-# raise further without checking why.
+# RETRIEVAL_TOP_K-limited prompt should ever need.
+#
+# max_attempts was raised from 2 to 5 after a real CloudWatch log showed
+# PM2/PM3/WP failing with "ServiceUnavailableException ... reached max
+# retries: 2): Bedrock is unable to process your request" -- all three
+# within about 1.2 seconds of each other. That's Bedrock rejecting
+# requests almost instantly under load, not a hang -- the job itself
+# completed in 38s (see the REPORT line for that RequestId), well inside
+# any Lambda timeout. The actual cause was BEDROCK_INVOKE_CONCURRENCY
+# below: firing all 10 invoke_model calls simultaneously with no cap was
+# bursting past whatever on-demand throughput Claude 3 Haiku has
+# available in this account/region, and 2 attempts (1 retry) wasn't
+# enough to ride out a transient 503 under that burst. Capping
+# concurrency (fewer simultaneous requests = less burst pressure) is the
+# primary fix; more retry attempts is the second layer, for whatever
+# throttling still gets through the concurrency cap.
 BEDROCK_CLIENT_CONFIG = Config(
     connect_timeout=10,
     read_timeout=90,
-    retries={"max_attempts": 2, "mode": "standard"},
+    retries={"max_attempts": 5, "mode": "standard"},
 )
+
+# Caps on how many PM types can be in-flight on each blocking call at
+# once. Previously all 10 PM types fired both their retrieval
+# (get_embedding + DB query) and their invoke_model call fully
+# concurrently, uncapped -- see BEDROCK_CLIENT_CONFIG's comment above for
+# the real ServiceUnavailableException this caused. With these caps, 10
+# PM types run in ceil(10/N) waves instead of all at once; each wave is
+# still concurrent within itself, so this isn't a return to fully
+# sequential processing -- worst case (every call taking the full 90s
+# read_timeout) is ceil(10/4) * 90s =~ 270s, comfortably inside a Lambda
+# timeout sized like ingest's. Tune down further if 503s still show up
+# in the logs at this concurrency; tune up only after confirming higher
+# throughput is actually available (check the Bedrock console's service
+# quotas for this model), not by guessing.
+BEDROCK_INVOKE_CONCURRENCY = 4   # simultaneous invoke_model (generation) calls
+RETRIEVAL_CONCURRENCY      = 5   # simultaneous get_embedding + DB retrieval calls
 
 # How many of the most relevant chunks (by embedding similarity) to pull
 # per PM type. ~40 chunks at ~500 words/chunk is roughly 20k words --
@@ -553,6 +612,15 @@ IMAGE_MATCHING_ENABLED = False
 S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
 MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
 
+# Where a generated Excel file is uploaded so the queue worker (see
+# run_generate_pm_job below) can hand back a download link instead of
+# trying to return xlsx bytes from an SQS-triggered invocation with
+# nothing listening for an HTTP response. Same private-by-default,
+# presign-on-demand pattern as manual images -- these can contain
+# proprietary equipment/maintenance detail, so no permanent public URL.
+PM_STRATEGY_S3_PREFIX = "pm-strategy-output"
+PM_STRATEGY_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max
+
 _QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
 
 # Guard against spurious substring matches on short/generic material
@@ -696,6 +764,8 @@ async def call_claude_for_pm_type(
     equipment_id: str,
     company_id: str,
     manual_images: list,
+    retrieval_semaphore: asyncio.Semaphore,
+    invoke_semaphore: asyncio.Semaphore,
 ) -> tuple[str, str, list]:
     log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
     loop = asyncio.get_event_loop()
@@ -704,12 +774,18 @@ async def call_claude_for_pm_type(
     # (via run_in_executor, since get_embedding()/psycopg2 are blocking
     # calls) rather than once upfront for the whole document -- see the
     # CHANGE LOG at the top of this file for why full-recall was replaced
-    # with per-type similarity search.
+    # with per-type similarity search. Bounded by retrieval_semaphore
+    # (RETRIEVAL_CONCURRENCY) so all 10 PM types don't hit get_embedding
+    # and the DB simultaneously -- see BEDROCK_INVOKE_CONCURRENCY's
+    # comment for why uncapped concurrency here was a real problem for
+    # the invoke_model call; the same risk applies to embedding calls,
+    # just not yet observed in a log the way the Bedrock 503s were.
     query_text = PM_QUERY_TEXT.get(pm_code, pm_name)
     try:
-        manual_text = await loop.run_in_executor(
-            None, fetch_relevant_manual_chunks, equipment_id, company_id, query_text
-        )
+        async with retrieval_semaphore:
+            manual_text = await loop.run_in_executor(
+                None, fetch_relevant_manual_chunks, equipment_id, company_id, query_text
+            )
     except Exception as retrieval_err:
         log.error(f"{pm_code} RETRIEVAL FAILED: {type(retrieval_err).__name__}: {retrieval_err}")
         return pm_code, pm_name, []
@@ -732,15 +808,21 @@ async def call_claude_for_pm_type(
 
     try:
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: bedrock.invoke_model(
-                    modelId     = BEDROCK_MODEL,
-                    body        = body,
-                    contentType = "application/json",
-                    accept      = "application/json",
+            # Bounded by invoke_semaphore (BEDROCK_INVOKE_CONCURRENCY) --
+            # see that constant's comment. This is the fix for the actual
+            # ServiceUnavailableException seen in production logs: all 10
+            # PM types firing invoke_model at once was bursting past
+            # Bedrock's on-demand throughput for this model.
+            async with invoke_semaphore:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: bedrock.invoke_model(
+                        modelId     = BEDROCK_MODEL,
+                        body        = body,
+                        contentType = "application/json",
+                        accept      = "application/json",
+                    )
                 )
-            )
         except Exception as invoke_err:
             log.error(f"{pm_code} INVOKE_MODEL FAILED: {type(invoke_err).__name__}: {invoke_err}")
             raise
@@ -955,6 +1037,39 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
     return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
 
 
+# ── Output delivery: S3 upload + presigned URL (for the queue worker) ─────────
+
+def _upload_pm_strategy_and_presign(excel_bytes: bytes, filename: str, equipment_id: str, company_id: str) -> str:
+    """
+    Upload a generated Excel file to S3 and return a presigned download
+    URL. Used only by the queue entry point (run_generate_pm_job) below --
+    a synchronous caller of generate()/generate_with_filename() already
+    gets the bytes directly and has no need for this.
+
+    Key is namespaced by company/equipment/uuid so re-running generation
+    for the same equipment doesn't collide with or overwrite a previous
+    run's output -- each job's file is independently addressable and
+    independently expiring. Same private-by-default pattern as manual
+    images (see presign_manual_image_url): the object itself is never
+    public, only a time-limited signed URL is handed back.
+    """
+    s3 = boto3.client("s3", region_name=BEDROCK_REGION)
+    s3_key = f"{PM_STRATEGY_S3_PREFIX}/{company_id}/{equipment_id}/{uuid.uuid4()}/{filename}"
+
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=excel_bytes,
+        ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=PM_STRATEGY_URL_EXPIRY_SECONDS,
+    )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def generate(equipment_id: str, company_id: str) -> bytes:
@@ -1002,8 +1117,21 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     # that needs to change to turn image matching off end-to-end.
     manual_images = fetch_manual_images_for_equipment(equipment_id, company_id) if IMAGE_MATCHING_ENABLED else []
 
+    # See BEDROCK_INVOKE_CONCURRENCY / RETRIEVAL_CONCURRENCY's comments --
+    # these semaphores are what actually stop all 10 PM types from
+    # bursting Bedrock at once, which is what produced the
+    # ServiceUnavailableException seen in production. Created fresh per
+    # generate() call (not module-level) since an asyncio.Semaphore is
+    # bound to the event loop it's created on, and asyncio.run() (see
+    # run_generate_pm_job) creates a new loop per job.
+    retrieval_semaphore = asyncio.Semaphore(RETRIEVAL_CONCURRENCY)
+    invoke_semaphore     = asyncio.Semaphore(BEDROCK_INVOKE_CONCURRENCY)
+
     tasks = [
-        call_claude_for_pm_type(bedrock, pm_code, pm_name, equipment_id, company_id, manual_images)
+        call_claude_for_pm_type(
+            bedrock, pm_code, pm_name, equipment_id, company_id, manual_images,
+            retrieval_semaphore, invoke_semaphore,
+        )
         for pm_code, pm_name in PM_TYPES
     ]
     results = await asyncio.gather(*tasks)
@@ -1034,3 +1162,78 @@ async def generate_with_filename(equipment_id: str, company_id: str) -> tuple:
     equipment_info = fetch_equipment_info(equipment_id, company_id)
     filename = build_output_filename(equipment_id, equipment_info)
     return excel_bytes, filename
+
+
+# ── Queue entry point ─────────────────────────────────────────────────────────
+
+def run_generate_pm_job(job_id: str, equipment_id: str, company_id: str):
+    """
+    Called when Lambda is triggered by SQS for a generate_pm_strategy job --
+    the same queue/job pattern ingest_document.py's run_ingest_job already
+    runs on, via the same pm_strategy_jobs table. PM generation was always
+    submitted as a job rather than answered inline (see the module
+    docstring's "NOTE ON WHERE THE TIMEOUT WAS ACTUALLY COMING FROM"), but
+    up to now nothing in this file was actually shaped as the queue's
+    entry point -- generate()/generate_with_filename() return xlsx bytes
+    in memory, which is fine for a synchronous caller but has nothing to
+    hand bytes back to when invoked off SQS. This function is that entry
+    point: same job_id/status/result/error shape as run_ingest_job, so
+    the same worker Lambda and the same pm_strategy_jobs polling logic on
+    the frontend work for both ingest and generation without needing to
+    special-case which kind of job it's looking at.
+
+    Because ten concurrent Bedrock calls plus (optionally) ten retrieval
+    round-trips can genuinely take a few minutes on a large manual, this
+    runs with the same freedom from a synchronous request/response window
+    that made ingest's up-to-15-minute runs possible -- whatever SQS
+    visibility timeout and Lambda function timeout you have configured
+    for the ingest consumer should also comfortably cover a generation
+    run; there's nothing generation-specific that needs a different
+    ceiling.
+
+    Unlike run_ingest_job's result (a small JSON summary with no binary
+    payload to move), a generated strategy IS a binary file, so this
+    uploads it to S3 first (see _upload_pm_strategy_and_presign) and
+    writes only a presigned download_url + filename into the job's
+    result JSON -- the job row itself never carries the xlsx bytes.
+    """
+    try:
+        excel_bytes, filename = asyncio.run(generate_with_filename(equipment_id, company_id))
+        download_url = _upload_pm_strategy_and_presign(excel_bytes, filename, equipment_id, company_id)
+
+        result = {
+            "equipment_id":  equipment_id,
+            "company_id":    company_id,
+            "filename":      filename,
+            "download_url":  download_url,
+            "expires_in":    PM_STRATEGY_URL_EXPIRY_SECONDS,
+            "status":        "generated",
+        }
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'ready', result = %s::jsonb, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (psycopg2.extras.Json(result), job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        log.info(f"PM STRATEGY GENERATION JOB COMPLETE [{job_id}]")
+
+    except Exception as e:
+        log.error(f"PM STRATEGY GENERATION JOB ERROR [{job_id}]: {str(e)}")
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE pm_strategy_jobs
+                    SET status = 'failed', error = %s, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (str(e), job_id))
+            conn.commit()
+        finally:
+            conn.close()
