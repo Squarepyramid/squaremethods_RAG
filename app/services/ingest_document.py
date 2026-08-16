@@ -18,13 +18,20 @@ re-enabling it requires re-ingesting already-processed documents' TEXT
 chunks; only documents ingested while the flag is off will be missing
 images until they're re-ingested.
 
-*** SCANNED-PDF FALLBACK: AMAZON TEXTRACT (NOT LOCAL OCR) ***
-A meaningful fraction of manufacturer-supplied manuals are flat scans --
-every page is a raster image with no text layer at all (pypdf's
-extract_text() returns "" for every page). Previously that made
-extract_text() raise "No text could be extracted from the document." and
-the whole ingest job would fail, even though the pages are perfectly
-readable to a human.
+*** TEXTRACT-ONLY BUILD -- COMPARISON VARIANT, NOT THE RECOMMENDED DEFAULT ***
+This file is a variant of document_ingest_service.py that sends EVERY
+PDF through Amazon Textract, unconditionally -- no pypdf native-text
+pass, no scanned-vs-clean detection, no per-page or per-document
+threshold. It exists so the two approaches can be compared side by
+side (behavior, latency, cost, log output) on the same real documents.
+It is NOT what's currently recommended for production: for a mix of
+scanned and normal digitally-generated manuals, this build pays
+Textract's async-job latency (and per-page cost) on every single
+ingest, including the normal manuals that already have a perfectly
+good text layer and previously extracted for free in milliseconds via
+pypdf. See document_ingest_service.py (the hybrid version) for the
+native-first, Textract-only-when-needed design and the reasoning
+behind it.
 
 We tried a local-OCR fix first (pymupdf to render pages + pytesseract +
 a `tesseract` binary in the Lambda image) and deliberately backed out of
@@ -49,19 +56,17 @@ already a dependency), so there is no OS package, no binary, no Docker
 build step, and nothing that can break in CI for glibc/version reasons.
 See TEXTRACT_ENABLED below.
 
-How it's used: Textract's async document-text-detection API only takes
-input from S3 (not raw bytes), and it always processes the ENTIRE
+How it's used here: Textract's async document-text-detection API only
+takes input from S3 (not raw bytes), and it always processes the ENTIRE
 submitted document -- there's no way to ask it to OCR just specific
 pages, and there's no billing difference between submitting the whole
 file vs. a subset (you're charged per page of whatever you submit
-either way). So the design is: try native pypdf extraction first (free,
-instant, and the common case for a normal digitally-generated manual --
-Textract is never called at all if every page already has real text).
-Only if at least one page comes back with no usable native text does
-the WHOLE document get submitted to Textract once, and its output is
-used for every page it covers (see _textract_extract_document's
-docstring for why "whole document" instead of "just the missing
-pages").
+either way). In THIS build, every PDF is submitted to Textract exactly
+once, unconditionally -- there is no native-extraction check and no
+fallback if the Textract call fails (contrast with the hybrid version,
+which falls back to native text on a Textract error since it already
+has that text in hand; this build has nothing to fall back to, so a
+Textract failure here fails the whole ingest job).
 
 DEPLOYMENT REQUIREMENT for Textract: the Lambda's execution role needs
     textract:StartDocumentTextDetection
@@ -83,10 +88,9 @@ Key design decisions:
   - Ingest runs as an async background job via SQS (see run_ingest_job)
   - Embeddings are generated concurrently in bounded batches to handle
     large documents (50+ pages) within the Lambda timeout window
-  - PDF text extraction falls back to Amazon Textract for pages with no
-    usable native text layer, so scanned/flatbed-scanned manuals ingest
-    instead of failing outright -- see the module docstring section above
-    for why Textract instead of local OCR.
+  - EVERY PDF's text extraction goes through Amazon Textract, unconditionally
+    (this is the Textract-only comparison build -- see the module docstring
+    section above). No pypdf native-text pass, no scanned-vs-clean check.
   - Extracted manual images are associated with their PAGE's text as
     "context_text" (not a precise per-figure caption) -- OEM manuals
     rarely have clean one-image-per-component layouts; a parts-list
@@ -211,36 +215,16 @@ def url_to_uuid(file_url: str) -> str:
     return str(uuid.UUID(hashlib.md5(file_url.encode()).hexdigest()))
 
 
-# ── Scanned-PDF fallback: Amazon Textract ─────────────────────────────────────
+# ── Text extraction: Amazon Textract, unconditionally ─────────────────────────
 #
-# See the module docstring for why this is Textract and not local OCR.
-# Only pages with no usable native text layer trigger a Textract call,
-# and only once per document (the whole file, not per page -- see
-# _textract_extract_document's docstring).
+# TEXTRACT-ONLY BUILD: no native-text check, no per-page or per-document
+# threshold. Every PDF is submitted to Textract exactly once. See the
+# module docstring for why this exists as a separate build from the
+# hybrid (native-first) version.
 
 TEXTRACT_ENABLED               = True   # requires the IAM permissions in the module docstring
-TEXTRACT_MIN_TEXT_CHARS        = 20     # native-extracted chars below this -> treat the page as scanned
 TEXTRACT_POLL_INTERVAL_SECONDS = 3      # how often to check job status while waiting
 TEXTRACT_MAX_WAIT_SECONDS      = 300    # give up waiting after this long (leaves headroom under the Lambda timeout for download/chunk/embed)
-
-# What fraction of a document's pages must look scanned (< TEXTRACT_MIN_TEXT_CHARS)
-# before the whole document gets submitted to Textract at all. Real manuals
-# routinely have a handful of pages that are naturally sparse without being
-# scanned -- cover pages, section dividers, blank backs of double-sided
-# pages, an index page that's mostly whitespace -- and treating even ONE such
-# page as "needs OCR" used to send the ENTIRE document through a 30s-5min
-# Textract round trip for no benefit, which is what made ordinary
-# digitally-generated manuals slower (and, via the overwrite bug this
-# replaced -- see _extract_pdf_page_texts -- also lower quality, since
-# Textract's plain per-line text was overwriting perfectly good native text
-# on pages that never needed it). A genuinely scanned document fails this
-# check by a wide margin in practice (100% of pages, confirmed against a
-# real 66-page fully-scanned manual) vs. a normal document's occasional
-# sparse page (typically low single-digit %), so 30% leaves a comfortable
-# gap between the two. Tunable: lower this if a real manual turns out to
-# have a large block of genuinely scanned pages (e.g. photocopied drawings)
-# mixed into mostly-native-text content at a lower ratio than 30%.
-TEXTRACT_TRIGGER_MIN_FRACTION  = 0.3
 
 _S3_VIRTUAL_HOSTED_RE = re.compile(r"^(?P<bucket>[^.]+)\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
 _S3_PATH_STYLE_RE     = re.compile(r"^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
@@ -375,93 +359,51 @@ def _textract_extract_document(file_bytes: bytes, file_url: str) -> dict:
 
 def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
     """
+    TEXTRACT-ONLY BUILD: every PDF is sent through Textract, every time --
+    no pypdf native-text pass, no scanned-vs-clean check, no threshold.
     Returns a list of per-page text, one entry per page, in page order.
-    Native pypdf extraction is used first (free, instant); if every page
-    already has usable text, Textract is never called at all -- this
-    keeps the common case (a normal digitally-generated manual) exactly
-    as fast and free as before.
 
-    Textract is only invoked if a large-enough FRACTION of pages look
-    scanned (see TEXTRACT_TRIGGER_MIN_FRACTION) -- not just "at least
-    one." A handful of naturally sparse pages (covers, dividers, blank
-    backs) in an otherwise normal manual used to be enough to trigger a
-    slow whole-document Textract round trip for zero benefit; this way,
-    a normal manual with the odd sparse page stays on the fast, free
-    native-only path, while a genuinely scanned document (which fails
-    this check by a wide margin -- 100% of pages, in the real manual
-    this was tested against) still gets sent through Textract.
+    pypdf is still used here, but only to get the page COUNT (so the
+    returned list has the right length/order even for a page Textract's
+    result happens not to cover) -- unlike the hybrid version, its
+    extract_text() is never called, so there's no free native-text pass
+    being wasted or compared against.
 
-    When Textract IS invoked, it still processes the WHOLE document (see
-    _textract_extract_document for why), but only the pages that
-    actually lacked native text get their entry replaced with Textract's
-    output below -- pages that already had good native text keep it,
-    rather than being overwritten by Textract's plain per-line text
-    (which can reorder or mangle tables/multi-column layouts differently
-    than pypdf, so blanket-replacing already-good text was a quality
-    regression, not an improvement).
+    No fallback on a Textract failure: the hybrid version can fall back
+    to the native text it already extracted if Textract errors or times
+    out, but this build never extracts native text in the first place,
+    so a Textract error here propagates up and fails the whole ingest
+    job (see extract_text_from_pdf's except-clause). That's a real
+    behavioral difference worth knowing about when comparing the two --
+    this build has strictly more exposure to Textract-side failures
+    (job failure, timeout, throttling, IAM/network issues) than the
+    hybrid one, because it depends on Textract for 100% of documents
+    instead of only the ones that actually need OCR.
 
     Shared by extract_text_from_pdf() (joins the non-empty pages into
     the document's full text) and extract_images_from_pdf() (uses each
-    page's text as that image's context_text), so both get Textract'd
-    text for scanned pages instead of extract_images_from_pdf silently
-    falling back to native-only extraction and getting blank
-    context_text on pages extract_text_from_pdf had to send to Textract.
+    page's text as that image's context_text).
     """
-    import pypdf
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-
-    native_texts = [(page.extract_text() or "").strip() for page in reader.pages]
-    needs_ocr    = [i for i, t in enumerate(native_texts) if len(t) < TEXTRACT_MIN_TEXT_CHARS]
-
-    if not needs_ocr:
-        return native_texts
-
-    scanned_fraction = len(needs_ocr) / len(native_texts)
-    if scanned_fraction < TEXTRACT_TRIGGER_MIN_FRACTION:
-        log.info(
-            f"{len(needs_ocr)}/{len(native_texts)} page(s) ({scanned_fraction:.0%}) "
-            f"have no usable text layer, but that's below "
-            f"TEXTRACT_TRIGGER_MIN_FRACTION ({TEXTRACT_TRIGGER_MIN_FRACTION:.0%}) -- "
-            f"treating this as a normal document with a few naturally sparse "
-            f"pages (covers, dividers, blank backs) rather than a scanned one, "
-            f"and skipping Textract for it. Those {len(needs_ocr)} page(s) will "
-            f"be missing from the extracted text."
-        )
-        return native_texts
-
     if not TEXTRACT_ENABLED:
-        log.info(
-            f"{len(needs_ocr)}/{len(native_texts)} page(s) have no usable "
-            f"text layer and Textract is disabled (TEXTRACT_ENABLED=False); "
-            f"they will be skipped."
+        raise RuntimeError(
+            "TEXTRACT_ENABLED is False -- this Textract-only build has no "
+            "extraction path at all without it (unlike the hybrid version, "
+            "which still has native pypdf extraction to fall back on)."
         )
-        return native_texts
+
+    import pypdf
+    reader     = pypdf.PdfReader(io.BytesIO(file_bytes))
+    num_pages  = len(reader.pages)
 
     log.info(
-        f"{len(needs_ocr)}/{len(native_texts)} page(s) ({scanned_fraction:.0%}) "
-        f"have no usable text layer -- sending the document to Textract."
+        f"Sending {num_pages}-page PDF to Textract unconditionally "
+        f"(Textract-only build -- no native-text check performed)."
     )
-    try:
-        textract_pages = _textract_extract_document(file_bytes, file_url)
-    except Exception as e:
-        log.error(
-            f"Textract extraction failed ({e}); continuing with native text "
-            f"only -- pages without a text layer will be missing from this "
-            f"ingest. If this keeps happening, check the Lambda execution "
-            f"role has textract:StartDocumentTextDetection, "
-            f"textract:GetDocumentTextDetection, and s3:GetObject on the "
-            f"source bucket."
-        )
-        return native_texts
+    textract_pages = _textract_extract_document(file_bytes, file_url)
 
-    page_texts = list(native_texts)
-    filled = 0
-    for i in needs_ocr:
-        textract_text = textract_pages.get(i + 1, "").strip()
-        if textract_text:
-            page_texts[i] = textract_text
-            filled += 1
-    log.info(f"Textract returned text for {filled}/{len(needs_ocr)} previously-blank page(s).")
+    page_texts = [textract_pages.get(i + 1, "").strip() for i in range(num_pages)]
+    filled = sum(1 for t in page_texts if t)
+    log.info(f"Textract returned text for {filled}/{num_pages} page(s).")
     return page_texts
 
 
@@ -950,13 +892,14 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     if not text.strip():
         if filename.lower().endswith(".pdf"):
             raise ValueError(
-                "No text could be extracted from the document. If this PDF "
-                "is scanned (no embedded text layer), check the CloudWatch "
-                "logs above for a Textract error -- this can mean the job "
-                "failed, timed out, TEXTRACT_ENABLED is False, or the "
-                "Lambda execution role is missing "
-                "textract:StartDocumentTextDetection / "
-                "textract:GetDocumentTextDetection / s3:GetObject."
+                "No text could be extracted from the document. This build "
+                "sends every PDF through Textract unconditionally, so an "
+                "empty result here means Textract itself returned nothing "
+                "for every page (not a native-vs-scanned distinction) -- "
+                "check the CloudWatch logs above for a Textract error: job "
+                "failure, timeout, TEXTRACT_ENABLED is False, or the Lambda "
+                "execution role missing textract:StartDocumentTextDetection "
+                "/ textract:GetDocumentTextDetection / s3:GetObject."
             )
         raise ValueError("No text could be extracted from the document.")
     log.info(f"Extracted {len(text.split())} words.")
