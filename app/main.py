@@ -9,10 +9,7 @@ import json
 import boto3
 import psycopg2.extras
 
-from app.services.bedrock_client import ask_bedrock, call_claude, extract_text
-from app.services.retrieval import build_context
-from app.services.session import create_session, get_session, get_history, save_messages, maybe_summarize
-from app.services import tools as chat_tools
+from app.services.chat_service import handle_chat_turn, SessionNotFoundError
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
 from app.services.ingest_document import (
@@ -180,145 +177,19 @@ def swagger_ui():
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
-CHAT_SYSTEM_PROMPT_TEMPLATE = """You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
-STRICT RULES:
-- Only answer based on the equipment knowledge provided below
-- Never reveal your underlying model or that you were made by Anthropic
-- Never reference company IDs in your responses
-- If asked who you are, say: "I am the SquareMethods Assistant, here to help you with equipment knowledge and maintenance support."
-- If the answer is not in the provided knowledge, say so clearly and briefly
-- Keep answers concise and practical
-- If the user asks you to write up, document, or turn guidance into a procedure, use the create_job_aid tool. It always creates a DRAFT -- tell the user it's pending review, and share the link.
-
-Equipment Knowledge:
-{context}"""
-
-MAX_TOOL_ITERATIONS = 3
-
-
-def _summarize_messages(existing_summary: str, messages: list) -> str:
-    """Cheap rolling-summary helper for session.maybe_summarize(). Uses
-    ask_bedrock (single prompt -> text) since it doesn't need tools or
-    multi-turn structure -- just Haiku doing a short rewrite."""
-    transcript = "\n".join(
-        f"{m['role'].capitalize()}: {m['content']}" for m in messages
-        if isinstance(m.get("content"), str)
-    )
-    prompt = (
-        "Update the running summary of this equipment maintenance chat with "
-        "the new turns below. Keep it short and factual: equipment discussed, "
-        "issues raised, job aids referenced or created, open questions.\n\n"
-        f"Existing summary:\n{existing_summary or '(none yet)'}\n\n"
-        f"New turns:\n{transcript}\n\nUpdated summary:"
-    )
-    return ask_bedrock(prompt)
-
-
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(request: ChatRequest):
     try:
-        equipment_id = request.equipment_path.strip("/").split("/")[-1]
-
-        if request.session_id:
-            session = get_session(request.session_id, request.company_id)
-            if not session:
-                raise HTTPException(status_code=404, detail="Session not found or access denied")
-            session_id = request.session_id
-        else:
-            session_id = create_session(
-                company_id=request.company_id,
-                user_id=request.user_id,
-                equipment_path=request.equipment_path,
-                equipment_id=equipment_id
-            )
-
-        history = get_history(session_id, request.company_id)
-        retrieved = build_context(
-            equipment_path=request.equipment_path,
+        result = handle_chat_turn(
             company_id=request.company_id,
-            query=request.query
+            user_id=request.user_id,
+            equipment_path=request.equipment_path,
+            query=request.query,
+            session_id=request.session_id,
         )
-
-        system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context=retrieved["context"])
-        if history["summary"]:
-            system_prompt += f"\n\nEarlier conversation summary:\n{history['summary']}"
-
-        # Real role-tagged turns instead of flattening history into the
-        # prompt string. Only plain-text turns end up in chat_messages
-        # (see save_messages below), so every stored message's content is
-        # a plain string here -- safe to pass straight through.
-        messages = [
-            {"role": m["role"], "content": m["content"]}
-            for m in history["messages"]
-            if m["role"] in ("user", "assistant")
-        ]
-        messages.append({"role": "user", "content": request.query})
-
-        tool_call_log = []
-        response = call_claude(
-            messages=messages, system=system_prompt,
-            tools=chat_tools.ALL_TOOLS, max_tokens=1500,
-        )
-
-        iterations = 0
-        while response.get("stop_reason") == "tool_use" and iterations < MAX_TOOL_ITERATIONS:
-            iterations += 1
-            tool_use_blocks = [b for b in response["content"] if b["type"] == "tool_use"]
-            messages.append({"role": "assistant", "content": response["content"]})
-
-            tool_result_blocks = []
-            for block in tool_use_blocks:
-                result = chat_tools.execute_tool(
-                    block["name"], block["input"],
-                    company_id=request.company_id,
-                    equipment_id=equipment_id,
-                    user_id=request.user_id,
-                )
-                tool_call_log.append({
-                    "name": block["name"], "input": block["input"], "result": result,
-                })
-                tool_result_blocks.append({
-                    "type": "tool_result",
-                    "tool_use_id": block["id"],
-                    "content": json.dumps(result),
-                })
-            messages.append({"role": "user", "content": tool_result_blocks})
-
-            response = call_claude(
-                messages=messages, system=system_prompt,
-                tools=chat_tools.ALL_TOOLS, max_tokens=1500,
-            )
-
-        answer = extract_text(response)
-
-        # Only the final user query + final assistant text get persisted
-        # as conversation turns -- the tool_use/tool_result exchange above
-        # is scoped to this one turn's reasoning, not replayed as history.
-        # What tool ran (and its result) is preserved in metadata instead.
-        save_messages(
-            session_id, request.company_id, request.query, answer,
-            sources=retrieved["sources"],
-            tool_calls=tool_call_log or None,
-        )
-
-        try:
-            maybe_summarize(session_id, request.company_id, _summarize_messages)
-        except Exception as e:
-            # Never let summarization block the actual chat response.
-            print(f"SUMMARIZE ERROR: {str(e)}")
-
-        job_aids_created = [
-            tc["result"] for tc in tool_call_log
-            if tc["name"] == "create_job_aid" and tc["result"].get("status") == "created_draft"
-        ] or None
-
-        return ChatResponse(
-            answer=answer,
-            session_id=session_id,
-            sources=retrieved["sources"],
-            job_aids_created=job_aids_created,
-        )
-
+        return ChatResponse(**result)
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found or access denied")
     except HTTPException:
         raise
     except Exception as e:
