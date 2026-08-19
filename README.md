@@ -363,6 +363,16 @@ ORDER BY table_name;
 
 # to see all tables
 \dt
+
+
+# to see the table schema
+
+SELECT table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_name IN ('chat_sessions')
+ORDER BY table_name, ordinal_position;
+
+
 # view what is in table
 SELECT * FROM equipment_type_defaults LIMIT 10;
 SELECT COUNT(*) FROM equipment_type_defaults;
