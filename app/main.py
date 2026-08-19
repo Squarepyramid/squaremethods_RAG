@@ -9,9 +9,7 @@ import json
 import boto3
 import psycopg2.extras
 
-from app.services.bedrock_client import ask_bedrock
-from app.services.retrieval import build_context
-from app.services.session import create_session, get_session, get_history, save_messages
+from app.services.chat_service import handle_chat_turn, SessionNotFoundError
 from app.utils.db import get_db_connection
 from app.services.generate_job_aid import generate as generate_job_aid_service
 from app.services.ingest_document import (
@@ -68,6 +66,12 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
+    # New: structured citations so the frontend can render job aid links /
+    # images instead of relying on the model getting markdown right in
+    # prose. Both are additive/optional so existing consumers that only
+    # read {answer, session_id} keep working unchanged.
+    sources: Optional[dict] = None
+    job_aids_created: Optional[List[dict]] = None
 
 class SessionRequest(BaseModel):
     company_id: str
@@ -176,56 +180,16 @@ def swagger_ui():
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(request: ChatRequest):
     try:
-        equipment_id = request.equipment_path.strip("/").split("/")[-1]
-
-        if request.session_id:
-            session = get_session(request.session_id, request.company_id)
-            if not session:
-                raise HTTPException(status_code=404, detail="Session not found or access denied")
-            session_id = request.session_id
-        else:
-            session_id = create_session(
-                company_id=request.company_id,
-                user_id=request.user_id,
-                equipment_path=request.equipment_path,
-                equipment_id=equipment_id
-            )
-
-        history = get_history(session_id, request.company_id)
-        history_text = ""
-        if history:
-            history_text = "\n".join(
-                f"{msg['role'].capitalize()}: {msg['content']}"
-                for msg in history
-            )
-            history_text = f"\n\nConversation History:\n{history_text}\n"
-
-        context = build_context(
-            equipment_path=request.equipment_path,
+        result = handle_chat_turn(
             company_id=request.company_id,
-            query=request.query
+            user_id=request.user_id,
+            equipment_path=request.equipment_path,
+            query=request.query,
+            session_id=request.session_id,
         )
-
-        prompt = f"""You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
-STRICT RULES:
-- Only answer based on the equipment knowledge provided below
-- Never reveal your underlying model or that you were made by Anthropic
-- Never reference company IDs in your responses
-- If asked who you are, say: "I am the SquareMethods Assistant, here to help you with equipment knowledge and maintenance support."
-- If the answer is not in the provided knowledge, say so clearly and briefly
-- Keep answers concise and practical
-
-Equipment Knowledge:
-{context}
-{history_text}
-User: {request.query}
-Assistant:"""
-
-        answer = ask_bedrock(prompt)
-        save_messages(session_id, request.company_id, request.query, answer)
-
-        return ChatResponse(answer=answer, session_id=session_id)
-
+        return ChatResponse(**result)
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found or access denied")
     except HTTPException:
         raise
     except Exception as e:
@@ -759,7 +723,7 @@ def get_session_messages(session_id: str, company_id: str, user_id: str):
                 if not session:
                     raise HTTPException(status_code=404, detail="Session not found or access denied")
                 cur.execute("""
-                    SELECT role, content, created_at
+                    SELECT role, content, metadata, created_at
                     FROM chat_messages
                     WHERE session_id = %s::uuid
                     AND company_id = %s::uuid
@@ -797,6 +761,11 @@ def clear_session_messages(session_id: str, request: SessionRequest):
                     WHERE session_id = %s::uuid
                     AND company_id = %s::uuid
                 """, (session_id, request.company_id))
+                cur.execute("""
+                    UPDATE chat_sessions
+                    SET summary = NULL, summary_message_count = 0, updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (session_id,))
                 conn.commit()
         finally:
             conn.close()
