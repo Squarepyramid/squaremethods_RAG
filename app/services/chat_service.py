@@ -17,7 +17,10 @@ import json
 
 from app.services.bedrock_client import call_claude, extract_text, ask_bedrock
 from app.services.retrieval import build_context
-from app.services.session import create_session, get_session, get_history, save_messages, maybe_summarize
+from app.services.session import (
+    create_session, get_session, get_history, save_messages, maybe_summarize,
+    reset_session_for_equipment,
+)
 from app.services import tools as chat_tools
 
 MAX_TOOL_ITERATIONS = 3
@@ -97,7 +100,10 @@ def _wants_job_aid(query: str) -> bool:
 
 class SessionNotFoundError(Exception):
     """Raised when an explicit session_id was passed but doesn't resolve
-    for this company (missing or belongs to someone else)."""
+    for this company (missing or belongs to someone else). NOT raised for
+    an equipment mismatch -- see the comment in handle_chat_turn(): a
+    session existing for the wrong equipment is repaired in place
+    (reset_session_for_equipment()), not treated as a failure."""
     def __init__(self, session_id: str):
         self.session_id = session_id
         super().__init__(f"Session not found or access denied: {session_id}")
@@ -132,6 +138,23 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
         session = get_session(session_id, company_id)
         if not session:
             raise SessionNotFoundError(session_id)
+        if str(session["equipment_id"]) != str(equipment_id):
+            # The session is just history bookkeeping -- it must never be
+            # the reason a chat turn fails. If it's attached to different
+            # equipment than what's being asked about now, that history
+            # no longer applies (get_history() has no per-equipment
+            # filter, so leaving it in place is how a previous equipment's
+            # real answer leaked into this one). Clear it and re-home the
+            # session to the current equipment, then keep going -- the
+            # user still gets an answer on this turn, just with a blank
+            # history instead of a contaminated one.
+            print(f"SESSION EQUIPMENT MISMATCH: session {session_id} was "
+                  f"for equipment {session['equipment_id']}, now used for "
+                  f"{equipment_id} -- clearing its history and re-homing it")
+            reset_session_for_equipment(
+                session_id, company_id,
+                equipment_id=equipment_id, equipment_path=equipment_path,
+            )
     else:
         session_id = create_session(
             company_id=company_id, user_id=user_id,

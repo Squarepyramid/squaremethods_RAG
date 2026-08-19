@@ -31,10 +31,21 @@ What changed from the original, and why:
      module dependency-free of app.services.llm); the caller passes a
      `summarizer_fn(existing_summary, messages) -> str`.
 
-  5. `update_session_equipment()` lets a session follow the user if they
-     navigate to a different equipment mid-conversation, instead of a
-     session being permanently pinned to whatever equipment it was
-     created against.
+  5. A session is just a convenience for keeping history around, not an
+     access-control boundary the chat can fail on. There used to be a
+     get_active_session() helper (unused anywhere -- removed) and an
+     update_session_equipment() that re-pointed a session's equipment_id
+     WITHOUT touching its existing messages/summary. That combination is
+     exactly how one equipment's real, correctly-grounded answer (e.g. a
+     pump's oil spec) leaked into another equipment's answer: get_history()
+     has no per-equipment filter, so a re-pointed session's old
+     messages/summary just kept riding along into the new equipment's
+     context. `reset_session_for_equipment()` replaces it: when
+     chat_service.handle_chat_turn() sees a session_id attached to
+     different equipment than the current request, it clears that
+     session's messages/summary and re-homes it in the same transaction
+     -- history and equipment_id can never drift apart -- and the chat
+     turn proceeds normally instead of erroring out.
 
 Requires two additive migrations (see migration.sql):
     ALTER TABLE chat_sessions ADD COLUMN summary TEXT;
@@ -95,33 +106,6 @@ def create_session(company_id: str, user_id: str, equipment_path: str,
         conn.close()
 
 
-def get_active_session(company_id: str, user_id: str, equipment_id: str,
-                        max_age_hours: int = 24) -> dict:
-    """
-    Convenience for "resume if there's a recent session for this
-    user+equipment, else the caller should create_session()". Optional --
-    only use this if your product wants one continuous conversation per
-    equipment rather than a fresh session every time the chat opens.
-    """
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, company_id, user_id, equipment_id, equipment_path
-                FROM chat_sessions
-                WHERE company_id = %s::uuid
-                AND user_id = %s::uuid
-                AND equipment_id = %s::uuid
-                AND deleted_at IS NULL
-                AND updated_at > NOW() - (%s || ' hours')::interval
-                ORDER BY updated_at DESC
-                LIMIT 1
-            """, (company_id, user_id, equipment_id, max_age_hours))
-            return cur.fetchone()
-    finally:
-        conn.close()
-
-
 def get_session(session_id: str, company_id: str) -> dict:
     conn = get_db_connection()
     try:
@@ -139,17 +123,48 @@ def get_session(session_id: str, company_id: str) -> dict:
         conn.close()
 
 
-def update_session_equipment(session_id: str, company_id: str,
-                              equipment_id: str, equipment_path: str) -> None:
+def reset_session_for_equipment(session_id: str, company_id: str,
+                                 equipment_id: str, equipment_path: str) -> None:
+    """
+    Re-homes a session to a different piece of equipment AND wipes its
+    message history + rolling summary, atomically, in one transaction.
+
+    A session is just a convenience for keeping a chat's history around
+    (so a later turn can say "which job aid was that?" and still know)
+    -- it is NOT an access-control boundary the chat is allowed to fail
+    on. chat_service.handle_chat_turn() calls this instead of erroring
+    when a session_id shows up attached to different equipment than the
+    current request: drop the history that no longer applies and keep
+    the conversation going, rather than blocking the user's question on
+    a session-bookkeeping mismatch.
+
+    Clearing messages/summary is not optional here -- it's always paired
+    with the equipment_id update, in the same query. Repointing a
+    session's equipment_id WITHOUT wiping its history is what the old
+    update_session_equipment() did, and it's exactly how one equipment's
+    real, correctly-grounded answer (a pump's oil spec) leaked into an
+    answer about unrelated equipment: get_history() has no per-equipment
+    filter, so the old messages just kept riding along to the new
+    equipment's context. There is deliberately no version of this
+    function that repoints equipment_id alone.
+    """
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
+                DELETE FROM chat_messages
+                WHERE session_id = %s::uuid AND company_id = %s::uuid
+            """, (session_id, company_id))
+            cur.execute("""
                 UPDATE chat_sessions
-                SET equipment_id = %s::uuid, equipment_path = %s, updated_at = NOW()
+                SET equipment_id = %s::uuid, equipment_path = %s,
+                    summary = NULL, summary_message_count = 0, updated_at = NOW()
                 WHERE id = %s::uuid AND company_id = %s::uuid
             """, (equipment_id, equipment_path, session_id, company_id))
             conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
