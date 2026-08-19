@@ -360,7 +360,11 @@ FROM information_schema.tables
 WHERE table_schema = 'public' 
 ORDER BY table_name;
 
+25070e8c-4118-4f04-9b61-c6a9e6a869b9"
 
+SELECT count(*) FROM knowledge_embeddings
+WHERE content LIKE '25070e8c-4118-4f04-9b61-c6a9e6a869b9'
+AND source_type = 'manual';
 # to see all tables
 \dt
 

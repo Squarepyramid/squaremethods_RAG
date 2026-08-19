@@ -156,18 +156,21 @@ def _strip_manual_content_prefix(content: str) -> str:
 def semantic_search(query: str, company_id: str, equipment_id: str = None,
                      limit: int = 5, conn=None) -> list:
     """
-    NOTE on the equipment_id filter: knowledge_embeddings.source_id is
-    NOT the equipment's id for manual chunks -- ingest_document.py's
-    save_chunks() sets source_id to uuid5(doc_uuid, chunk_index), a
-    per-chunk hash with no relationship to the equipment. The equipment
-    link is embedded as text in the content column instead
-    ("equipment_id:{id} | doc_id:... | bom_items:... | <chunk text>"),
-    which is also how that same file's own clear_node_chunks() finds a
-    node's chunks (WHERE content LIKE '%equipment_id:{id}%'). Filtering
-    on source_id = equipment_id, as this used to, could never match a
-    real manual chunk -- it was comparing against a value structurally
-    incapable of equaling it. This matches the content-prefix convention
-    instead so ingested manuals actually surface in chat.
+    NOTE on the equipment_id filter -- this used to run on a text-prefix
+    hack (migration_002_knowledge_embeddings_equipment_id.sql explains
+    the history): knowledge_embeddings.source_id is NOT the equipment's
+    id for manual chunks, so filtering on source_id = equipment_id could
+    never match one -- it was comparing against a value structurally
+    incapable of equaling it. The old fix matched on
+    `content LIKE '%equipment_id:{id}%'` instead, parsing a UUID back out
+    of the ingested chunk's text prefix on every query. Now that
+    knowledge_embeddings has a real equipment_id column (backfilled from
+    that same prefix for existing manual rows), filter on it directly --
+    exact match, indexed, no string parsing per row. ingest_document.py
+    (and whatever in generate_job_aid.py writes the other source_types)
+    must populate this column on every future INSERT for this to keep
+    working; if a document ingested after that migration isn't showing
+    up here, check that first.
     """
     try:
         embedding = get_embedding(query)
@@ -180,10 +183,10 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
-                        AND content LIKE %s
+                        AND equipment_id = %s::uuid
                         ORDER BY embedding <=> %s::vector
                         LIMIT %s
-                    """, (embedding_str, company_id, f"%equipment_id:{equipment_id}%", embedding_str, limit))
+                    """, (embedding_str, company_id, equipment_id, embedding_str, limit))
                 else:
                     cur.execute("""
                         SELECT source_type, source_id, content,

@@ -628,14 +628,22 @@ def clear_node_chunks(conn, equipment_id: str, company_id: str):
     """
     Remove ALL manual chunks for a node (equipment or component).
     Called when a node is deleted. Cleans up all its documents at once.
+
+    Filters on the real equipment_id column (see
+    migration_002_knowledge_embeddings_equipment_id.sql) rather than the
+    old content LIKE '%equipment_id:{id}%' text match -- exact and
+    indexed instead of a substring scan. Requires that migration to have
+    run AND its backfill to be complete, or pre-migration rows (not yet
+    backfilled) won't be matched here even though they'd have matched
+    the old LIKE-based query.
     """
     with conn.cursor() as cur:
         cur.execute("""
             DELETE FROM knowledge_embeddings
             WHERE source_type = 'manual'
             AND company_id = %s::uuid
-            AND content LIKE %s
-        """, (company_id, f"%equipment_id:{equipment_id}%"))
+            AND equipment_id = %s::uuid
+        """, (company_id, equipment_id))
         deleted = cur.rowcount
     conn.commit()
     log.info(f"Removed {deleted} chunks for node {equipment_id}")
@@ -809,10 +817,20 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     Embed and save all chunks. Each chunk gets:
       - a unique source_id derived from (doc_uuid, chunk_index) via uuid5
         so re-ingesting the same file produces the same chunk UUIDs
+      - a real knowledge_embeddings.equipment_id column value (see
+        migration_002_knowledge_embeddings_equipment_id.sql -- THAT
+        MIGRATION MUST BE APPLIED before this function will work; the
+        INSERT below will fail with "column equipment_id does not exist"
+        otherwise) -- this is what retrieval.py's semantic_search() now
+        filters on directly for equipment-scoped chat retrieval
       - a content prefix with equipment_id, doc_id, and (NEW) any BOM
-        item/part-number pairs found in that chunk's text, for node-scoped
-        retrieval, document-scoped deletion, and future item-number-precise
-        lookups
+        item/part-number pairs found in that chunk's text -- still
+        written for document-scoped deletion (clear_document_chunks,
+        doc_id has no column of its own) and for
+        fetch_all_manual_chunks() in generate_pm_strategy.py, which
+        parses this fixed-shape prefix. The equipment_id copy in this
+        prefix is now redundant with the new column for retrieval
+        purposes, but kept so that parser doesn't break.
 
     The content prefix is always exactly three "key:value | " segments
     followed by the chunk text -- "bom_items" is included even when empty
@@ -854,19 +872,20 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
             company_id,
             "manual",
             chunk_source_id,
+            equipment_id,
             content,
             emb_str,
         ))
 
     sql = """
         INSERT INTO knowledge_embeddings
-            (id, company_id, source_type, source_id, content, embedding,
-             created_at, updated_at)
+            (id, company_id, source_type, source_id, equipment_id, content,
+             embedding, created_at, updated_at)
         VALUES %s
     """
     psycopg2.extras.execute_values(
         conn.cursor(), sql, rows,
-        template="(%s, %s::uuid, %s, %s::uuid, %s, %s::vector, NOW(), NOW())",
+        template="(%s, %s::uuid, %s, %s::uuid, %s::uuid, %s, %s::vector, NOW(), NOW())",
         page_size=100,
     )
     conn.commit()
