@@ -331,15 +331,20 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
         except Exception as e:
             print(f"Failure modes fetch error: {str(e)}")
 
-        # 4. Semantic search
+        # 4. Semantic search -- each line is tagged with its source_type
+        # (almost always "manual" for an equipment-scoped search, but
+        # tagging explicitly rather than hardcoding the label means this
+        # stays correct if another source_type ever shows up here) so the
+        # model can cite specifically where a fact came from instead of
+        # a vague "our knowledge base."
         try:
             semantic_results = semantic_search(query, company_id, equipment_id, conn=conn)
             if semantic_results:
-                sem_text = "\nAdditional relevant knowledge:"
+                sem_text = "\nFrom indexed manuals/documents (cite as \"the equipment manual\" unless a more specific source is obvious):"
                 added = False
                 for r in semantic_results:
                     if r['similarity'] > SEMANTIC_SIMILARITY_THRESHOLD:
-                        sem_text += f"\n- {_strip_manual_content_prefix(r['content'])}"
+                        sem_text += f"\n- [{r['source_type']}] {_strip_manual_content_prefix(r['content'])}"
                         sources["semantic"].append({
                             "source_type": r["source_type"],
                             "source_id": str(r["source_id"]),
