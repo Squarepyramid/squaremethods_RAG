@@ -369,7 +369,7 @@ ORDER BY table_name;
 
 SELECT table_name, column_name, data_type
 FROM information_schema.columns
-WHERE table_name IN ('chat_sessions')
+WHERE table_name IN ('knowledge_embeddings')
 ORDER BY table_name, ordinal_position;
 
 

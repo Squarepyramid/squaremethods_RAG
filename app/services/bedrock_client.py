@@ -35,7 +35,8 @@ def ask_bedrock(prompt: str) -> str:
 
 
 def call_claude(*, messages: list, system: str = None, tools: list = None,
-                 max_tokens: int = 1024, model_id: str = None) -> dict:
+                 max_tokens: int = 1024, model_id: str = None,
+                 temperature: float = None) -> dict:
     """
     messages: list of {"role": "user"|"assistant", "content": str | list[dict]}
     system:   optional top-level system prompt (kept separate from turns,
@@ -43,6 +44,11 @@ def call_claude(*, messages: list, system: str = None, tools: list = None,
     tools:    optional list of tool defs in Anthropic tool_use format
               (see tools.CREATE_JOB_AID_TOOL) -- Claude 3 on Bedrock
               supports the same "tools" shape as the direct Anthropic API.
+    temperature: optional, 0-1. Lower makes answers more literal/deterministic
+              and less likely to fill gaps with a plausible-sounding guess --
+              chat_service.py uses a low value since answers must be strictly
+              grounded in retrieved DB content. Omitted (None) leaves
+              Bedrock's own default in place.
 
     Returns the parsed response body as-is. Check response["stop_reason"]:
     "tool_use" means response["content"] contains one or more
@@ -61,6 +67,8 @@ def call_claude(*, messages: list, system: str = None, tools: list = None,
         payload["system"] = system
     if tools:
         payload["tools"] = tools
+    if temperature is not None:
+        payload["temperature"] = temperature
 
     response = client.invoke_model(
         modelId=model_id or MODEL_ID,

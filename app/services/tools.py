@@ -25,12 +25,15 @@ CREATE_JOB_AID_TOOL = {
     "name": "create_job_aid",
     "description": (
         "Create a DRAFT job aid (a step-by-step maintenance procedure) for "
-        "the equipment currently in context. Use this when the user asks "
-        "you to write up, document, or turn a conversation into a job aid "
-        "or procedure. The job aid is saved as a draft for a human to "
-        "review and publish -- it is never shown to technicians "
-        "automatically. Always tell the user it's a draft awaiting review "
-        "and share the link so they can find it."
+        "the equipment currently in context. Only call this when the user "
+        "has EXPLICITLY asked you to save, document, or turn something "
+        "into a job aid or procedure -- never in response to an ordinary "
+        "question, and never as a way to avoid answering directly. Always "
+        "answer the user's question in your own text first; this tool "
+        "just saves a copy. The job aid is saved as a draft for a human "
+        "to review and publish -- it is never shown to technicians "
+        "automatically. Tell the user it's a draft awaiting review and "
+        "share the link."
     ),
     "input_schema": {
         "type": "object",

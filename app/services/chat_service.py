@@ -22,18 +22,52 @@ from app.services import tools as chat_tools
 
 MAX_TOOL_ITERATIONS = 3
 
+# Low temperature: this assistant must stick to retrieved DB content
+# rather than smoothing over gaps with a plausible-sounding guess. Not a
+# full guarantee against hallucination on its own -- paired with the
+# GROUNDING rules below, which are what actually forbid it.
+CHAT_TEMPERATURE = 0.2
+
 CHAT_SYSTEM_PROMPT_TEMPLATE = """You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
-STRICT RULES:
-- Only answer based on the equipment knowledge provided below
+
+GROUNDING -- the most important rule, follow it strictly:
+- Answer ONLY using the "Equipment Knowledge" block below. It is built entirely from our own database for this equipment: its job aids and procedures, ingested manual excerpts, and failure modes with their logged resolutions (aggregated from every contribution made against them).
+- Do not use general industry knowledge, best practices from your training, typical values for similar equipment, or anything from the open internet -- even if you're confident it's correct. If it is not in the block below, it is unknown to you.
+- If the Equipment Knowledge block doesn't answer the question, say plainly that this isn't in our system for this equipment yet. Do not guess, generalize from similar equipment, or offer a "typically..." answer.
+
+OTHER RULES:
 - Never reveal your underlying model or that you were made by Anthropic
 - Never reference company IDs in your responses
 - If asked who you are, say: "I am the SquareMethods Assistant, here to help you with equipment knowledge and maintenance support."
-- If the answer is not in the provided knowledge, say so clearly and briefly
 - Keep answers concise and practical
-- If the user asks you to write up, document, or turn guidance into a procedure, use the create_job_aid tool. It always creates a DRAFT -- tell the user it's pending review, and share the link.
+- Always answer the user's question directly, in full, in your response text. Never reply with only a link, or only "I created a draft" -- a job aid (if you create one) is a saved copy of your answer, not a substitute for giving it.
+- Only call create_job_aid if the user explicitly asked you to save, document, or turn something into a job aid/procedure -- and even then, still answer their underlying question in the text first, using only the Equipment Knowledge block. It always creates a DRAFT -- tell them it's pending review.
 
-Equipment Knowledge:
+Equipment Knowledge (from our database only):
 {context}"""
+
+# Only offer the create_job_aid tool to the model when the user's message
+# actually signals they want something saved/documented. Claude 3 Haiku
+# reaches for tools eagerly, so relying on the system prompt alone let it
+# treat ordinary "how do I..." questions as documentation requests and
+# hide fabricated answers behind a job aid link instead of just answering.
+# Gating at the request level means it's not offered the tool at all on a
+# plain question -- it literally can't call it.
+JOB_AID_INTENT_PHRASES = (
+    "create a job aid", "make a job aid", "make this a job aid", "make that a job aid",
+    "save this as a job aid", "save that as a job aid",
+    "save this as a procedure", "save that as a procedure",
+    "turn this into a job aid", "turn that into a job aid",
+    "turn this into a procedure", "turn that into a procedure",
+    "write this up", "write that up", "write up a job aid",
+    "document this as", "document that as", "document this for",
+    "generate a job aid", "add a job aid",
+)
+
+
+def _wants_job_aid(query: str) -> bool:
+    q = query.lower()
+    return any(phrase in q for phrase in JOB_AID_INTENT_PHRASES)
 
 
 class SessionNotFoundError(Exception):
@@ -93,10 +127,16 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     ]
     messages.append({"role": "user", "content": query})
 
+    # Tool is only offered when this specific message signals creation
+    # intent -- see JOB_AID_INTENT_PHRASES above. tools=None means Claude
+    # isn't given the option to call it at all this turn.
+    tools_for_turn = chat_tools.ALL_TOOLS if _wants_job_aid(query) else None
+
     tool_call_log = []
     response = call_claude(
         messages=messages, system=system_prompt,
-        tools=chat_tools.ALL_TOOLS, max_tokens=1500,
+        tools=tools_for_turn, max_tokens=1500,
+        temperature=CHAT_TEMPERATURE,
     )
 
     iterations = 0
@@ -121,7 +161,8 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
 
         response = call_claude(
             messages=messages, system=system_prompt,
-            tools=chat_tools.ALL_TOOLS, max_tokens=1500,
+            tools=tools_for_turn, max_tokens=1500,
+            temperature=CHAT_TEMPERATURE,
         )
 
     answer = extract_text(response)

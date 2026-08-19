@@ -135,8 +135,40 @@ def get_failure_modes(equipment_id: str, company_id: str, conn=None) -> list:
             return cur.fetchall()
 
 
+def _strip_manual_content_prefix(content: str) -> str:
+    """
+    Manual chunks (source_type='manual') are stored by ingest_document.py's
+    save_chunks() with a fixed three-segment metadata prefix:
+    "equipment_id:... | doc_id:... | bom_items:... | <actual chunk text>".
+    That's there for clear_node_chunks()/clear_document_chunks() to find
+    chunks by equipment/document -- it's not meant to be read by a human
+    or an LLM. Strip it before surfacing content in the chat prompt;
+    other source_types (e.g. squaremethods_import/squaremethods_wp from
+    generate_job_aid.py) don't use this prefix, so this is a no-op for them.
+    """
+    if content.startswith("equipment_id:"):
+        parts = content.split(" | ", 3)
+        if len(parts) == 4:
+            return parts[3]
+    return content
+
+
 def semantic_search(query: str, company_id: str, equipment_id: str = None,
                      limit: int = 5, conn=None) -> list:
+    """
+    NOTE on the equipment_id filter: knowledge_embeddings.source_id is
+    NOT the equipment's id for manual chunks -- ingest_document.py's
+    save_chunks() sets source_id to uuid5(doc_uuid, chunk_index), a
+    per-chunk hash with no relationship to the equipment. The equipment
+    link is embedded as text in the content column instead
+    ("equipment_id:{id} | doc_id:... | bom_items:... | <chunk text>"),
+    which is also how that same file's own clear_node_chunks() finds a
+    node's chunks (WHERE content LIKE '%equipment_id:{id}%'). Filtering
+    on source_id = equipment_id, as this used to, could never match a
+    real manual chunk -- it was comparing against a value structurally
+    incapable of equaling it. This matches the content-prefix convention
+    instead so ingested manuals actually surface in chat.
+    """
     try:
         embedding = get_embedding(query)
         embedding_str = "[" + ",".join(map(str, embedding)) + "]"
@@ -148,10 +180,10 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
-                        AND source_id = %s::uuid
+                        AND content LIKE %s
                         ORDER BY embedding <=> %s::vector
                         LIMIT %s
-                    """, (embedding_str, company_id, equipment_id, embedding_str, limit))
+                    """, (embedding_str, company_id, f"%equipment_id:{equipment_id}%", embedding_str, limit))
                 else:
                     cur.execute("""
                         SELECT source_type, source_id, content,
@@ -307,7 +339,7 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
                 added = False
                 for r in semantic_results:
                     if r['similarity'] > SEMANTIC_SIMILARITY_THRESHOLD:
-                        sem_text += f"\n- {r['content']}"
+                        sem_text += f"\n- {_strip_manual_content_prefix(r['content'])}"
                         sources["semantic"].append({
                             "source_type": r["source_type"],
                             "source_id": str(r["source_id"]),
