@@ -28,7 +28,6 @@ whose cursors default to RealDictCursor (that's implied by the original
 code doing `equipment['name']` on fetchone() results).
 """
 import os
-import uuid
 from contextlib import contextmanager
 
 import psycopg2.extras
@@ -57,19 +56,16 @@ def _connection(conn=None):
             conn.close()
 
 
-def _validate_uuid(value: str, field_name: str) -> str:
-    try:
-        return str(uuid.UUID(str(value)))
-    except (ValueError, AttributeError, TypeError):
-        raise ValueError(f"Invalid UUID for {field_name}: {value!r}")
-
-
-def build_job_aid_url(company_id: str, equipment_id: str, job_aid_id: str) -> str:
+def build_job_aid_url(slug: str) -> str:
     """
-    ASSUMPTION: adjust this path to match your real frontend routing.
-    Kept as one function so there's a single place to fix if it's wrong.
+    job_aids has both `slug` and `qrcode` columns, which strongly implies
+    a slug-based public URL rather than one keyed by raw UUID -- that's
+    what this builds. ASSUMPTION: the exact path
+    (e.g. maybe it's "/ja/{slug}" or a QR-landing route, not
+    "/job-aids/{slug}") -- confirm against your frontend router and
+    adjust this one function if it's wrong.
     """
-    return f"{APP_BASE_URL}/equipment/{equipment_id}/job-aids/{job_aid_id}"
+    return f"{APP_BASE_URL}/job-aids/{slug}"
 
 
 def get_equipment(equipment_id: str, company_id: str, conn=None) -> dict:
@@ -91,8 +87,8 @@ def get_job_aids(equipment_id: str, company_id: str, conn=None) -> list:
     with _connection(conn) as c:
         with c.cursor() as cur:
             cur.execute("""
-                SELECT ja.id, ja.title, ja.instruction, ja.category,
-                       ja.estimated_duration, ja.status
+                SELECT ja.id, ja.title, ja.slug, ja.instruction, ja.category,
+                       ja.estimated_duration, ja.status, ja.image
                 FROM job_aids ja
                 JOIN job_aid_equipment jae ON ja.id = jae.job_aid_id
                 WHERE jae.equipment_id = %s::uuid
@@ -110,7 +106,7 @@ def get_procedures(job_aid_ids: list, company_id: str, conn=None) -> list:
         with c.cursor() as cur:
             cur.execute("""
                 SELECT p.job_aid_id, p.title, p.step, p.instruction,
-                       p.precautions, p.type
+                       p.precautions, p.type, p.image
                 FROM procedures p
                 WHERE p.job_aid_id = ANY(%s::uuid[])
                 AND p.company_id = %s::uuid
@@ -118,37 +114,6 @@ def get_procedures(job_aid_ids: list, company_id: str, conn=None) -> list:
                 ORDER BY p.job_aid_id, p.step
             """, (job_aid_ids, company_id))
             return cur.fetchall()
-
-
-def get_job_aid_media(job_aid_ids: list, company_id: str, conn=None) -> list:
-    """
-    ASSUMPTION: a `job_aid_media` table doesn't exist yet in the code you
-    shared. If you have images/diagrams attached to job aids somewhere
-    else (a generic `attachments` table, S3 keys on the job_aid row,
-    etc.), point this query at that instead -- the shape everything else
-    expects back is: job_aid_id, url, caption, media_type.
-
-    Suggested DDL is in migration.sql.
-    """
-    if not job_aid_ids:
-        return []
-    with _connection(conn) as c:
-        with c.cursor() as cur:
-            try:
-                cur.execute("""
-                    SELECT job_aid_id, url, caption, media_type
-                    FROM job_aid_media
-                    WHERE job_aid_id = ANY(%s::uuid[])
-                    AND company_id = %s::uuid
-                    AND deleted_at IS NULL
-                """, (job_aid_ids, company_id))
-                return cur.fetchall()
-            except Exception as e:
-                # Table may not exist yet in your environment -- degrade
-                # gracefully instead of breaking the whole chat turn.
-                print(f"Job aid media fetch error (is job_aid_media set up?): {str(e)}")
-                c.rollback()
-                return []
 
 
 def get_failure_modes(equipment_id: str, company_id: str, conn=None) -> list:
@@ -202,70 +167,12 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
         return []
 
 
-def create_job_aid(company_id: str, equipment_id: str, created_by_user_id: str,
-                    title: str, instruction: str = None, category: str = None,
-                    estimated_duration=None, steps: list = None, conn=None) -> dict:
-    """
-    Creates a job aid (+ its equipment link + its procedure steps) as a
-    single transaction, in status='draft'.
-
-    `steps` is a list of dicts: {"title": str|None, "instruction": str,
-    "precautions": list[str]|None, "type": str|None}. Step numbers are
-    assigned by list order (1-indexed) -- pass them already in the order
-    they should be performed.
-
-    ASSUMPTION: job_aids has a `created_by` column and procedures rows
-    don't need their own id passed in (DB-generated). Adjust the INSERTs
-    if your schema differs -- these are the columns visible in the
-    original SELECTs plus the obvious ones needed to write a row.
-    """
-    company_id = _validate_uuid(company_id, "company_id")
-    equipment_id = _validate_uuid(equipment_id, "equipment_id")
-    if not title or not title.strip():
-        raise ValueError("title is required to create a job aid")
-    steps = steps or []
-
-    job_aid_id = str(uuid.uuid4())
-
-    with _connection(conn) as c:
-        try:
-            with c.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO job_aids
-                        (id, company_id, title, instruction, category,
-                         estimated_duration, status, created_by)
-                    VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, 'draft', %s::uuid)
-                """, (job_aid_id, company_id, title.strip(), instruction, category,
-                      estimated_duration, created_by_user_id))
-
-                cur.execute("""
-                    INSERT INTO job_aid_equipment (job_aid_id, equipment_id)
-                    VALUES (%s::uuid, %s::uuid)
-                """, (job_aid_id, equipment_id))
-
-                for i, step in enumerate(steps, start=1):
-                    cur.execute("""
-                        INSERT INTO procedures
-                            (job_aid_id, company_id, title, step, instruction,
-                             precautions, type)
-                        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s)
-                    """, (
-                        job_aid_id, company_id, step.get("title"), i,
-                        step.get("instruction"), step.get("precautions"),
-                        step.get("type", "step"),
-                    ))
-            c.commit()
-        except Exception:
-            c.rollback()
-            raise
-
-    return {
-        "id": job_aid_id,
-        "title": title.strip(),
-        "status": "draft",
-        "step_count": len(steps),
-        "url": build_job_aid_url(company_id, equipment_id, job_aid_id),
-    }
+# NOTE: job aid creation used to live here as its own create_job_aid().
+# It's gone -- tools.py now calls generate_job_aid.save_job_aid() directly
+# so chat-created job aids go through the exact same insert path (job_aids
+# + procedures + job_aid_equipment, slug generation, draft status) as
+# every other job aid in the app, instead of a second parallel
+# implementation that could drift out of sync.
 
 
 def build_context(equipment_path: str, company_id: str, query: str) -> dict:
@@ -319,13 +226,13 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
         except Exception as e:
             print(f"Equipment fetch error: {str(e)}")
 
-        # 2. Job aids, procedures, and media
+        # 2. Job aids and procedures (images come from job_aids.image and
+        # procedures.image directly -- no separate media table)
         try:
             job_aids = get_job_aids(equipment_id, company_id, conn=conn)
             if job_aids:
                 job_aid_ids = [str(ja['id']) for ja in job_aids]
                 procedures = get_procedures(job_aid_ids, company_id, conn=conn)
-                media = get_job_aid_media(job_aid_ids, company_id, conn=conn)
 
                 for ja in job_aids:
                     ja_text = f"\nJob Aid: {ja['title']}"
@@ -345,7 +252,7 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
                             if p['precautions']:
                                 ja_text += f" (Precautions: {', '.join(p['precautions'])})"
 
-                    job_aid_url = build_job_aid_url(company_id, equipment_id, str(ja['id']))
+                    job_aid_url = build_job_aid_url(ja['slug'])
                     ja_text += f"\nLink: {job_aid_url}"
                     context_parts.append(ja_text)
 
@@ -356,12 +263,21 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
                         "url": job_aid_url,
                     })
 
-                for m in media:
-                    sources["images"].append({
-                        "job_aid_id": str(m['job_aid_id']),
-                        "url": m['url'],
-                        "caption": m.get('caption') if isinstance(m, dict) else None,
-                    })
+                    if ja['image']:
+                        sources["images"].append({
+                            "job_aid_id": str(ja['id']),
+                            "step": None,
+                            "url": ja['image'],
+                            "caption": ja['title'],
+                        })
+                    for p in ja_procedures:
+                        if p['image']:
+                            sources["images"].append({
+                                "job_aid_id": str(ja['id']),
+                                "step": p['step'],
+                                "url": p['image'],
+                                "caption": p.get('title') or f"Step {p['step']}",
+                            })
         except Exception as e:
             print(f"Job aids fetch error: {str(e)}")
 
