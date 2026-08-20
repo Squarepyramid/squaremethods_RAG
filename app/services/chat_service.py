@@ -15,10 +15,10 @@ that into a response.
 """
 import json
 
-from app.services.bedrock_client import call_claude, extract_text, ask_bedrock
+from app.services.bedrock_client import call_claude, extract_text
 from app.services.retrieval import build_context
 from app.services.session import (
-    create_session, get_session, get_history, save_messages, maybe_summarize,
+    create_session, get_session, save_messages,
     reset_session_for_equipment,
 )
 from app.services import tools as chat_tools
@@ -33,15 +33,13 @@ CHAT_TEMPERATURE = 0.2
 
 CHAT_SYSTEM_PROMPT_TEMPLATE = """You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
 
-EVERY MESSAGE IS A NEW, SEPARATE QUESTION -- THIS IS YOUR MOST IMPORTANT RULE:
-- Respond to ONLY the question the user just asked. Do not open your response by restating, summarizing, or repeating anything you said in a previous turn of this conversation.
-- Earlier turns exist only so you can resolve what a word like "it," "this pump," or "that setting" refers to -- never as content to fold into a new answer.
-- WRONG (do not do this): user asks about function, you answer, user then asks "what is the speed" -- and you begin with "I've already provided the function... [recap]... As for the speed...". That recap sentence must not appear. The correct response starts directly with the speed answer (or that it's not in the system), nothing before it.
-- Only recap a prior turn if the user explicitly asks you to (e.g. "can you summarize what we've covered so far").
+NO CONVERSATION HISTORY -- THIS IS YOUR MOST IMPORTANT RULE:
+- This message is the ONLY thing you know about this conversation. You are never shown any earlier turns, even from earlier in this same chat session -- there is no "before" for you to draw on.
+- If the question only makes sense with context from an earlier turn (e.g. "what about that setting," "is it the same for this one"), say you don't have the earlier context and ask them to restate the full question -- do not guess what it might be referring to.
+- If asked to summarize, recap, or repeat what was covered earlier in the conversation, say plainly that you don't have access to earlier turns and can only answer the question just asked -- never invent or reconstruct what an earlier turn might have said.
 
 WHEN YOU DON'T HAVE THE ANSWER, BE BRIEF:
 - If the Equipment Knowledge block doesn't cover the question, say so in one short sentence -- e.g. "That's not in our system for this equipment yet." Do not follow it with a paragraph of hedging, caveats, or suggestions to contact the manufacturer -- one sentence is enough.
-- Never pad a "don't know" answer with information from a previous turn to make the response feel more substantial.
 
 GROUNDING:
 - Answer ONLY using the "Equipment Knowledge" block below. It is built entirely from our own database for this equipment: its job aids and procedures, ingested manual excerpts, and failure modes with their logged resolutions (aggregated from every contribution made against them).
@@ -109,27 +107,15 @@ class SessionNotFoundError(Exception):
         super().__init__(f"Session not found or access denied: {session_id}")
 
 
-def _summarize_messages(existing_summary: str, messages: list) -> str:
-    transcript = "\n".join(
-        f"{m['role'].capitalize()}: {m['content']}" for m in messages
-        if isinstance(m.get("content"), str)
-    )
-    prompt = (
-        "Update the running summary of this equipment maintenance chat with "
-        "the new turns below. Keep it short and factual: equipment discussed, "
-        "issues raised, job aids referenced or created, open questions.\n\n"
-        f"Existing summary:\n{existing_summary or '(none yet)'}\n\n"
-        f"New turns:\n{transcript}\n\nUpdated summary:"
-    )
-    return ask_bedrock(prompt)
-
-
 def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
                       query: str, session_id: str = None) -> dict:
     """
     Runs one full chat turn: resolve/create session, retrieve context,
-    call Claude (looping through any tool_use), persist the turn, maybe
-    roll the summary. Returns:
+    call Claude (looping through any tool_use), persist the turn.
+    Answers are generated from ONLY this turn's query + freshly retrieved
+    context -- no prior conversation history is fed to the model, even
+    within the same session (see the `messages` comment below for why).
+    Returns:
         {"session_id", "answer", "sources", "job_aids_created"}
     """
     equipment_id = equipment_path.strip("/").split("/")[-1]
@@ -139,18 +125,18 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
         if not session:
             raise SessionNotFoundError(session_id)
         if str(session["equipment_id"]) != str(equipment_id):
-            # The session is just history bookkeeping -- it must never be
-            # the reason a chat turn fails. If it's attached to different
-            # equipment than what's being asked about now, that history
-            # no longer applies (get_history() has no per-equipment
-            # filter, so leaving it in place is how a previous equipment's
-            # real answer leaked into this one). Clear it and re-home the
-            # session to the current equipment, then keep going -- the
-            # user still gets an answer on this turn, just with a blank
-            # history instead of a contaminated one.
+            # Chat generation never reads this session's history (see
+            # below -- messages is built from ONLY the current query,
+            # nothing from get_history()), so a mismatch here can no
+            # longer leak one equipment's answer into another's the way
+            # it used to. This re-home + wipe still runs anyway, purely
+            # so the STORED chat_messages rows for this session_id stay
+            # coherent for one piece of equipment (e.g. if a UI ever
+            # lists a session's past messages) rather than silently
+            # mixing two equipment's turns under one session_id.
             print(f"SESSION EQUIPMENT MISMATCH: session {session_id} was "
                   f"for equipment {session['equipment_id']}, now used for "
-                  f"{equipment_id} -- clearing its history and re-homing it")
+                  f"{equipment_id} -- clearing its stored history and re-homing it")
             reset_session_for_equipment(
                 session_id, company_id,
                 equipment_id=equipment_id, equipment_path=equipment_path,
@@ -161,19 +147,25 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
             equipment_path=equipment_path, equipment_id=equipment_id,
         )
 
-    history = get_history(session_id, company_id)
     retrieved = build_context(equipment_path=equipment_path, company_id=company_id, query=query)
 
     system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context=retrieved["context"])
-    if history["summary"]:
-        system_prompt += f"\n\nEarlier conversation summary:\n{history['summary']}"
 
-    messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history["messages"]
-        if m["role"] in ("user", "assistant")
-    ]
-    messages.append({"role": "user", "content": query})
+    # Deliberately NOT built from get_history() -- each turn is answered
+    # from this single query plus the freshly retrieved Equipment
+    # Knowledge block only. No prior turns, no rolling summary. This is
+    # what stops a model that once fabricated something (e.g. an
+    # invented job aid) from treating its own earlier words as
+    # established fact and building further invented detail on top of
+    # them turn after turn -- a real failure mode we hit in production
+    # even in a correctly equipment-scoped session, since grounding only
+    # governs the Equipment Knowledge block, not what the model sees in
+    # its own conversation history. Tradeoff: the model can no longer
+    # resolve a follow-up like "what about that setting" against an
+    # earlier turn, or produce a "here's what we covered" recap on
+    # request -- see the system prompt's "NO CONVERSATION HISTORY"
+    # section, which tells it to say so rather than guess.
+    messages = [{"role": "user", "content": query}]
 
     # Tool is only offered when this specific message signals creation
     # intent -- see JOB_AID_INTENT_PHRASES above. tools=None means Claude
@@ -215,16 +207,27 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
 
     answer = extract_text(response)
 
+    # Still saved for storage/display purposes (e.g. a UI showing a
+    # session's past messages) -- just never read back into a future
+    # call_claude() turn. See the comment above where `messages` is
+    # built for why generation no longer touches this.
     save_messages(
         session_id, company_id, query, answer,
         sources=retrieved["sources"],
         tool_calls=tool_call_log or None,
     )
 
-    try:
-        maybe_summarize(session_id, company_id, _summarize_messages)
-    except Exception as e:
-        print(f"SUMMARIZE ERROR: {str(e)}")
+    # No maybe_summarize() call here anymore -- the rolling summary it
+    # produced was only ever consumed by the "Earlier conversation
+    # summary" block in system_prompt, which no longer exists. Calling
+    # it now would just be a wasted Bedrock call computing a summary
+    # nothing reads. session.py's maybe_summarize()/get_history() still
+    # exist and still work if some other future feature wants a
+    # conversation summary -- they're just not wired into this turn
+    # anymore. Flagging rather than deleting them outright, since unlike
+    # update_session_equipment()/get_active_session() (removed earlier
+    # for being unused AND actively wrong), these are unused-for-now but
+    # not wrong -- worth a deliberate call on whether to keep them.
 
     job_aids_created = [
         tc["result"] for tc in tool_call_log

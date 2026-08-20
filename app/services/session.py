@@ -30,22 +30,37 @@ What changed from the original, and why:
      session.py deliberately does NOT call an LLM itself (keeps this
      module dependency-free of app.services.llm); the caller passes a
      `summarizer_fn(existing_summary, messages) -> str`.
+     AS OF THE "no conversation history in answers" change in
+     chat_service.py, neither `get_history()` nor `maybe_summarize()` is
+     called from the chat turn anymore -- every answer is generated from
+     only the current query + freshly retrieved Equipment Knowledge, on
+     purpose (a model that once fabricates something must not be able to
+     treat its own earlier turns as established fact and build further
+     invented detail on top of them). Both functions are left here,
+     working and unit-testable, in case some other feature wants a
+     conversation summary later; they're just not wired into answering.
 
-  5. A session is just a convenience for keeping history around, not an
-     access-control boundary the chat can fail on. There used to be a
-     get_active_session() helper (unused anywhere -- removed) and an
-     update_session_equipment() that re-pointed a session's equipment_id
-     WITHOUT touching its existing messages/summary. That combination is
-     exactly how one equipment's real, correctly-grounded answer (e.g. a
-     pump's oil spec) leaked into another equipment's answer: get_history()
-     has no per-equipment filter, so a re-pointed session's old
-     messages/summary just kept riding along into the new equipment's
-     context. `reset_session_for_equipment()` replaces it: when
-     chat_service.handle_chat_turn() sees a session_id attached to
-     different equipment than the current request, it clears that
-     session's messages/summary and re-homes it in the same transaction
-     -- history and equipment_id can never drift apart -- and the chat
-     turn proceeds normally instead of erroring out.
+  5. A session is just a convenience for keeping history around (for
+     display/audit -- e.g. a UI listing a session's past messages), not
+     an access-control boundary the chat can fail on, AND (since the
+     change described in point 4) not something generation reads from at
+     all anymore either. There used to be a get_active_session() helper
+     (unused anywhere -- removed) and an update_session_equipment() that
+     re-pointed a session's equipment_id WITHOUT touching its existing
+     messages/summary. That combination is exactly how one equipment's
+     real, correctly-grounded answer (e.g. a pump's oil spec) leaked into
+     another equipment's answer, back when get_history() fed the
+     conversation into every call_claude() turn: no per-equipment filter,
+     so a re-pointed session's old messages/summary just kept riding
+     along into the new equipment's context. `reset_session_for_equipment()`
+     replaces it: when chat_service.handle_chat_turn() sees a session_id
+     attached to different equipment than the current request, it clears
+     that session's messages/summary and re-homes it in the same
+     transaction -- history and equipment_id can never drift apart. Now
+     that generation doesn't read history at all, this no longer prevents
+     cross-equipment leakage into an *answer* (there's nothing for it to
+     leak into) -- it's kept purely so the *stored* chat_messages for a
+     session_id stay coherent for one piece of equipment.
 
 Requires two additive migrations (see migration.sql):
     ALTER TABLE chat_sessions ADD COLUMN summary TEXT;
