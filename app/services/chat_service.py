@@ -98,49 +98,59 @@ def _wants_job_aid(query: str) -> bool:
 
 
 # Deterministic post-generation guard against a specific, confirmed-in-
-# production failure mode: the model naming a job aid that was never
-# retrieved for this turn -- e.g. citing "the 'Case Sealer Troubleshooting'
-# job aid" for equipment that has ZERO job_aids rows at all (confirmed via
-# direct DB query). Prompt-only grounding ("Answer ONLY using the
-# Equipment Knowledge block... if it is not in the block, it is unknown
-# to you") did not reliably hold on Claude 3 Haiku for this, reproduced
-# with a single, isolated, no-history turn -- so this doesn't trust the
-# model's adherence at all. retrieved["sources"]["job_aids"] is ground
-# truth for exactly which job aids were actually retrieved this turn
-# (straight from get_job_aids(), same data the model was given); any
-# quoted "'Title' job aid" citation in the answer that isn't in that list
-# is fabricated with certainty, not just suspicion -- there's no
-# legitimate way for the model to name a job aid it wasn't given.
+# production pattern: the model citing a source category (a job aid, a
+# failure mode) that was never actually retrieved for this turn. First
+# caught as job-aid fabrication ("Per the 'Case Sealer Troubleshooting'
+# job aid...") on equipment with ZERO job_aids rows at all (confirmed via
+# direct DB query). The moment that specific citation shape was guarded
+# against, the SAME underlying behavior resurfaced one turn later as
+# "According to the known failure mode records..." instead -- so this is
+# generalized across both categories rather than patched one label at a
+# time; retrieved["sources"] is ground truth for exactly what was
+# actually retrieved this turn (straight from get_job_aids()/
+# get_failure_modes()), so any claim referencing a category that came
+# back completely empty is fabricated with certainty, not suspicion.
 #
-# Matches the citation style CHAT_SYSTEM_PROMPT_TEMPLATE's CITE YOUR
-# SOURCE section explicitly instructs: "Per the 'Pump PM1' job aid, ...".
-# Handles straight quotes and curly quotes; a citation style the model
-# doesn't reliably follow could evade this regex, but the observed
-# fabrications so far ("Per the 'Case Sealer Troubleshooting' job aid",
-# "refer to the 'Case Sealer Maintenance' job aid") match it exactly.
+# Two different precision levels, because the two fabrications we've
+# actually seen had different shapes:
+#   - job_aids: PRECISE. CHAT_SYSTEM_PROMPT_TEMPLATE's CITE YOUR SOURCE
+#     section instructs a specific citation style ("Per the 'Pump PM1'
+#     job aid, ..."), and both observed fabrications matched it exactly
+#     -- so this extracts the quoted title and diffs it against the real
+#     retrieved titles. Catches an invented EXTRA title even when some
+#     real job aids exist for this equipment.
+#   - failure_modes: COARSE. The two failure-mode fabrications we saw
+#     did NOT share one consistent citation shape (one quoted a title,
+#     one didn't), so this instead checks the category as a whole: if
+#     retrieved["sources"]["failure_modes"] came back completely empty
+#     for this turn, but the words "failure mode" appear anywhere in the
+#     answer, that reference cannot be legitimate -- there were zero
+#     real ones to reference. Coarser, no per-title diffing, but doesn't
+#     depend on guessing a citation format.
 _QUOTED_JOB_AID_CITATION_RE = re.compile(
     r"['‘’]([^'‘’]{2,80})['‘’]\s+job aid", re.IGNORECASE
 )
+_FAILURE_MODE_KEYWORD_RE = re.compile(r"failure mode", re.IGNORECASE)
 
-UNFOUNDED_JOB_AID_FALLBACK_ANSWER = (
-    "I don't have a job aid on file for that in our system for this "
-    "equipment -- that's not something I can point you to right now."
+UNFOUNDED_CITATION_FALLBACK_ANSWER = (
+    "I don't have that on file in our system for this equipment -- "
+    "that's not something I can point you to right now."
 )
 
 # Used to give the model ONE corrective retry when the guard fires,
 # instead of immediately discarding the whole answer. Discarding
 # outright is wrong when the Equipment Knowledge block also had real,
 # correct content (e.g. manual excerpts) that the model ignored in
-# favor of inventing a job aid -- the fabrication should be corrected,
+# favor of inventing a source -- the fabrication should be corrected,
 # not used as an excuse to throw away an answer that was otherwise
 # right there in the retrieved data. If the retry ALSO cites something
-# unfounded, THEN fall back to UNFOUNDED_JOB_AID_FALLBACK_ANSWER --
-# no infinite loop, exactly one extra attempt.
-JOB_AID_CITATION_CORRECTION_TEMPLATE = """CORRECTION -- your last answer to this exact question cited a job aid that does not exist in our data for this equipment: {unfounded_titles}. Do not invent that again.
+# unfounded, THEN fall back to UNFOUNDED_CITATION_FALLBACK_ANSWER -- no
+# loop, exactly one extra attempt.
+CITATION_CORRECTION_TEMPLATE = """CORRECTION -- your last answer to this exact question referenced source(s) that do not exist in our data for this equipment:
 
-The ONLY job aids that actually exist for this equipment are: {real_titles_desc}
+{problem_lines}
 
-Answer the same question again from scratch. Do not name, reference, or imply the existence of any job aid other than the ones listed above. If none are listed, do not use the word "job aid" anywhere in your answer -- answer using only the manual excerpts and/or failure mode records already provided in the Equipment Knowledge block above, and if those don't cover it either, say so in one short sentence per the WHEN YOU DON'T HAVE THE ANSWER rule."""
+Answer the same question again from scratch, using only the manual excerpts (and any real job aids/failure modes listed above) already provided in the Equipment Knowledge block, without repeating any of the fabricated references. If the manual doesn't cover it either, say so in one short sentence per the WHEN YOU DON'T HAVE THE ANSWER rule."""
 
 
 def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
@@ -153,6 +163,50 @@ def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
     real_titles = {ja["title"].strip().lower() for ja in real_job_aids if ja.get("title")}
     cited_titles = {m.group(1).strip() for m in _QUOTED_JOB_AID_CITATION_RE.finditer(answer)}
     return [title for title in cited_titles if title.lower() not in real_titles]
+
+
+def _detect_unfounded_citations(answer: str, sources: dict) -> dict:
+    """
+    Runs every category check against one turn's answer + its real
+    retrieved sources. Returns a dict describing what was found, e.g.
+    {"job_aids": ["Case Sealer Troubleshooting"], "failure_modes": True}
+    -- an empty dict means nothing suspicious was found. Add a new
+    category check here (e.g. for a future "manual" fabrication pattern)
+    rather than bolting on a separate parallel guard elsewhere.
+    """
+    problems = {}
+
+    unfounded_job_aids = _find_unfounded_job_aid_citations(answer, sources.get("job_aids") or [])
+    if unfounded_job_aids:
+        problems["job_aids"] = unfounded_job_aids
+
+    if not (sources.get("failure_modes") or []) and _FAILURE_MODE_KEYWORD_RE.search(answer):
+        problems["failure_modes"] = True
+
+    return problems
+
+
+def _build_citation_correction(problems: dict, sources: dict) -> str:
+    """Turns a _detect_unfounded_citations() result into the correction
+    message sent back to the model for its one retry."""
+    lines = []
+
+    if "job_aids" in problems:
+        cited = ", ".join(f"'{t}'" for t in problems["job_aids"])
+        real = sources.get("job_aids") or []
+        real_desc = (
+            ", ".join(f"'{ja['title']}'" for ja in real) if real
+            else "none -- there are no job aids on file for this equipment"
+        )
+        lines.append(f"- You cited job aid(s) {cited}, which do not exist. "
+                      f"The ONLY job aids that actually exist for this equipment are: {real_desc}")
+
+    if "failure_modes" in problems:
+        lines.append("- You referenced \"failure mode\" records, but there are NO logged "
+                      "failure modes on file for this equipment at all -- do not mention "
+                      "failure modes, known issues, or logged records in your answer.")
+
+    return CITATION_CORRECTION_TEMPLATE.format(problem_lines="\n".join(lines))
 
 
 class SessionNotFoundError(Exception):
@@ -266,30 +320,25 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
 
     answer = extract_text(response)
 
-    # See _find_unfounded_job_aid_citations()'s comment above. Rather
-    # than discarding the answer outright the moment a fabricated
-    # citation is caught, give the model ONE corrective retry -- the
-    # Equipment Knowledge block may well have had the real answer (e.g.
-    # manual excerpts) sitting right there, ignored in favor of
-    # inventing a job aid; a flat fallback would throw that real content
-    # away along with the fabrication. Exactly one retry, no loop: if
-    # the retry is also caught, THEN fall back to the safe generic
-    # message rather than keep spending calls chasing a clean answer.
-    real_job_aids = retrieved["sources"]["job_aids"]
-    unfounded = _find_unfounded_job_aid_citations(answer, real_job_aids)
-    if unfounded:
-        real_titles = [ja["title"] for ja in real_job_aids]
-        print(f"UNFOUNDED JOB AID CITATION (attempt 1): query={query!r} "
-              f"equipment_id={equipment_id} model cited {unfounded!r} but "
-              f"retrieved job aids were {real_titles!r} -- retrying once")
+    # See _detect_unfounded_citations()'s comment above. Rather than
+    # discarding the answer outright the moment a fabricated citation is
+    # caught, give the model ONE corrective retry -- the Equipment
+    # Knowledge block may well have had the real answer (e.g. manual
+    # excerpts) sitting right there, ignored in favor of inventing a
+    # source; a flat fallback would throw that real content away along
+    # with the fabrication. Exactly one retry, no loop: if the retry is
+    # ALSO caught (even a different category than the first attempt --
+    # e.g. it swaps a fabricated job aid for a fabricated failure mode,
+    # which is exactly what happened in production), fall back to the
+    # safe generic message rather than keep spending calls chasing a
+    # clean answer.
+    problems = _detect_unfounded_citations(answer, retrieved["sources"])
+    if problems:
+        print(f"UNFOUNDED CITATION (attempt 1): query={query!r} "
+              f"equipment_id={equipment_id} problems={problems!r} "
+              f"real_sources={retrieved['sources']!r} -- retrying once")
 
-        correction = JOB_AID_CITATION_CORRECTION_TEMPLATE.format(
-            unfounded_titles=", ".join(f"'{t}'" for t in unfounded),
-            real_titles_desc=(
-                ", ".join(f"'{t}'" for t in real_titles) if real_titles
-                else "none -- there are no job aids on file for this equipment"
-            ),
-        )
+        correction = _build_citation_correction(problems, retrieved["sources"])
         retry_messages = messages + [
             {"role": "assistant", "content": answer},
             {"role": "user", "content": correction},
@@ -300,13 +349,13 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
             temperature=CHAT_TEMPERATURE,
         )
         retry_answer = extract_text(retry_response)
-        retry_unfounded = _find_unfounded_job_aid_citations(retry_answer, real_job_aids)
+        retry_problems = _detect_unfounded_citations(retry_answer, retrieved["sources"])
 
-        if retry_unfounded:
-            print(f"UNFOUNDED JOB AID CITATION (attempt 2, giving up): "
-                  f"query={query!r} equipment_id={equipment_id} still cited "
-                  f"{retry_unfounded!r} after correction -- using fallback")
-            answer = UNFOUNDED_JOB_AID_FALLBACK_ANSWER
+        if retry_problems:
+            print(f"UNFOUNDED CITATION (attempt 2, giving up): query={query!r} "
+                  f"equipment_id={equipment_id} still problems={retry_problems!r} "
+                  f"after correction -- using fallback")
+            answer = UNFOUNDED_CITATION_FALLBACK_ANSWER
         else:
             answer = retry_answer
 
