@@ -20,7 +20,7 @@ from app.services.bedrock_client import call_claude, extract_text
 from app.services.retrieval import build_context
 from app.services.session import (
     create_session, get_session, save_messages,
-    reset_session_for_equipment,
+    reset_session_for_equipment, get_history, maybe_summarize,
 )
 from app.services import tools as chat_tools
 
@@ -34,10 +34,11 @@ CHAT_TEMPERATURE = 0.2
 
 CHAT_SYSTEM_PROMPT_TEMPLATE = """You are SquareMethods Assistant, a reliability and maintenance AI for industrial equipment.
 
-NO CONVERSATION HISTORY -- THIS IS YOUR MOST IMPORTANT RULE:
-- This message is the ONLY thing you know about this conversation. You are never shown any earlier turns, even from earlier in this same chat session -- there is no "before" for you to draw on.
-- If the question only makes sense with context from an earlier turn (e.g. "what about that setting," "is it the same for this one"), say you don't have the earlier context and ask them to restate the full question -- do not guess what it might be referring to.
-- If asked to summarize, recap, or repeat what was covered earlier in the conversation, say plainly that you don't have access to earlier turns and can only answer the question just asked -- never invent or reconstruct what an earlier turn might have said.
+CONVERSATION HISTORY -- READ THIS CAREFULLY, IT HAS TWO PARTS:
+- You ARE shown earlier turns of this conversation below (as real prior messages, and/or a summary of older ones). Use them to resolve follow-ups like "what about that setting" or "is it the same for this one," and to avoid repeating yourself.
+- However, earlier turns are NOT a source of truth, including your own earlier answers. Only the "Equipment Knowledge" block in THIS message is authoritative. An earlier turn -- yours or the user's -- may have been wrong, incomplete, or (rarely) fabricated; you must not treat something stated earlier as confirmed just because it was said, and you must not build new specific claims on top of an earlier claim instead of re-checking the current Equipment Knowledge block.
+- Every specific fact, number, spec, or citation in your answer must trace to the CURRENT Equipment Knowledge block below, same as if this were the first message in the conversation. If the user asks about something from an earlier turn that the current block doesn't cover, say the current lookup doesn't have it -- do not fall back on repeating what an earlier turn claimed as if that settles it.
+- If you truly have no history shown (e.g. this is the first message, or history is empty), say so plainly rather than guessing what an earlier turn might have said.
 
 WHEN YOU DON'T HAVE THE ANSWER, BE BRIEF:
 - If the Equipment Knowledge block doesn't cover the question, say so in one short sentence -- e.g. "That's not in our system for this equipment yet." Do not follow it with a paragraph of hedging, caveats, or suggestions to contact the manufacturer -- one sentence is enough.
@@ -134,6 +135,48 @@ _QUOTED_JOB_AID_CITATION_RE = re.compile(
 )
 _FAILURE_MODE_KEYWORD_RE = re.compile(r"failure mode", re.IGNORECASE)
 
+# Third category, added after a confirmed-in-production case: asked "what
+# is the rated speed," the model answered "1750 RPM, according to the
+# equipment manual" -- a specific number with a specific unit, cited to a
+# real source category, that does not appear ANYWHERE in the manual (the
+# only RPM figure in the whole document is an unrelated "1000 rpm" for a
+# different subsystem). This is a different failure shape than the job-aid/
+# failure-mode cases above: those fabricated the SOURCE (a title/category
+# that doesn't exist); this fabricates a VALUE while citing a source
+# category that legitimately does exist (manual excerpts were retrieved,
+# just not this number). Job-aid/failure-mode-style category diffing can't
+# catch this -- only checking the actual number against the actual
+# retrieved text can. Deliberately unit-anchored (not "any number") to
+# avoid false positives on step numbers, list items, dates, etc. -- a bare
+# "3" in "step 3" isn't a claim of fact, "1750 RPM" is.
+_NUMERIC_SPEC_RE = re.compile(
+    r"\b\d[\d,]*\.?\d*\s?"
+    r"(?:RPM|rpm|PSI|psi|HP|hp|V|volts?|A|amps?|amperes?|"
+    r"hours?|hrs?|minutes?|mins?|seconds?|secs?|"
+    r"in(?:ches)?|ft|feet|mm|cm|m|"
+    r"°F|°C|degrees?|"
+    r"lbs?|kg|N|Nm|"
+    r"VG\s?\d+)\b"
+)
+
+
+def _find_unfounded_numeric_specs(answer: str, context: str) -> list:
+    """
+    Returns the number+unit tokens `answer` states (e.g. "1750 RPM") that
+    do not appear as a substring anywhere in `context` -- the exact
+    Equipment Knowledge text the model was actually given this turn.
+    Deliberately a simple substring check, not fuzzy matching: a real,
+    grounded figure should appear close to verbatim (the model is quoting/
+    paraphrasing retrieved text, not doing unit conversion), so requiring
+    an exact substring match keeps this precise and cheap, at the cost of
+    missing a genuinely-grounded figure the model reformatted heavily
+    (e.g. "1,750" written as "1750") -- an acceptable tradeoff since a
+    false positive here just costs one extra retry, not a wrong answer.
+    """
+    context_lower = context.lower()
+    cited = {m.group(0).strip() for m in _NUMERIC_SPEC_RE.finditer(answer)}
+    return [spec for spec in cited if spec.lower() not in context_lower]
+
 UNFOUNDED_CITATION_FALLBACK_ANSWER = (
     "I don't have that on file in our system for this equipment -- "
     "that's not something I can point you to right now."
@@ -167,14 +210,20 @@ def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
     return [title for title in cited_titles if title.lower() not in real_titles]
 
 
-def _detect_unfounded_citations(answer: str, sources: dict) -> dict:
+def _detect_unfounded_citations(answer: str, sources: dict, context: str) -> dict:
     """
     Runs every category check against one turn's answer + its real
-    retrieved sources. Returns a dict describing what was found, e.g.
-    {"job_aids": ["Case Sealer Troubleshooting"], "failure_modes": True}
-    -- an empty dict means nothing suspicious was found. Add a new
-    category check here (e.g. for a future "manual" fabrication pattern)
-    rather than bolting on a separate parallel guard elsewhere.
+    retrieved sources/context. Returns a dict describing what was found,
+    e.g. {"job_aids": ["Case Sealer Troubleshooting"], "failure_modes":
+    True, "numeric_specs": ["1750 RPM"]} -- an empty dict means nothing
+    suspicious was found. Add a new category check here rather than
+    bolting on a separate parallel guard elsewhere.
+
+    `context` (retrieved["context"], the literal text the model saw) is
+    needed for the numeric_specs check -- unlike job_aids/failure_modes,
+    a fabricated number can't be caught by diffing against a list of
+    titles/categories, only by checking the number against the actual
+    retrieved text.
     """
     problems = {}
 
@@ -184,6 +233,10 @@ def _detect_unfounded_citations(answer: str, sources: dict) -> dict:
 
     if not (sources.get("failure_modes") or []) and _FAILURE_MODE_KEYWORD_RE.search(answer):
         problems["failure_modes"] = True
+
+    unfounded_specs = _find_unfounded_numeric_specs(answer, context)
+    if unfounded_specs:
+        problems["numeric_specs"] = unfounded_specs
 
     return problems
 
@@ -208,7 +261,51 @@ def _build_citation_correction(problems: dict, sources: dict) -> str:
                       "failure modes on file for this equipment at all -- do not mention "
                       "failure modes, known issues, or logged records in your answer.")
 
+    if "numeric_specs" in problems:
+        cited = ", ".join(problems["numeric_specs"])
+        lines.append(f"- You stated specific figure(s) {cited} that do NOT appear anywhere in "
+                      f"the retrieved Equipment Knowledge block below. Do not state a specific "
+                      f"number, spec, or measurement unless it appears verbatim in that block -- "
+                      f"if the exact figure isn't there, say that spec isn't on file rather than "
+                      f"estimating, rounding, or recalling one from general knowledge.")
+
     return CITATION_CORRECTION_TEMPLATE.format(problem_lines="\n".join(lines))
+
+
+def _summarize_history_turns(existing_summary: str, messages: list) -> str:
+    """
+    summarizer_fn for session.maybe_summarize() -- now actually wired up
+    (see handle_chat_turn()) since conversation history is read back into
+    generation again. Deliberately asks for a summary of what topics/
+    equipment issues were DISCUSSED, not a restatement of technical facts
+    as confirmed truth -- this summary itself becomes part of future
+    conversation history, and per the system prompt's CONVERSATION
+    HISTORY rule, history is background context, not a source of truth.
+    If this silently upgraded a past (possibly wrong, possibly even
+    already-corrected-by-the-retry-guard) answer into confident prose, that
+    upgraded version would get fed back into every future turn looking
+    MORE authoritative than the original ever was.
+    """
+    convo_text = "\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in messages
+        if isinstance(m.get("content"), str)
+    )
+    prompt = (
+        "Summarize this maintenance chat conversation in 3-5 sentences. "
+        "Focus on what topics, equipment issues, and questions came up -- "
+        "NOT a restatement of technical facts/specs as confirmed truth "
+        "(this summary will be shown to the assistant in future turns as "
+        "background context only, not as a source it can cite from).\n\n"
+    )
+    if existing_summary:
+        prompt += f"Existing summary of even earlier turns:\n{existing_summary}\n\n"
+    prompt += f"New turns to fold in:\n{convo_text}"
+
+    response = call_claude(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300, temperature=0.2,
+    )
+    return extract_text(response).strip()
 
 
 class SessionNotFoundError(Exception):
@@ -227,9 +324,12 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     """
     Runs one full chat turn: resolve/create session, retrieve context,
     call Claude (looping through any tool_use), persist the turn.
-    Answers are generated from ONLY this turn's query + freshly retrieved
-    context -- no prior conversation history is fed to the model, even
-    within the same session (see the `messages` comment below for why).
+    Answers are generated from this turn's query, freshly retrieved
+    Equipment Knowledge, AND real prior conversation history from this
+    session (see the `messages` comment below) -- but grounding still
+    comes ONLY from this turn's Equipment Knowledge block, never from
+    what an earlier turn (including the model's own) said; see the
+    system prompt's CONVERSATION HISTORY section.
     Returns:
         {"session_id", "answer", "sources", "job_aids_created"}
     """
@@ -240,15 +340,14 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
         if not session:
             raise SessionNotFoundError(session_id)
         if str(session["equipment_id"]) != str(equipment_id):
-            # Chat generation never reads this session's history (see
-            # below -- messages is built from ONLY the current query,
-            # nothing from get_history()), so a mismatch here can no
-            # longer leak one equipment's answer into another's the way
-            # it used to. This re-home + wipe still runs anyway, purely
-            # so the STORED chat_messages rows for this session_id stay
-            # coherent for one piece of equipment (e.g. if a UI ever
-            # lists a session's past messages) rather than silently
-            # mixing two equipment's turns under one session_id.
+            # Chat generation reads this session's history again (see
+            # below -- messages is built from get_history() plus the
+            # current query), so this wipe is load-bearing, not just
+            # bookkeeping: without it, a mismatch here is exactly how one
+            # equipment's real, correctly-grounded answer leaked into
+            # another equipment's answer before (see session.py's
+            # reset_session_for_equipment() docstring for the original
+            # incident). Re-homing without wiping is NOT a safe shortcut.
             print(f"SESSION EQUIPMENT MISMATCH: session {session_id} was "
                   f"for equipment {session['equipment_id']}, now used for "
                   f"{equipment_id} -- clearing its stored history and re-homing it")
@@ -266,21 +365,49 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
 
     system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context=retrieved["context"])
 
-    # Deliberately NOT built from get_history() -- each turn is answered
-    # from this single query plus the freshly retrieved Equipment
-    # Knowledge block only. No prior turns, no rolling summary. This is
-    # what stops a model that once fabricated something (e.g. an
-    # invented job aid) from treating its own earlier words as
-    # established fact and building further invented detail on top of
-    # them turn after turn -- a real failure mode we hit in production
-    # even in a correctly equipment-scoped session, since grounding only
-    # governs the Equipment Knowledge block, not what the model sees in
-    # its own conversation history. Tradeoff: the model can no longer
-    # resolve a follow-up like "what about that setting" against an
-    # earlier turn, or produce a "here's what we covered" recap on
-    # request -- see the system prompt's "NO CONVERSATION HISTORY"
-    # section, which tells it to say so rather than guess.
-    messages = [{"role": "user", "content": query}]
+    # Real conversation history is back (previously deliberately omitted --
+    # see the removed "NO CONVERSATION HISTORY" comment this replaces, and
+    # the CONVERSATION HISTORY section of the system prompt). Re-enabling
+    # this reopens the exact failure mode that got it removed in the first
+    # place: a model that once fabricated something (e.g. an invented spec
+    # or job aid) treating its own earlier words as established fact and
+    # building further invented detail on top of them turn after turn --
+    # grounding governs the Equipment Knowledge block, not what the model
+    # sees in its own history. Two things now hold that line instead of
+    # removing history outright: (1) the system prompt's CONVERSATION
+    # HISTORY rule explicitly tells the model earlier turns (including its
+    # own) are context, not truth, and every fact must still trace to
+    # THIS turn's Equipment Knowledge block; (2) _detect_unfounded_
+    # citations()'s numeric_specs check (added alongside this) catches a
+    # fabricated figure regardless of whether it originated fresh or got
+    # echoed forward from an earlier turn now sitting in history. Neither
+    # is a hard guarantee on its own -- if fabrication resurfaces and
+    # compounds across turns again, that's the signal this needs a
+    # stronger mechanism (e.g. capping how much of history is replayed,
+    # or re-validating every historical assistant turn's claims against
+    # sources before replaying it) rather than papering over it here.
+    #
+    # get_history() returns the rolling summary (if any older turns have
+    # been rolled up -- see maybe_summarize() below) plus recent messages
+    # verbatim. Only plain-string turns are replayed here -- tool-call
+    # turns are saved as a plain final-answer string via save_messages()
+    # (the tool_use/tool_result exchange itself is never persisted as
+    # separate chat_messages rows), so every historical row is already in
+    # the simple shape call_claude() expects.
+    history = get_history(session_id, company_id)
+
+    messages = []
+    if history["summary"]:
+        messages.append({
+            "role": "user",
+            "content": f"[Summary of earlier turns in this conversation, for background "
+                       f"context only -- not a source of confirmed fact: {history['summary']}]",
+        })
+        messages.append({"role": "assistant", "content": "Understood."})
+    for m in history["messages"]:
+        if m["role"] in ("user", "assistant") and isinstance(m["content"], str):
+            messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": query})
 
     # Tool is only offered when this specific message signals creation
     # intent -- see JOB_AID_INTENT_PHRASES above. tools=None means Claude
@@ -334,7 +461,7 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     # which is exactly what happened in production), fall back to the
     # safe generic message rather than keep spending calls chasing a
     # clean answer.
-    problems = _detect_unfounded_citations(answer, retrieved["sources"])
+    problems = _detect_unfounded_citations(answer, retrieved["sources"], retrieved["context"])
     if problems:
         print(f"UNFOUNDED CITATION (attempt 1): query={query!r} "
               f"equipment_id={equipment_id} problems={problems!r} "
@@ -351,7 +478,7 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
             temperature=CHAT_TEMPERATURE,
         )
         retry_answer = extract_text(retry_response)
-        retry_problems = _detect_unfounded_citations(retry_answer, retrieved["sources"])
+        retry_problems = _detect_unfounded_citations(retry_answer, retrieved["sources"], retrieved["context"])
 
         if retry_problems:
             # Logging the actual semantic hits (not just whether any
@@ -375,27 +502,28 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
         else:
             answer = retry_answer
 
-    # Still saved for storage/display purposes (e.g. a UI showing a
-    # session's past messages) -- just never read back into a future
-    # call_claude() turn. See the comment above where `messages` is
-    # built for why generation no longer touches this.
+    # Saved for storage/display AND, now that history is back (see the
+    # `messages` comment above), read back into every future turn's
+    # call_claude() via get_history(). Same call as before this change --
+    # only what reads this data afterward changed.
     save_messages(
         session_id, company_id, query, answer,
         sources=retrieved["sources"],
         tool_calls=tool_call_log or None,
     )
 
-    # No maybe_summarize() call here anymore -- the rolling summary it
-    # produced was only ever consumed by the "Earlier conversation
-    # summary" block in system_prompt, which no longer exists. Calling
-    # it now would just be a wasted Bedrock call computing a summary
-    # nothing reads. session.py's maybe_summarize()/get_history() still
-    # exist and still work if some other future feature wants a
-    # conversation summary -- they're just not wired into this turn
-    # anymore. Flagging rather than deleting them outright, since unlike
-    # update_session_equipment()/get_active_session() (removed earlier
-    # for being unused AND actively wrong), these are unused-for-now but
-    # not wrong -- worth a deliberate call on whether to keep them.
+    # Rolling summary is wired back in now that history is actually read
+    # (see the `messages` comment above) -- an unbounded replayed history
+    # would otherwise grow every prompt (and cost) turn after turn forever.
+    # Fire-and-forget in the sense that its own failure shouldn't fail the
+    # user's turn -- the answer is already computed and about to be
+    # returned; a summarization hiccup should degrade to "history grows
+    # one turn larger than ideal," not break the chat.
+    try:
+        maybe_summarize(session_id, company_id, _summarize_history_turns)
+    except Exception as e:
+        print(f"maybe_summarize failed (non-fatal, answer already computed): "
+              f"session_id={session_id} error={str(e)}")
 
     job_aids_created = [
         tc["result"] for tc in tool_call_log
