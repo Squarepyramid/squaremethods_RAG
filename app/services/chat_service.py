@@ -54,6 +54,7 @@ CITE YOUR SOURCE:
 - If a job aid is your source, name it (its title) so the user can find it, not just "a job aid."
 - Don't force a citation onto every single sentence if that gets repetitive -- one clear attribution per distinct fact or source is enough, not one per word.
 - If you're not sure which specific source a fact came from, still say generally where it's from (e.g. "from our equipment records") rather than omitting attribution -- never present database-sourced facts as if they were your own general knowledge.
+- A manual excerpt may be tagged with a page reference in brackets, like "[manual, page 243]" or "[manual, pages 243-244]" -- this equipment's manual is a scanned document, so the user may want to check the physical book. When an excerpt you're answering from has one, say it naturally, e.g. "Found on page 243 of the manual, ..." or "...(page 243)." ONLY state a page number that is literally shown in brackets in the block below for the excerpt you're actually using -- never estimate, round, infer, or recall a page number from anywhere else, and never state one at all when the excerpt you're citing has no page reference shown.
 
 FORMATTING -- a technician is reading this on a phone or tablet in the field, make it easy to scan:
 - Never write one dense block of text. Break your answer into short paragraphs (1-3 sentences each), separated by a blank line.
@@ -177,6 +178,50 @@ def _find_unfounded_numeric_specs(answer: str, context: str) -> list:
     cited = {m.group(0).strip() for m in _NUMERIC_SPEC_RE.finditer(answer)}
     return [spec for spec in cited if spec.lower() not in context_lower]
 
+
+# Fourth category, added alongside page-citation support (migration_003_
+# knowledge_embeddings_page_range.sql / ingest_document.py's Markdown
+# chunking / retrieval.py's page_start/page_end plumbing): the whole
+# point of telling a user "found on page 243" is so they can check the
+# physical manual -- a FABRICATED page number is arguably worse than the
+# earlier RPM incident, since it actively sends someone to the wrong page
+# of a real book with false confidence, instead of just being a wrong
+# number in the chat. Same shape as the numeric_specs check, but page
+# numbers need range-overlap checking rather than a substring check --
+# retrieval.py's page_start/page_end mean a chunk can legitimately span
+# more than one physical page, so a cited page must fall inside SOME
+# retrieved chunk's range, not match one number exactly.
+_PAGE_CITATION_RE = re.compile(r"\bpages?\s+(\d+)(?:\s*[-–]\s*(\d+))?\b", re.IGNORECASE)
+
+
+def _find_unfounded_page_citations(answer: str, semantic_sources: list) -> list:
+    """
+    Returns the page reference(s) `answer` states (e.g. "page 243",
+    "pages 243-244") that fall outside every actually-retrieved chunk's
+    page_start..page_end range for this turn (retrieved["sources"]
+    ["semantic"] -- straight from semantic_search(), ground truth for
+    what was really retrieved). A chunk with no page range at all
+    (page_start/page_end both None -- pre-migration data, or a DOCX
+    source) contributes nothing to check against, same as it contributes
+    no page citation to the prompt in the first place.
+    """
+    real_ranges = [
+        (s["page_start"], s["page_end"])
+        for s in semantic_sources
+        if s.get("page_start") is not None and s.get("page_end") is not None
+    ]
+
+    unfounded = []
+    for m in _PAGE_CITATION_RE.finditer(answer):
+        cited_start = int(m.group(1))
+        cited_end   = int(m.group(2)) if m.group(2) else cited_start
+        if not any(cited_start <= real_end and cited_end >= real_start
+                   for real_start, real_end in real_ranges):
+            unfounded.append(m.group(0).strip())
+
+    return unfounded
+
+
 UNFOUNDED_CITATION_FALLBACK_ANSWER = (
     "I don't have that on file in our system for this equipment -- "
     "that's not something I can point you to right now."
@@ -238,6 +283,10 @@ def _detect_unfounded_citations(answer: str, sources: dict, context: str) -> dic
     if unfounded_specs:
         problems["numeric_specs"] = unfounded_specs
 
+    unfounded_pages = _find_unfounded_page_citations(answer, sources.get("semantic") or [])
+    if unfounded_pages:
+        problems["page_citations"] = unfounded_pages
+
     return problems
 
 
@@ -268,6 +317,23 @@ def _build_citation_correction(problems: dict, sources: dict) -> str:
                       f"number, spec, or measurement unless it appears verbatim in that block -- "
                       f"if the exact figure isn't there, say that spec isn't on file rather than "
                       f"estimating, rounding, or recalling one from general knowledge.")
+
+    if "page_citations" in problems:
+        cited = ", ".join(problems["page_citations"])
+        real = sources.get("semantic") or []
+        real_pages = sorted({
+            (s["page_start"], s["page_end"]) for s in real
+            if s.get("page_start") is not None
+        })
+        real_desc = (
+            ", ".join(f"page {a}" if a == b else f"pages {a}-{b}" for a, b in real_pages)
+            if real_pages else "none -- no retrieved excerpt this turn has a page reference at all"
+        )
+        lines.append(f"- You cited {cited}, which does NOT match the page range of any excerpt "
+                      f"actually retrieved for this turn. The only page reference(s) actually "
+                      f"available this turn are: {real_desc}. Only state a page number that is "
+                      f"literally shown in brackets next to the excerpt you're citing -- if that "
+                      f"excerpt has no page reference shown, don't state one for it.")
 
     return CITATION_CORRECTION_TEMPLATE.format(problem_lines="\n".join(lines))
 

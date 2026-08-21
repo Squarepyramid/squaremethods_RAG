@@ -71,6 +71,12 @@ Textract failure here fails the whole ingest job).
 DEPLOYMENT REQUIREMENT for Textract: the Lambda's execution role needs
     textract:StartDocumentTextDetection
     textract:GetDocumentTextDetection
+    textract:StartDocumentAnalysis   -- added for the LAYOUT/Markdown extraction path
+    textract:GetDocumentAnalysis     -- (see extract_markdown_from_pdf()); the plain
+                                         text-detection actions above are still needed
+                                         too, for the unchanged extract_text_from_pdf()
+                                         path (image context_text, still used if
+                                         IMAGE_EXTRACTION_ENABLED is turned back on)
     s3:GetObject on the bucket manuals are uploaded to
 file_url is expected to already be an S3 URL (that's how every document
 reaches _run_ingest today) and is used directly as Textract's input --
@@ -357,6 +363,243 @@ def _textract_extract_document(file_bytes: bytes, file_url: str) -> dict:
                 log.warning(f"Failed to delete Textract scratch object {scratch_key}: {e}")
 
 
+# ── Text extraction: Textract Layout Analysis -> Markdown ─────────────────────
+#
+# Added for structural (not flat-word-count) chunking that generalizes
+# across manuals with different formatting conventions -- see the earlier
+# ALL-CAPS-regex header detector this replaces, which was reverse-
+# engineered from ONE manual's casing style and had no reason to
+# generalize to a different manufacturer's Title Case or numbered
+# headers. Textract's LAYOUT feature (AnalyzeDocument / its async
+# StartDocumentAnalysis form) classifies each block of a page as a real
+# structural element -- LAYOUT_TITLE, LAYOUT_SECTION_HEADER, LAYOUT_TEXT,
+# LAYOUT_LIST, LAYOUT_TABLE, etc. -- from the document's actual visual
+# layout (font size, position, spacing), not any assumption about a
+# particular manual's text formatting. Still just a boto3 API call, same
+# "no OS package, nothing to break in CI" property that got Textract
+# chosen over local OCR in the first place (see the module docstring) --
+# this doesn't reopen that already-settled tradeoff.
+#
+# Kept SEPARATE from _textract_extract_document()/_extract_pdf_page_texts()
+# above rather than replacing them -- those still back
+# extract_images_from_pdf()'s page-level context_text (out of scope here;
+# IMAGE_EXTRACTION_ENABLED is currently False anyway) and anything else
+# that specifically wants flat per-page text with no structure.
+#
+# *** UNVERIFIED AGAINST A LIVE CALL *** -- this sandbox has no AWS
+# credentials. The block-shape assumptions below (CHILD relationships
+# pointing to LINE blocks; which BlockTypes appear under FeatureTypes=
+# ["LAYOUT"]) come from Textract's documented API, not a real response
+# inspected here. Smoke-test against one real manual before trusting this
+# in production -- log the raw Blocks for that run if the resulting
+# Markdown looks wrong (missing sections, headers not detected, garbled
+# ordering) so there's something concrete to debug against.
+
+_LAYOUT_HEADER_TYPES = {"LAYOUT_TITLE": "#", "LAYOUT_SECTION_HEADER": "##"}
+_LAYOUT_SKIP_TYPES    = {"LAYOUT_HEADER", "LAYOUT_FOOTER", "LAYOUT_PAGE_NUMBER", "LAYOUT_FIGURE"}
+_PAGE_MARKER_RE = re.compile(r"<!--\s*page:(\d+)\s*-->")
+
+
+def _textract_analyze_layout(file_bytes: bytes, file_url: str) -> list:
+    """
+    Same async-job/S3-input/polling/pagination pattern as
+    _textract_extract_document() above, but calls StartDocumentAnalysis
+    with FeatureTypes=["LAYOUT"] instead of StartDocumentTextDetection,
+    and returns the FULL raw Blocks list (LAYOUT_* blocks AND the
+    underlying LINE/WORD blocks they reference via CHILD relationships)
+    rather than a pre-reduced page->text dict, since _blocks_to_markdown()
+    below needs to resolve each LAYOUT block's children itself.
+    """
+    textract = _textract_client()
+
+    parsed = _parse_s3_url(file_url)
+    scratch_bucket = scratch_key = None
+    if parsed:
+        bucket, key = parsed
+    else:
+        log.warning(
+            f"file_url doesn't look like an S3 URL ({file_url!r}); "
+            f"uploading a scratch copy to S3_BUCKET for Textract instead."
+        )
+        scratch_bucket = bucket = S3_BUCKET
+        scratch_key    = key    = f"textract-scratch/{uuid.uuid4()}.pdf"
+        _s3_client().put_object(Bucket=bucket, Key=key, Body=file_bytes)
+
+    try:
+        start_response = textract.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["LAYOUT"],
+        )
+        job_id = start_response["JobId"]
+
+        waited = 0
+        result = None
+        while True:
+            result = textract.get_document_analysis(JobId=job_id)
+            status = result["JobStatus"]
+            if status in ("SUCCEEDED", "PARTIAL_SUCCESS"):
+                break
+            if status == "FAILED":
+                raise RuntimeError(
+                    f"Textract layout-analysis job {job_id} failed: {result.get('StatusMessage')}"
+                )
+            if waited >= TEXTRACT_MAX_WAIT_SECONDS:
+                raise TimeoutError(
+                    f"Textract layout-analysis job {job_id} still {status} after "
+                    f"{TEXTRACT_MAX_WAIT_SECONDS}s -- giving up for this ingest."
+                )
+            time.sleep(TEXTRACT_POLL_INTERVAL_SECONDS)
+            waited += TEXTRACT_POLL_INTERVAL_SECONDS
+
+        blocks = []
+        next_token = None
+        while True:
+            if next_token:
+                result = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+            blocks.extend(result.get("Blocks", []))
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+
+        return blocks
+    finally:
+        if scratch_key:
+            try:
+                _s3_client().delete_object(Bucket=scratch_bucket, Key=scratch_key)
+            except Exception as e:
+                log.warning(f"Failed to delete Textract scratch object {scratch_key}: {e}")
+
+
+def _resolve_block_text(block: dict, blocks_by_id: dict, join: str = " ") -> str:
+    """
+    A LAYOUT_* block doesn't carry its own text directly -- it references
+    the LINE blocks that make it up via a CHILD relationship. Joins their
+    Text fields in the order given (Textract returns child ids in reading
+    order per its docs). Defensive: a missing/unresolvable child is
+    skipped, not fatal -- a chunk with a small gap in it is far better
+    than crashing the whole ingest job on a block shape this sandbox
+    couldn't verify live.
+    """
+    pieces = []
+    for rel in block.get("Relationships", []) or []:
+        if rel.get("Type") != "CHILD":
+            continue
+        for child_id in rel.get("Ids", []):
+            child = blocks_by_id.get(child_id)
+            if child and child.get("Text"):
+                pieces.append(child["Text"])
+    return join.join(pieces).strip()
+
+
+def _blocks_to_markdown(blocks: list) -> str:
+    """
+    Walks Textract's LAYOUT blocks (see _textract_analyze_layout()) in
+    reading order and synthesizes one Markdown string for the whole
+    document, with an invisible `<!-- page:N -->` HTML-comment marker
+    inserted at every page boundary. Confirmed (mechanically tested
+    against langchain_text_splitters directly, alongside this change)
+    that MarkdownHeaderTextSplitter preserves these markers inside
+    whatever chunk's content they fall into -- that's what lets
+    chunk_markdown() recover a page_start/page_end per chunk after
+    splitting, then strip the markers back out before the text is
+    embedded or shown to anyone.
+
+    LAYOUT_HEADER/LAYOUT_FOOTER/LAYOUT_PAGE_NUMBER/LAYOUT_FIGURE are
+    skipped -- running page headers/footers and page-number-only blocks
+    aren't useful chunk content, and figures are handled by the separate
+    (currently disabled) image-extraction path, not text content.
+    LAYOUT_TABLE is emitted as plain paragraph text rather than a real
+    Markdown table for now -- table cell geometry parsing is a real gap,
+    flagged rather than silently done wrong; a garbled-but-present table
+    beats a missing one, but revisit if a manual with data-critical
+    tables (specs, tolerances) shows extraction quality problems here.
+    """
+    blocks_by_id = {b["Id"]: b for b in blocks if b.get("Id")}
+
+    layout_blocks = [b for b in blocks if str(b.get("BlockType", "")).startswith("LAYOUT_")]
+    layout_blocks = [b for b in layout_blocks if b.get("BlockType") not in _LAYOUT_SKIP_TYPES]
+
+    def _sort_key(b):
+        page = b.get("Page", 1)
+        geom = (b.get("Geometry") or {}).get("BoundingBox") or {}
+        return (page, geom.get("Top", 0.0), geom.get("Left", 0.0))
+
+    layout_blocks.sort(key=_sort_key)
+
+    # Marker placement is NOT simply "on every page change" -- confirmed
+    # by direct testing against MarkdownHeaderTextSplitter that a marker
+    # placed immediately BEFORE a header line gets swept into the
+    # PRECEDING section's content (the splitter treats the header line
+    # itself as the exact boundary, so anything sitting just before it,
+    # including a marker meant for the section that's ABOUT to start,
+    # ends up attributed to the section that's ending). The fix: emit a
+    # header's own page marker AFTER the header line, as the first line
+    # of that section's body, unconditionally (not just on a page
+    # change) -- every section MarkdownHeaderTextSplitter produces then
+    # reliably starts with its own accurate marker regardless of where
+    # the split boundary falls. Non-header content blocks keep the
+    # simpler "mark only when the page actually changes" behavior, since
+    # they don't sit at a boundary the splitter will cut on.
+    lines = []
+    last_marked_page = None
+    for block in layout_blocks:
+        page = block.get("Page", 1)
+        block_type = block.get("BlockType")
+
+        if block_type in _LAYOUT_HEADER_TYPES:
+            text = _resolve_block_text(block, blocks_by_id, join=" ")
+            if text:
+                lines.append(f"{_LAYOUT_HEADER_TYPES[block_type]} {text}")
+                lines.append(f"<!-- page:{page} -->")
+                last_marked_page = page
+            lines.append("")
+            continue
+
+        if page != last_marked_page:
+            lines.append(f"<!-- page:{page} -->")
+            last_marked_page = page
+
+        if block_type == "LAYOUT_LIST":
+            # Each child of a LAYOUT_LIST is one list item's LINE -- kept
+            # as separate bullets rather than flattened into one
+            # paragraph, matching the visual structure Textract detected.
+            for rel in block.get("Relationships", []) or []:
+                if rel.get("Type") != "CHILD":
+                    continue
+                for child_id in rel.get("Ids", []):
+                    child = blocks_by_id.get(child_id)
+                    if child and child.get("Text"):
+                        lines.append(f"- {child['Text']}")
+
+        else:
+            # LAYOUT_TEXT, LAYOUT_TABLE, LAYOUT_KEY_VALUE, and anything
+            # else not explicitly handled above -- plain paragraph text.
+            text = _resolve_block_text(block, blocks_by_id, join="\n")
+            if text:
+                lines.append(text)
+
+        lines.append("")  # blank line between blocks -- standard Markdown paragraph separation
+
+    return "\n".join(lines)
+
+
+def extract_markdown_from_pdf(file_bytes: bytes, file_url: str) -> str:
+    """
+    PDF entry point for the Markdown + page-marker extraction path (see
+    _blocks_to_markdown()) -- what _run_ingest() actually calls for PDFs
+    now. extract_text_from_pdf()/_extract_pdf_page_texts() below are kept
+    unchanged, still used by extract_images_from_pdf() for page-level
+    image context_text (out of scope for this change) and anything else
+    that specifically wants flat text with no structure.
+    """
+    try:
+        blocks = _textract_analyze_layout(file_bytes, file_url)
+        return _blocks_to_markdown(blocks)
+    except Exception as e:
+        log.error(f"PDF layout/Markdown extraction error: {e}")
+        raise
+
+
 def _extract_pdf_page_texts(file_bytes: bytes, file_url: str) -> list:
     """
     TEXTRACT-ONLY BUILD: every PDF is sent through Textract, every time --
@@ -419,6 +662,11 @@ def extract_text_from_pdf(file_bytes: bytes, file_url: str) -> str:
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
+    """
+    Unchanged behavior for any existing caller that wants flat text.
+    extract_markdown_from_docx() below is the structure-aware version
+    _run_ingest() actually uses now.
+    """
     try:
         import docx
         doc = docx.Document(io.BytesIO(file_bytes))
@@ -428,12 +676,74 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         raise
 
 
+_DOCX_HEADING_STYLE_RE = re.compile(r"^Heading\s+(\d)$", re.IGNORECASE)
+
+
+def extract_markdown_from_docx(file_bytes: bytes) -> str:
+    """
+    Same principle as the PDF path switching to Textract's LAYOUT blocks:
+    detect structure from the source document's OWN formatting, not a
+    guess at a text pattern. Word's built-in paragraph styles
+    ("Heading 1", "Heading 2", ..., "Title") are a real, reliable
+    structural signal python-docx exposes directly via
+    paragraph.style.name -- no OCR, no regex-on-casing guess. A DOCX
+    manual authored with Word's built-in heading styles gets real
+    section-aware chunking through the same chunk_markdown() as PDFs; one
+    that doesn't use heading styles at all degrades to every paragraph
+    being unheaded plain text (chunk_markdown() then falls back to one
+    big unsectioned chunk sequence via its size-bounded sub-split) -- not
+    worse than before this change, just not improved for that document.
+
+    DOCX has no fixed "page" concept at the paragraph-extraction level
+    (Word reflows; page breaks depend on rendering, not source content),
+    so no `<!-- page:N -->` markers are emitted here -- DOCX-sourced
+    chunks legitimately have page_start/page_end = NULL, same as the
+    migration comment documents.
+    """
+    try:
+        import docx
+        doc = docx.Document(io.BytesIO(file_bytes))
+        lines = []
+        for p in doc.paragraphs:
+            text = p.text.strip()
+            if not text:
+                continue
+            style_name = (p.style.name if p.style else "") or ""
+            m = _DOCX_HEADING_STYLE_RE.match(style_name.strip())
+            if m:
+                level = min(int(m.group(1)), 4)
+                lines.append(f"{'#' * level} {text}")
+            elif style_name.strip().lower() == "title":
+                lines.append(f"# {text}")
+            else:
+                lines.append(text)
+        return "\n\n".join(lines)
+    except Exception as e:
+        log.error(f"DOCX markdown extraction error: {e}")
+        raise
+
+
 def extract_text(file_bytes: bytes, filename: str, file_url: str) -> str:
     filename_lower = filename.lower()
     if filename_lower.endswith(".pdf"):
         return extract_text_from_pdf(file_bytes, file_url)
     elif filename_lower.endswith(".docx") or filename_lower.endswith(".doc"):
         return extract_text_from_docx(file_bytes)
+    else:
+        raise ValueError(f"Unsupported file type: {filename}")
+
+
+def extract_markdown(file_bytes: bytes, filename: str, file_url: str) -> str:
+    """
+    Structure-aware entry point -- what _run_ingest() calls now instead
+    of extract_text(). Mirrors extract_text()'s dispatch exactly, just
+    routing to the Markdown-producing extractor for each file type.
+    """
+    filename_lower = filename.lower()
+    if filename_lower.endswith(".pdf"):
+        return extract_markdown_from_pdf(file_bytes, file_url)
+    elif filename_lower.endswith(".docx") or filename_lower.endswith(".doc"):
+        return extract_markdown_from_docx(file_bytes)
     else:
         raise ValueError(f"Unsupported file type: {filename}")
 
@@ -584,21 +894,115 @@ def _encode_bom_items(bom_items: list) -> str:
     return ",".join(f"{b['item_no']}={b['part_no']}" for b in bom_items)
 
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
+# ── Chunking: Markdown structural + page-range tagging ────────────────────────
+#
+# SUPERSEDES two prior versions of this section, in order:
+#   1. Pure CHUNK_SIZE-word sliding-window chunking over the entire
+#      document as one flattened string -- no awareness of page breaks or
+#      section structure at all. Confirmed-in-production bug: a
+#      "SEQUENCE OF OPERATION" section got sliced across windows diluted
+#      by unrelated neighboring text, so NOT ONE resulting chunk started
+#      with or represented that section -- semantic_search() for "what is
+#      the sequence of operation" scored under 0.20 against every chunk
+#      of that document, and the assistant told a user the content wasn't
+#      documented even though it was sitting in the manual.
+#   2. An ALL-CAPS-regex header detector, splitting on section headers
+#      before windowing. Fixed (1) for that one manual, but was reverse-
+#      engineered from that manual's specific casing convention -- caught
+#      (correctly) as not generalizing to a different manufacturer's
+#      Title Case or numbered headers, since it was never verified
+#      against more than one document.
+#
+# This version fixes the generalization problem: it splits on REAL
+# document structure (Markdown headings that extract_markdown_from_pdf()/
+# extract_markdown_from_docx() produce from Textract's LAYOUT-classified
+# blocks or Word's own heading styles -- see those functions) via
+# langchain_text_splitters.MarkdownHeaderTextSplitter, instead of guessing
+# at any one manual's formatting convention. A section this splitter
+# produces can still be long (e.g. a full "TROUBLE SHOOTING TIPS"
+# chapter), so the same CHUNK_SIZE/CHUNK_OVERLAP word-windowing as before
+# still runs WITHIN each header-bounded section -- it just never crosses a
+# section boundary anymore, and every resulting chunk is prefixed with its
+# full heading path (e.g. "TITLE > SEQUENCE OF OPERATION"), not just the
+# immediate header, reconstructed from the splitter's own metadata rather
+# than re-guessed.
+#
+# ALSO NEW: extracts each chunk's page_start/page_end from the
+# `<!-- page:N -->` markers embedded in the Markdown (see
+# _blocks_to_markdown()), then strips them from the text before it's
+# embedded or shown to anyone -- bookkeeping, like the equipment_id/doc_id
+# content prefix, not content. save_chunks() persists these as real
+# columns (migration_003_knowledge_embeddings_page_range.sql) so
+# retrieval.py can surface a real "Found on Page 243" citation.
+#
+# NOTE: this only changes chunking for documents ingested (or
+# re-ingested) AFTER this ships -- it does nothing for chunks already
+# sitting in knowledge_embeddings from a prior ingestion. Those keep
+# whatever the chunker in place at ingest time produced (flat-window text,
+# no page range) until that document is explicitly re-ingested.
+_MARKDOWN_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")]
 
-def chunk_text(text: str) -> list:
-    words  = text.split()
-    chunks = []
-    start  = 0
-    while start < len(words):
-        end   = min(start + CHUNK_SIZE, len(words))
-        chunk = " ".join(words[start:end]).strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(words):
-            break
-        start = end - CHUNK_OVERLAP
-    return chunks
+
+def _extract_and_strip_page_range(text: str):
+    """
+    Returns (clean_text, page_start, page_end) -- page_start/page_end are
+    None if `text` contains no `<!-- page:N -->` markers at all (e.g. a
+    DOCX source, which never has any, or a chunk that somehow ended up
+    with none) -- treated as "unknown," never defaulted to a guessed page.
+    """
+    pages = [int(m) for m in _PAGE_MARKER_RE.findall(text)]
+    clean = _PAGE_MARKER_RE.sub("", text)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    if not pages:
+        return clean, None, None
+    return clean, min(pages), max(pages)
+
+
+def chunk_markdown(markdown_text: str) -> list:
+    """
+    Returns a list of {"text": str, "page_start": int|None, "page_end": int|None}
+    dicts, ready for save_chunks() -- this is what _run_ingest() calls
+    now instead of chunk_text(). See the module comment above for the
+    two-pass design: structural split first (MarkdownHeaderTextSplitter),
+    then a size-bounded sub-split within each resulting section.
+    """
+    from langchain_text_splitters import MarkdownHeaderTextSplitter
+
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=_MARKDOWN_HEADERS, strip_headers=False,
+    )
+    sections = splitter.split_text(markdown_text)
+
+    results = []
+    for section in sections:
+        heading_path = " > ".join(
+            section.metadata[k] for k in ("h1", "h2", "h3", "h4")
+            if k in section.metadata
+        )
+
+        words = section.page_content.split()
+        if not words:
+            continue
+
+        start = 0
+        while start < len(words):
+            end         = min(start + CHUNK_SIZE, len(words))
+            window_text = " ".join(words[start:end])
+            clean_text, page_start, page_end = _extract_and_strip_page_range(window_text)
+
+            if clean_text:
+                full_text = f"{heading_path}\n{clean_text}" if heading_path else clean_text
+                results.append({
+                    "text": full_text,
+                    "page_start": page_start,
+                    "page_end": page_end,
+                })
+
+            if end == len(words):
+                break
+            start = end - CHUNK_OVERLAP
+
+    return results
 
 
 # ── DB helpers: text chunks ───────────────────────────────────────────────────
@@ -831,11 +1235,22 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
         parses this fixed-shape prefix. The equipment_id copy in this
         prefix is now redundant with the new column for retrieval
         purposes, but kept so that parser doesn't break.
+      - real page_start/page_end columns (migration_003_knowledge_
+        embeddings_page_range.sql -- MUST be applied before this INSERT
+        will work, same ordering caution as migration_002) -- NOT folded
+        into the content prefix, since that convention is already
+        flagged for retirement (see SKILL.md) and there's no reason to
+        grow it further.
 
     The content prefix is always exactly three "key:value | " segments
     followed by the chunk text -- "bom_items" is included even when empty
     so the prefix has a fixed, predictable shape for parsing later
     (see fetch_all_manual_chunks in generate_pm_strategy.py).
+
+    `chunks` is now a list of {"text", "page_start", "page_end"} dicts
+    (see chunk_markdown() in ingest_document.py), not a list of plain
+    strings -- the shape changed together with the Markdown structural
+    chunking rewrite.
 
     Embeddings are generated concurrently (bounded by EMBED_CONCURRENCY)
     instead of one at a time, so large documents (50-100+ pages) complete
@@ -843,16 +1258,19 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     """
     doc_uuid = url_to_uuid(file_url)
 
-    contents = []
+    contents    = []
+    page_ranges = []
     chunks_with_bom = 0
     for chunk in chunks:
-        bom_items = extract_bom_items(chunk)
+        chunk_text_value = chunk["text"]
+        bom_items = extract_bom_items(chunk_text_value)
         if bom_items:
             chunks_with_bom += 1
         bom_field = _encode_bom_items(bom_items)
         contents.append(
-            f"equipment_id:{equipment_id} | doc_id:{doc_uuid} | bom_items:{bom_field} | {chunk}"
+            f"equipment_id:{equipment_id} | doc_id:{doc_uuid} | bom_items:{bom_field} | {chunk_text_value}"
         )
+        page_ranges.append((chunk.get("page_start"), chunk.get("page_end")))
 
     if chunks_with_bom:
         log.info(f"Found parts-list rows in {chunks_with_bom}/{len(chunks)} chunks.")
@@ -866,6 +1284,7 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
         emb_str   = "[" + ",".join(map(str, embedding)) + "]"
         record_id = str(uuid.uuid4())
         chunk_source_id = str(uuid.uuid5(uuid.UUID(doc_uuid), str(i)))
+        page_start, page_end = page_ranges[i]
 
         rows.append((
             record_id,
@@ -875,17 +1294,19 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
             equipment_id,
             content,
             emb_str,
+            page_start,
+            page_end,
         ))
 
     sql = """
         INSERT INTO knowledge_embeddings
             (id, company_id, source_type, source_id, equipment_id, content,
-             embedding, created_at, updated_at)
+             embedding, page_start, page_end, created_at, updated_at)
         VALUES %s
     """
     psycopg2.extras.execute_values(
         conn.cursor(), sql, rows,
-        template="(%s, %s::uuid, %s, %s::uuid, %s::uuid, %s, %s::vector, NOW(), NOW())",
+        template="(%s, %s::uuid, %s, %s::uuid, %s::uuid, %s, %s::vector, %s, %s, NOW(), NOW())",
         page_size=100,
     )
     conn.commit()
@@ -907,24 +1328,37 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     file_bytes = response.content
     log.info(f"Downloaded {len(file_bytes)} bytes from {filename}")
 
-    text = extract_text(file_bytes, filename, file_url)
-    if not text.strip():
+    # extract_markdown() (Textract LAYOUT for PDF, Word heading styles for
+    # DOCX) replaces extract_text() here -- see that function and
+    # chunk_markdown() for why. extract_text()/chunk_text() are kept in
+    # the file, unused by this path, in case something else still wants
+    # flat unstructured text.
+    markdown_text = extract_markdown(file_bytes, filename, file_url)
+    if not markdown_text.strip():
         if filename.lower().endswith(".pdf"):
             raise ValueError(
                 "No text could be extracted from the document. This build "
-                "sends every PDF through Textract unconditionally, so an "
-                "empty result here means Textract itself returned nothing "
-                "for every page (not a native-vs-scanned distinction) -- "
-                "check the CloudWatch logs above for a Textract error: job "
-                "failure, timeout, TEXTRACT_ENABLED is False, or the Lambda "
-                "execution role missing textract:StartDocumentTextDetection "
-                "/ textract:GetDocumentTextDetection / s3:GetObject."
+                "sends every PDF through Textract (LAYOUT analysis) "
+                "unconditionally, so an empty result here means Textract "
+                "itself returned nothing for every page -- check the "
+                "CloudWatch logs above for a Textract error: job failure, "
+                "timeout, TEXTRACT_ENABLED is False, or the Lambda "
+                "execution role missing textract:StartDocumentAnalysis / "
+                "textract:GetDocumentAnalysis / s3:GetObject. (Layout "
+                "analysis needs different IAM actions than the old plain "
+                "text-detection path -- StartDocumentAnalysis/"
+                "GetDocumentAnalysis, not StartDocumentTextDetection/"
+                "GetDocumentTextDetection -- if this used to work and now "
+                "fails with an access-denied error, that permission is "
+                "the first thing to check.)"
             )
         raise ValueError("No text could be extracted from the document.")
-    log.info(f"Extracted {len(text.split())} words.")
+    log.info(f"Extracted {len(markdown_text.split())} words (Markdown).")
 
-    chunks = chunk_text(text)
+    chunks = chunk_markdown(markdown_text)
     log.info(f"Created {len(chunks)} chunks.")
+    with_pages = sum(1 for c in chunks if c.get("page_start") is not None)
+    log.info(f"{with_pages}/{len(chunks)} chunks have a page range attached.")
 
     # Image extraction is PDF-only, and gated behind IMAGE_EXTRACTION_ENABLED
     # (currently False -- see module docstring). Skipping this entirely

@@ -188,6 +188,16 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
     must populate this column on every future INSERT for this to keep
     working; if a document ingested after that migration isn't showing
     up here, check that first.
+
+    Also SELECTs page_start/page_end (migration_003_knowledge_embeddings_
+    page_range.sql -- MUST be applied or this query fails with "column
+    page_start does not exist," same ordering caution as migration_002)
+    so build_context() can surface a real "page 243"-style citation
+    instead of never citing a page, or worse, the model guessing one.
+    NULL for chunks ingested before that migration or before
+    ingest_document.py's Markdown structural chunking rewrite, and always
+    NULL for DOCX-sourced chunks (no fixed page concept) -- both
+    correctly produce no page reference, not a fabricated one.
     """
     try:
         embedding = get_embedding(query)
@@ -196,7 +206,7 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
             with c.cursor() as cur:
                 if equipment_id:
                     cur.execute("""
-                        SELECT source_type, source_id, content,
+                        SELECT source_type, source_id, content, page_start, page_end,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
@@ -206,7 +216,7 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
                     """, (embedding_str, company_id, equipment_id, embedding_str, limit))
                 else:
                     cur.execute("""
-                        SELECT source_type, source_id, content,
+                        SELECT source_type, source_id, content, page_start, page_end,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
@@ -356,19 +366,34 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
         # tagging explicitly rather than hardcoding the label means this
         # stays correct if another source_type ever shows up here) so the
         # model can cite specifically where a fact came from instead of
-        # a vague "our knowledge base."
+        # a vague "our knowledge base." Also tagged with a page reference
+        # when the chunk has one (migration_003_knowledge_embeddings_
+        # page_range.sql / ingest_document.py's Markdown structural
+        # chunking) -- this manual is a scanned PDF with no native text
+        # layer, so a page reference is the only way a technician can
+        # verify an answer against the PHYSICAL book. page_start/page_end
+        # are None for chunks ingested before that migration, or for any
+        # DOCX-sourced chunk (no fixed page concept) -- shown as no page
+        # reference at all in that case, never a guessed one.
         try:
             semantic_results = semantic_search(query, company_id, equipment_id, conn=conn)
             if semantic_results:
-                sem_text = "\nFrom indexed manuals/documents (cite as \"the equipment manual\" unless a more specific source is obvious):"
+                sem_text = "\nFrom indexed manuals/documents (cite as \"the equipment manual\" unless a more specific source is obvious; include the page reference shown in brackets when the model answers from that excerpt):"
                 added = False
                 for r in semantic_results:
                     if r['similarity'] > SEMANTIC_SIMILARITY_THRESHOLD:
-                        sem_text += f"\n- [{r['source_type']}] {_strip_manual_content_prefix(r['content'])}"
+                        page_start, page_end = r.get("page_start"), r.get("page_end")
+                        if page_start and page_end:
+                            page_ref = f" [page {page_start}]" if page_start == page_end else f" [pages {page_start}-{page_end}]"
+                        else:
+                            page_ref = ""
+                        sem_text += f"\n- [{r['source_type']}{page_ref}] {_strip_manual_content_prefix(r['content'])}"
                         sources["semantic"].append({
                             "source_type": r["source_type"],
                             "source_id": str(r["source_id"]),
                             "similarity": float(r["similarity"]),
+                            "page_start": page_start,
+                            "page_end": page_end,
                         })
                         added = True
                 if added:
