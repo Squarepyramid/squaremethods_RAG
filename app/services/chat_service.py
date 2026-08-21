@@ -352,9 +352,23 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
         retry_problems = _detect_unfounded_citations(retry_answer, retrieved["sources"])
 
         if retry_problems:
+            # Logging the actual semantic hits (not just whether any
+            # existed) is the point here, not just "still fabricated" --
+            # this is what tells us, without having to reproduce the
+            # query by hand again, whether the model ignored real manual
+            # content that WAS retrieved (severe -- grounding failing
+            # even with the right answer sitting in context) or whether
+            # nothing relevant was retrieved at all (points back to
+            # semantic_search()/SEMANTIC_SIMILARITY_THRESHOLD, not the
+            # model). retrieved["sources"]["semantic"] has similarity
+            # scores per hit; retrieved["context"] is the exact text the
+            # model saw.
+            semantic_hits = retrieved["sources"]["semantic"]
             print(f"UNFOUNDED CITATION (attempt 2, giving up): query={query!r} "
                   f"equipment_id={equipment_id} still problems={retry_problems!r} "
-                  f"after correction -- using fallback")
+                  f"after correction -- using fallback. "
+                  f"semantic_hits={semantic_hits!r} "
+                  f"context_given={retrieved['context']!r}")
             answer = UNFOUNDED_CITATION_FALLBACK_ANSWER
         else:
             answer = retry_answer
