@@ -504,17 +504,47 @@ def _blocks_to_markdown(blocks: list) -> str:
     splitting, then strip the markers back out before the text is
     embedded or shown to anyone.
 
-    LAYOUT_HEADER/LAYOUT_FOOTER/LAYOUT_PAGE_NUMBER/LAYOUT_FIGURE are
-    skipped -- running page headers/footers and page-number-only blocks
-    aren't useful chunk content, and figures are handled by the separate
-    (currently disabled) image-extraction path, not text content.
-    LAYOUT_TABLE is emitted as plain paragraph text rather than a real
-    Markdown table for now -- table cell geometry parsing is a real gap,
-    flagged rather than silently done wrong; a garbled-but-present table
-    beats a missing one, but revisit if a manual with data-critical
-    tables (specs, tolerances) shows extraction quality problems here.
+    LAYOUT_HEADER/LAYOUT_FOOTER/LAYOUT_FIGURE are skipped from chunk
+    CONTENT -- running page headers/footers aren't useful body text, and
+    figures are handled by the separate (currently disabled) image-
+    extraction path, not text content. LAYOUT_TABLE is emitted as plain
+    paragraph text rather than a real Markdown table for now -- table
+    cell geometry parsing is a real gap, flagged rather than silently
+    done wrong; a garbled-but-present table beats a missing one, but
+    revisit if a manual with data-critical tables (specs, tolerances)
+    shows extraction quality problems here.
+
+    LAYOUT_PAGE_NUMBER blocks are excluded from content the same way, but
+    NOT thrown away -- their text is the manual's own PRINTED page label,
+    which is what a real page marker should cite, not Textract's raw
+    `Page` field. Confirmed-in-production gap this fixes: Textract's
+    `Page` counts from the start of the PDF FILE, with no awareness that
+    a manual's own numbering may start later (unnumbered cover/TOC
+    pages push everything after them out of sync). On the real manual
+    this was built against, a section whose own printed header reads
+    "28" sits on the PDF's 29th physical page -- citing raw file-order
+    would have told a user "page 29" for content the printed book itself
+    labels "28," off by exactly the front-matter page count. Falls back
+    to the raw Textract page index for any page where no LAYOUT_PAGE_NUMBER
+    block was detected, or where its text isn't cleanly a number (e.g. a
+    roman-numeral front-matter page, or a bad OCR read) -- a slightly
+    file-order-relative citation beats one built from garbage text.
     """
     blocks_by_id = {b["Id"]: b for b in blocks if b.get("Id")}
+
+    printed_page_labels = {}
+    for b in blocks:
+        if b.get("BlockType") != "LAYOUT_PAGE_NUMBER":
+            continue
+        raw_page = b.get("Page", 1)
+        if raw_page in printed_page_labels:
+            continue  # first one found for this raw page wins; defensive against duplicates
+        label_text = _resolve_block_text(b, blocks_by_id, join=" ").strip()
+        if label_text.isdigit():
+            printed_page_labels[raw_page] = int(label_text)
+
+    def _cited_page(raw_page):
+        return printed_page_labels.get(raw_page, raw_page)
 
     layout_blocks = [b for b in blocks if str(b.get("BlockType", "")).startswith("LAYOUT_")]
     layout_blocks = [b for b in layout_blocks if b.get("BlockType") not in _LAYOUT_SKIP_TYPES]
@@ -550,13 +580,13 @@ def _blocks_to_markdown(blocks: list) -> str:
             text = _resolve_block_text(block, blocks_by_id, join=" ")
             if text:
                 lines.append(f"{_LAYOUT_HEADER_TYPES[block_type]} {text}")
-                lines.append(f"<!-- page:{page} -->")
-                last_marked_page = page
+                lines.append(f"<!-- page:{_cited_page(page)} -->")
+                last_marked_page = page  # raw page, for change-detection below -- see _cited_page()
             lines.append("")
             continue
 
         if page != last_marked_page:
-            lines.append(f"<!-- page:{page} -->")
+            lines.append(f"<!-- page:{_cited_page(page)} -->")
             last_marked_page = page
 
         if block_type == "LAYOUT_LIST":
