@@ -1392,7 +1392,7 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
         "company_id":   company_id,
         "source_type":  "manual",
         "filename":     filename,
-        "words":        len(text.split()),
+        "words":        len(markdown_text.split()),
         "chunks":       len(chunks),
         "images":       len(images),
         "status":       "ingested"
