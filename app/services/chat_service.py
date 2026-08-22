@@ -86,21 +86,92 @@ Equipment Knowledge (from our database only):
 # hide fabricated answers behind a job aid link instead of just answering.
 # Gating at the request level means it's not offered the tool at all on a
 # plain question -- it literally can't call it.
-JOB_AID_INTENT_PHRASES = (
-    "create a job aid", "make a job aid", "make this a job aid", "make that a job aid",
-    "save this as a job aid", "save that as a job aid",
-    "save this as a procedure", "save that as a procedure",
-    "turn this into a job aid", "turn that into a job aid",
-    "turn this into a procedure", "turn that into a procedure",
-    "write this up", "write that up", "write up a job aid",
-    "document this as", "document that as", "document this for",
-    "generate a job aid", "add a job aid",
+#
+# CONFIRMED-IN-PRODUCTION FAILURE this regex replaced a fixed phrase list
+# with: a user asked "create job aid for the maintenance of this
+# equipment" -- unmatched by the old exact-substring list, which only had
+# "create A job aid" (with the article). Because the tool wasn't offered,
+# the model (reasonably, given it had no tool) answered in prose instead
+# and asked "would you like me to proceed?" The user replied "yes" -- also
+# unmatched (no phrase covers a bare confirmation) -- so the tool STILL
+# wasn't offered, yet the model's prose reply claimed to have created/
+# named a job aid, which _find_unfounded_job_aid_citations() correctly
+# caught as fabricated (there was no real one -- the tool was never
+# called) and forced UNFOUNDED_CITATION_FALLBACK_ANSWER. The user-visible
+# symptom ("I don't have that on file...") was the guard doing its job;
+# the actual bug was upstream, in intent detection never granting the
+# tool in the first place.
+#
+# Two fixes, both still hard gates (never just prompt-level persuasion --
+# see the regression above):
+#   1. _JOB_AID_INTENT_RE: a creation verb (create/make/save/turn/write
+#      up/document/generate/add) within a few words of "job aid" or
+#      "procedure", tolerant of missing/extra articles ("create job aid",
+#      "create a job aid", "create the job aid" all match) instead of
+#      requiring one of a fixed list of exact phrases. Still anchored to
+#      BOTH a real creation verb AND the specific job-aid/procedure noun
+#      -- a plain question like "what's the maintenance procedure for
+#      this" has no creation verb near "procedure" and won't match, so
+#      this doesn't reopen the over-eager-tool-use regression the
+#      original gate was built to prevent.
+#   2. _JOB_AID_CONFIRMATION_RE + _JOB_AID_OFFER_RE: handles the "yes"
+#      turn specifically. A bare confirmation ("yes"/"sure"/"go ahead"/
+#      etc.) only counts as job-aid intent when the IMMEDIATELY PRECEDING
+#      assistant message actually offered to create one (mentions "job
+#      aid" together with offer language like "would you like" / "let me
+#      know if you'd like" / "want me to") -- see _wants_job_aid()'s
+#      `last_assistant_message` param and its call site in
+#      handle_chat_turn(), which pulls that from history. A "yes" that
+#      isn't confirming a job-aid offer (e.g. confirming something else
+#      entirely) still correctly does NOT grant the tool.
+_JOB_AID_INTENT_RE = re.compile(
+    r"\b(?:creat\w*|mak\w*|sav\w*|turn|writ\w*\s+up|document\w*|generat\w*|add)\b"
+    r"(?:\s+\w+){0,3}?\s+\b(?:job aid|procedure)s?\b",
+    re.IGNORECASE,
+)
+
+_JOB_AID_CONFIRMATION_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|"
+    r"please do|go ahead|do it|please proceed|proceed|sounds good|"
+    r"please create it|create it|make it)\W*$",
+    re.IGNORECASE,
+)
+
+# Deliberately NOT one proximity-bounded regex (a "job aid ... would you
+# like" pattern within N characters) -- tried that first and it would
+# have MISSED the actual transcript this was built from: the assistant's
+# real offer said "...job aids listed below. Please let me know if you
+# need me to create or provide any of these specific job aids. I'm happy
+# to create a more detailed job aid document for you. Just let me know if
+# you would like me to proceed with that." -- the mention and the offer
+# phrase land in different sentences, AND the mentions are plural ("job
+# aids"), which a bare `\bjob aid\b` (no trailing s) doesn't match at all
+# (the word boundary after "aid" fails when immediately followed by "s").
+# Two independent, unanchored checks over the whole message instead: this
+# is still narrowly gated overall (only even consulted when the CURRENT
+# message is a bare confirmation -- see _wants_job_aid() -- and only
+# against the single immediately-preceding assistant message, never the
+# full conversation), so dropping proximity/sentence-boundary requirements
+# here doesn't reopen the over-eager-tool-use regression -- it only
+# widens what counts as "the assistant just offered."
+_JOB_AID_MENTION_RE = re.compile(r"\bjob aids?\b", re.IGNORECASE)
+_JOB_AID_OFFER_LANGUAGE_RE = re.compile(
+    r"\b(would you like|let me know|want me to|shall i|should i|do you want)\b",
+    re.IGNORECASE,
 )
 
 
-def _wants_job_aid(query: str) -> bool:
-    q = query.lower()
-    return any(phrase in q for phrase in JOB_AID_INTENT_PHRASES)
+def _wants_job_aid(query: str, last_assistant_message: str = None) -> bool:
+    if _JOB_AID_INTENT_RE.search(query):
+        return True
+    # Bare confirmation only counts if the assistant's own last turn was
+    # actually offering to create a job aid -- see the comment above.
+    if (last_assistant_message
+            and _JOB_AID_CONFIRMATION_RE.match(query.strip())
+            and _JOB_AID_MENTION_RE.search(last_assistant_message)
+            and _JOB_AID_OFFER_LANGUAGE_RE.search(last_assistant_message)):
+        return True
+    return False
 
 
 # Deterministic post-generation guard against a specific, confirmed-in-
@@ -577,9 +648,27 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     messages.append({"role": "user", "content": query})
 
     # Tool is only offered when this specific message signals creation
-    # intent -- see JOB_AID_INTENT_PHRASES above. tools=None means Claude
-    # isn't given the option to call it at all this turn.
-    tools_for_turn = chat_tools.ALL_TOOLS if _wants_job_aid(query) else None
+    # intent -- see _wants_job_aid() above. tools=None means Claude isn't
+    # given the option to call it at all this turn.
+    #
+    # last_assistant_message (the previous turn's reply, if any) is passed
+    # in so a bare "yes"/"go ahead" confirming an offer the ASSISTANT just
+    # made ("...would you like me to create a job aid for this?") also
+    # counts as intent -- see _wants_job_aid()'s docstring/comments for
+    # the real production case (asked to create a job aid, phrase-matching
+    # missed it, model asked to confirm instead of calling the tool, user
+    # said "yes", still no tool offered, model's prose claimed a job aid
+    # existed anyway, and the citation guard correctly nuked that
+    # fabrication -- leaving the user stuck with the fallback message and
+    # no actual job aid). Pulled from history, not from the `messages`
+    # list built above, since that list also mixes in the rolling-summary
+    # placeholder turns.
+    last_assistant_message = next(
+        (m["content"] for m in reversed(history["messages"])
+         if m["role"] == "assistant" and isinstance(m["content"], str)),
+        None,
+    )
+    tools_for_turn = chat_tools.ALL_TOOLS if _wants_job_aid(query, last_assistant_message) else None
 
     tool_call_log = []
     response = call_claude(
