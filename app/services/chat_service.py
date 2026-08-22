@@ -50,11 +50,13 @@ GROUNDING:
 - If nothing in the block addresses the specific symptom described, treat it as not covered -- follow the WHEN YOU DON'T HAVE THE ANSWER rule -- even when related content about the same component or equipment exists. Do not offer the closest topically-related entry as if it answers a different symptom; if you mention it at all, be explicit that it covers a different issue than the one asked about.
 
 CITE YOUR SOURCE:
-- The Equipment Knowledge block is labeled by where each piece came from: "Job Aid: <title>" sections, "Known Failure Modes" (aggregated from logged contributions), and manual/document excerpts. Say which one a fact came from, briefly and naturally -- e.g. "According to the equipment manual, ..." / "Per the 'Pump PM1' job aid, ..." / "Per logged failure mode records, ...".
+- The Equipment Knowledge block is labeled by where each piece came from: "Job Aid: <title>" sections, "Known Failure Modes" (aggregated from logged contributions), and manual/document excerpts. Say which one a fact came from, briefly and naturally -- e.g. "According to the equipment manual, ..." / "Per the 'Pump PM1' job aid, ..." / "Per the 'Conveyor Belt Slipping' failure mode, ...".
 - If a job aid is your source, name it (its title) so the user can find it, not just "a job aid."
+- This equipment may have MORE THAN ONE failure mode logged against it -- a resolution by itself doesn't tell the user which failure/symptom it was logged under. If a failure mode is your source, name it (its title, exactly as shown under "Known Failure Modes") the same way you would a job aid, e.g. "Per the 'Conveyor Belt Slipping' failure mode, ..." -- not just "per logged failure mode records" with no title, which is ambiguous whenever more than one failure mode is listed.
 - Don't force a citation onto every single sentence if that gets repetitive -- one clear attribution per distinct fact or source is enough, not one per word.
 - If you're not sure which specific source a fact came from, still say generally where it's from (e.g. "from our equipment records") rather than omitting attribution -- never present database-sourced facts as if they were your own general knowledge.
 - A manual excerpt may be tagged with a page reference in brackets, like "[manual, page 243]" or "[manual, pages 243-244]" -- this equipment's manual is a scanned document, so the user may want to check the physical book. When an excerpt you're answering from has one, say it naturally, e.g. "Found on page 243 of the manual, ..." or "...(page 243)." ONLY state a page number that is literally shown in brackets in the block below for the excerpt you're actually using -- never estimate, round, infer, or recall a page number from anywhere else, and never state one at all when the excerpt you're citing has no page reference shown.
+- This equipment may have MORE THAN ONE manual/document on file (e.g. a separate Operator Manual and Parts Catalog) -- a page number by itself does not tell the user which physical book to open. When an excerpt shows a "document:" name in brackets alongside its page reference, state BOTH together, e.g. "page 11 of the Operator Manual" or "page 11 of PARTS_CATALOG.pdf" (use the document name as shown -- don't invent a nicer-sounding title for it). If an excerpt has a page reference but NO document name shown, cite the page number alone as before -- don't guess which document it belongs to.
 
 FORMATTING -- a technician is reading this on a phone or tablet in the field, make it easy to scan:
 - Never write one dense block of text. Break your answer into short paragraphs (1-3 sentences each), separated by a blank line.
@@ -115,24 +117,40 @@ def _wants_job_aid(query: str) -> bool:
 # get_failure_modes()), so any claim referencing a category that came
 # back completely empty is fabricated with certainty, not suspicion.
 #
-# Two different precision levels, because the two fabrications we've
-# actually seen had different shapes:
-#   - job_aids: PRECISE. CHAT_SYSTEM_PROMPT_TEMPLATE's CITE YOUR SOURCE
-#     section instructs a specific citation style ("Per the 'Pump PM1'
-#     job aid, ..."), and both observed fabrications matched it exactly
-#     -- so this extracts the quoted title and diffs it against the real
-#     retrieved titles. Catches an invented EXTRA title even when some
-#     real job aids exist for this equipment.
-#   - failure_modes: COARSE. The two failure-mode fabrications we saw
-#     did NOT share one consistent citation shape (one quoted a title,
-#     one didn't), so this instead checks the category as a whole: if
-#     retrieved["sources"]["failure_modes"] came back completely empty
-#     for this turn, but the words "failure mode" appear anywhere in the
-#     answer, that reference cannot be legitimate -- there were zero
-#     real ones to reference. Coarser, no per-title diffing, but doesn't
-#     depend on guessing a citation format.
+# Originally two different precision levels, because the two fabrications
+# we'd actually seen had different shapes:
+#   - job_aids: PRECISE from the start. CHAT_SYSTEM_PROMPT_TEMPLATE's CITE
+#     YOUR SOURCE section instructs a specific citation style ("Per the
+#     'Pump PM1' job aid, ..."), and both observed fabrications matched it
+#     exactly -- so this extracts the quoted title and diffs it against
+#     the real retrieved titles. Catches an invented EXTRA title even when
+#     some real job aids exist for this equipment.
+#   - failure_modes: was COARSE-ONLY. The two failure-mode fabrications
+#     we'd seen did NOT share one consistent citation shape (one quoted a
+#     title, one didn't), and at the time the system prompt didn't ask for
+#     a specific title anyway ("Per logged failure mode records..." was
+#     the modeled example) -- so this only checked the category as a
+#     whole: retrieved["sources"]["failure_modes"] completely empty but
+#     the words "failure mode" appear anywhere in the answer means that
+#     reference cannot be legitimate. No per-title diffing.
+#
+# Now PRECISE for both, matching real usage: equipment can have MORE THAN
+# ONE failure mode logged against it (confirmed), same as it can have
+# multiple job aids -- a citation that doesn't name which one is exactly
+# the ambiguity problem page citations had with multiple manuals. The
+# system prompt's CITE YOUR SOURCE section now asks for a specific quoted
+# failure-mode title, same style as job aids ("Per the 'Conveyor Belt
+# Slipping' failure mode, ..."), so this can now diff a quoted title
+# against the real retrieved ones too. The COARSE whole-category check is
+# kept and runs FIRST, unconditionally -- it's still the only thing that
+# catches a generic, unquoted "per logged failure mode records" reference
+# when zero real failure modes exist at all (the precise check would find
+# no quoted title to even compare, and would otherwise miss that case).
 _QUOTED_JOB_AID_CITATION_RE = re.compile(
     r"['‘’]([^'‘’]{2,80})['‘’]\s+job aid", re.IGNORECASE
+)
+_QUOTED_FAILURE_MODE_CITATION_RE = re.compile(
+    r"['‘’]([^'‘’]{2,80})['‘’]\s+failure mode", re.IGNORECASE
 )
 _FAILURE_MODE_KEYWORD_RE = re.compile(r"failure mode", re.IGNORECASE)
 
@@ -204,6 +222,20 @@ def _find_unfounded_page_citations(answer: str, semantic_sources: list) -> list:
     (page_start/page_end both None -- pre-migration data, or a DOCX
     source) contributes nothing to check against, same as it contributes
     no page citation to the prompt in the first place.
+
+    KNOWN LIMITATION: this only checks the page NUMBER against the union
+    of every retrieved chunk's range, regardless of which document that
+    range belongs to (migration_004_knowledge_embeddings_doc_id.sql added
+    a filename per chunk, since one equipment can have multiple manuals
+    ingested against it -- see retrieval.py's build_context()). A page
+    number that's real for Document A but gets attributed in the answer's
+    prose to Document B's name would NOT be caught here -- only a page
+    number outside every real range is. Catching a doc-name/page mismatch
+    would need parsing which document name the model associated with
+    which cited page out of free-form prose, which is a much less
+    reliable check than this one; left as a follow-up if that failure
+    mode is ever actually observed, rather than building a fragile guard
+    against a theoretical one now.
     """
     real_ranges = [
         (s["page_start"], s["page_end"])
@@ -255,14 +287,39 @@ def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
     return [title for title in cited_titles if title.lower() not in real_titles]
 
 
+def _find_unfounded_failure_mode_citations(answer: str, real_failure_modes: list) -> list:
+    """
+    Same idea as _find_unfounded_job_aid_citations(), for failure modes.
+    Returns the list of failure-mode titles `answer` cites (in the
+    "'Title' failure mode" style the system prompt now asks for) that do
+    NOT match any title in `real_failure_modes` (retrieved["sources"]
+    ["failure_modes"] for this same turn). Non-empty means the model
+    named a specific failure mode it was never given -- e.g. it correctly
+    had SOME real failure modes to work with, but attributed a resolution
+    to a title that doesn't exist among them (as distinct from citing
+    "failure mode" generically with zero real ones at all, which
+    _FAILURE_MODE_KEYWORD_RE + the empty-category check in
+    _detect_unfounded_citations() already catches on its own).
+    """
+    real_titles = {fm["title"].strip().lower() for fm in real_failure_modes if fm.get("title")}
+    cited_titles = {m.group(1).strip() for m in _QUOTED_FAILURE_MODE_CITATION_RE.finditer(answer)}
+    return [title for title in cited_titles if title.lower() not in real_titles]
+
+
 def _detect_unfounded_citations(answer: str, sources: dict, context: str) -> dict:
     """
     Runs every category check against one turn's answer + its real
     retrieved sources/context. Returns a dict describing what was found,
     e.g. {"job_aids": ["Case Sealer Troubleshooting"], "failure_modes":
     True, "numeric_specs": ["1750 RPM"]} -- an empty dict means nothing
-    suspicious was found. Add a new category check here rather than
-    bolting on a separate parallel guard elsewhere.
+    suspicious was found. `problems["failure_modes"]` is either `True`
+    (the coarse case: a generic "failure mode" reference with ZERO real
+    failure modes retrieved this turn at all) or a non-empty list of
+    specific fabricated titles (the precise case: some real failure modes
+    existed, but a quoted title in the answer doesn't match any of them)
+    -- see _build_citation_correction() for how each shape is worded.
+    Add a new category check here rather than bolting on a separate
+    parallel guard elsewhere.
 
     `context` (retrieved["context"], the literal text the model saw) is
     needed for the numeric_specs check -- unlike job_aids/failure_modes,
@@ -276,8 +333,21 @@ def _detect_unfounded_citations(answer: str, sources: dict, context: str) -> dic
     if unfounded_job_aids:
         problems["job_aids"] = unfounded_job_aids
 
-    if not (sources.get("failure_modes") or []) and _FAILURE_MODE_KEYWORD_RE.search(answer):
+    real_failure_modes = sources.get("failure_modes") or []
+    if not real_failure_modes and _FAILURE_MODE_KEYWORD_RE.search(answer):
+        # Coarse case first: zero real failure modes at all, but the
+        # answer mentions the category generically (no title to diff
+        # against, or the model didn't quote one) -- certainly fabricated.
         problems["failure_modes"] = True
+    else:
+        # Precise case: some real failure modes exist for this equipment
+        # (which, per confirmed usage, can be more than one) -- diff any
+        # quoted failure-mode title in the answer against the real ones,
+        # same as job_aids. Catches "attributed to a failure mode that
+        # doesn't exist" even though the category itself is legitimate.
+        unfounded_failure_modes = _find_unfounded_failure_mode_citations(answer, real_failure_modes)
+        if unfounded_failure_modes:
+            problems["failure_modes"] = unfounded_failure_modes
 
     unfounded_specs = _find_unfounded_numeric_specs(answer, context)
     if unfounded_specs:
@@ -306,9 +376,28 @@ def _build_citation_correction(problems: dict, sources: dict) -> str:
                       f"The ONLY job aids that actually exist for this equipment are: {real_desc}")
 
     if "failure_modes" in problems:
-        lines.append("- You referenced \"failure mode\" records, but there are NO logged "
-                      "failure modes on file for this equipment at all -- do not mention "
-                      "failure modes, known issues, or logged records in your answer.")
+        fm_problem = problems["failure_modes"]
+        if fm_problem is True:
+            # Coarse case -- see _detect_unfounded_citations(): zero real
+            # failure modes retrieved this turn at all.
+            lines.append("- You referenced \"failure mode\" records, but there are NO logged "
+                          "failure modes on file for this equipment at all -- do not mention "
+                          "failure modes, known issues, or logged records in your answer.")
+        else:
+            # Precise case -- fm_problem is a list of cited titles that
+            # don't match any real one, mirroring the job_aids branch
+            # above. Real failure modes DO exist here (that's why the
+            # coarse branch didn't fire); this equipment may have more
+            # than one, so list all of them so the retry can match a
+            # resolution to the correct title instead of inventing one.
+            cited = ", ".join(f"'{t}'" for t in fm_problem)
+            real = sources.get("failure_modes") or []
+            real_desc = ", ".join(f"'{fm['title']}'" for fm in real if fm.get("title"))
+            lines.append(f"- You cited failure mode(s) {cited}, which do not exist. "
+                          f"The ONLY failure modes that actually exist for this equipment are: "
+                          f"{real_desc}. If you're not sure which one a resolution belongs to, "
+                          f"name the one it's actually listed under in the Equipment Knowledge "
+                          f"block rather than inventing a title.")
 
     if "numeric_specs" in problems:
         cited = ", ".join(problems["numeric_specs"])
@@ -321,19 +410,31 @@ def _build_citation_correction(problems: dict, sources: dict) -> str:
     if "page_citations" in problems:
         cited = ", ".join(problems["page_citations"])
         real = sources.get("semantic") or []
+        # Pairs each real range with its filename (may be None) so the
+        # correction can tell the model WHICH document a valid page
+        # belongs to, not just that some valid page exists -- relevant
+        # once an equipment has more than one manual on file (see
+        # _find_unfounded_page_citations' KNOWN LIMITATION comment: this
+        # guard itself doesn't check document identity, but the retry
+        # prompt can still nudge the model toward citing correctly).
         real_pages = sorted({
-            (s["page_start"], s["page_end"]) for s in real
+            (s["page_start"], s["page_end"], s.get("filename")) for s in real
             if s.get("page_start") is not None
         })
+        def _describe(a, b, fname):
+            page_desc = f"page {a}" if a == b else f"pages {a}-{b}"
+            return f"{page_desc} ({fname})" if fname else page_desc
         real_desc = (
-            ", ".join(f"page {a}" if a == b else f"pages {a}-{b}" for a, b in real_pages)
+            ", ".join(_describe(a, b, fname) for a, b, fname in real_pages)
             if real_pages else "none -- no retrieved excerpt this turn has a page reference at all"
         )
         lines.append(f"- You cited {cited}, which does NOT match the page range of any excerpt "
                       f"actually retrieved for this turn. The only page reference(s) actually "
                       f"available this turn are: {real_desc}. Only state a page number that is "
                       f"literally shown in brackets next to the excerpt you're citing -- if that "
-                      f"excerpt has no page reference shown, don't state one for it.")
+                      f"excerpt has no page reference shown, don't state one for it. If an excerpt "
+                      f"shows a document name next to its page reference, state both together -- "
+                      f"this equipment may have more than one manual on file.")
 
     return CITATION_CORRECTION_TEMPLATE.format(problem_lines="\n".join(lines))
 

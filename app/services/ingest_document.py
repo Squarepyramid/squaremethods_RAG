@@ -1040,9 +1040,13 @@ def chunk_markdown(markdown_text: str) -> list:
 def clear_document_chunks(conn, file_url: str, company_id: str):
     """
     Remove all chunks for a specific document identified by file URL.
-    Matches on the doc_id prefix embedded in the content column.
-    Called when a document is deleted or re-uploaded.
-    Does not affect other documents on the same node.
+    Matches on the real doc_id column (migration_004_knowledge_embeddings_
+    doc_id.sql -- MUST be applied before this runs, same ordering caution
+    as migration_002/003) instead of the old `content LIKE
+    '%doc_id:{uuid}%'` scan -- exact and indexed
+    (idx_knowledge_embeddings_company_doc), same upgrade migration_002
+    made for equipment_id. Called when a document is deleted or
+    re-uploaded. Does not affect other documents on the same node.
     """
     doc_uuid = url_to_uuid(file_url)
     with conn.cursor() as cur:
@@ -1050,8 +1054,8 @@ def clear_document_chunks(conn, file_url: str, company_id: str):
             DELETE FROM knowledge_embeddings
             WHERE company_id = %s::uuid
             AND source_type = 'manual'
-            AND content LIKE %s
-        """, (company_id, f"%doc_id:{doc_uuid}%"))
+            AND doc_id = %s::uuid
+        """, (company_id, doc_uuid))
         deleted = cur.rowcount
     conn.commit()
     log.info(f"Removed {deleted} chunks for document {file_url}")
@@ -1246,7 +1250,8 @@ async def embed_chunks_concurrently(contents: list) -> list:
     return [embedding for _, embedding in results]
 
 
-def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id: str):
+def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id: str,
+                 filename: str = None):
     """
     Embed and save all chunks. Each chunk gets:
       - a unique source_id derived from (doc_uuid, chunk_index) via uuid5
@@ -1257,14 +1262,27 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
         INSERT below will fail with "column equipment_id does not exist"
         otherwise) -- this is what retrieval.py's semantic_search() now
         filters on directly for equipment-scoped chat retrieval
+      - real doc_id and filename columns (migration_004_knowledge_
+        embeddings_doc_id.sql -- MUST be applied before this INSERT will
+        work, same ordering caution as migration_002/003). doc_id is what
+        clear_document_chunks() now matches on directly instead of a
+        content LIKE scan. filename is new: an equipment node can have
+        MORE THAN ONE manual ingested against it (e.g. a separate
+        Operator Manual and Parts Catalog on the same equipment_id), so a
+        page number alone ("page 11") is ambiguous between them --
+        retrieval.py surfaces this filename alongside the page reference
+        so a citation can say which physical document to open, not just
+        which page of an unnamed one. There is no human-authored "title"
+        anywhere in this system (IngestDocumentRequest carries no title
+        field) -- the ingested file's own name is the only label
+        available, so that's what's stored, verbatim as passed in.
       - a content prefix with equipment_id, doc_id, and (NEW) any BOM
         item/part-number pairs found in that chunk's text -- still
-        written for document-scoped deletion (clear_document_chunks,
-        doc_id has no column of its own) and for
-        fetch_all_manual_chunks() in generate_pm_strategy.py, which
-        parses this fixed-shape prefix. The equipment_id copy in this
-        prefix is now redundant with the new column for retrieval
-        purposes, but kept so that parser doesn't break.
+        written for fetch_all_manual_chunks() in generate_pm_strategy.py,
+        which parses this fixed-shape prefix. The equipment_id/doc_id
+        copies in this prefix are now redundant with the real columns for
+        retrieval and deletion purposes, but kept so that parser doesn't
+        break.
       - real page_start/page_end columns (migration_003_knowledge_
         embeddings_page_range.sql -- MUST be applied before this INSERT
         will work, same ordering caution as migration_002) -- NOT folded
@@ -1281,6 +1299,12 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
     (see chunk_markdown() in ingest_document.py), not a list of plain
     strings -- the shape changed together with the Markdown structural
     chunking rewrite.
+
+    `filename` is the caller's already-computed display name for this
+    document (see _run_ingest: `file_url.split("/")[-1].split("?")[0]`) --
+    optional/None only so existing direct callers of this function (if
+    any, outside _run_ingest) don't break; every real ingest path passes
+    it.
 
     Embeddings are generated concurrently (bounded by EMBED_CONCURRENCY)
     instead of one at a time, so large documents (50-100+ pages) complete
@@ -1326,17 +1350,19 @@ def save_chunks(conn, chunks: list, file_url: str, equipment_id: str, company_id
             emb_str,
             page_start,
             page_end,
+            doc_uuid,
+            filename,
         ))
 
     sql = """
         INSERT INTO knowledge_embeddings
             (id, company_id, source_type, source_id, equipment_id, content,
-             embedding, page_start, page_end, created_at, updated_at)
+             embedding, page_start, page_end, doc_id, filename, created_at, updated_at)
         VALUES %s
     """
     psycopg2.extras.execute_values(
         conn.cursor(), sql, rows,
-        template="(%s, %s::uuid, %s, %s::uuid, %s::uuid, %s, %s::vector, %s, %s, NOW(), NOW())",
+        template="(%s, %s::uuid, %s, %s::uuid, %s::uuid, %s, %s::vector, %s, %s, %s::uuid, %s, NOW(), NOW())",
         page_size=100,
     )
     conn.commit()
@@ -1409,7 +1435,7 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     conn = get_db_connection()
     try:
         clear_document_chunks(conn, file_url, company_id)
-        save_chunks(conn, chunks, file_url, equipment_id, company_id)
+        save_chunks(conn, chunks, file_url, equipment_id, company_id, filename=filename)
 
         if IMAGE_EXTRACTION_ENABLED:
             clear_document_images(conn, file_url, company_id)

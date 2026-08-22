@@ -198,6 +198,14 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
     ingest_document.py's Markdown structural chunking rewrite, and always
     NULL for DOCX-sourced chunks (no fixed page concept) -- both
     correctly produce no page reference, not a fabricated one.
+
+    Also SELECTs filename (migration_004_knowledge_embeddings_doc_id.sql
+    -- MUST be applied or this query fails with "column filename does not
+    exist," same ordering caution) -- an equipment node can have MORE
+    THAN ONE manual ingested against it, so a bare page number is
+    ambiguous between them; build_context() attaches this filename to the
+    page reference so a citation says which physical document to check.
+    NULL for chunks ingested before that migration.
     """
     try:
         embedding = get_embedding(query)
@@ -206,7 +214,7 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
             with c.cursor() as cur:
                 if equipment_id:
                     cur.execute("""
-                        SELECT source_type, source_id, content, page_start, page_end,
+                        SELECT source_type, source_id, content, page_start, page_end, filename,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
@@ -216,7 +224,7 @@ def semantic_search(query: str, company_id: str, equipment_id: str = None,
                     """, (embedding_str, company_id, equipment_id, embedding_str, limit))
                 else:
                     cur.execute("""
-                        SELECT source_type, source_id, content, page_start, page_end,
+                        SELECT source_type, source_id, content, page_start, page_end, filename,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM knowledge_embeddings
                         WHERE company_id = %s::uuid
@@ -247,7 +255,8 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
               "job_aids": [{"id","title","category","url"}, ...],
               "images": [{"job_aid_id","url","caption"}, ...],
               "failure_modes": [{"id","title","status"}, ...],
-              "semantic": [{"source_type","source_id","similarity"}, ...],
+              "semantic": [{"source_type","source_id","similarity",
+                            "page_start","page_end","filename"}, ...],
           }
         }
 
@@ -375,25 +384,39 @@ def build_context(equipment_path: str, company_id: str, query: str) -> dict:
         # are None for chunks ingested before that migration, or for any
         # DOCX-sourced chunk (no fixed page concept) -- shown as no page
         # reference at all in that case, never a guessed one.
+        #
+        # The page reference also carries the source filename when known
+        # (migration_004_knowledge_embeddings_doc_id.sql) -- confirmed:
+        # one equipment node can have MORE THAN ONE manual ingested
+        # against it (e.g. an Operator Manual and a separate Parts
+        # Catalog), so "page 11" alone is ambiguous between them. Two
+        # different chunks retrieved in the same turn can legitimately
+        # have different filenames, so this is per-excerpt, not a single
+        # document name for the whole block. filename is None for chunks
+        # ingested before that migration -- shown as just a bare page
+        # reference in that case, same as always for pre-migration data.
         try:
             semantic_results = semantic_search(query, company_id, equipment_id, conn=conn)
             if semantic_results:
-                sem_text = "\nFrom indexed manuals/documents (cite as \"the equipment manual\" unless a more specific source is obvious; include the page reference shown in brackets when the model answers from that excerpt):"
+                sem_text = "\nFrom indexed manuals/documents (cite as \"the equipment manual\" unless a more specific source is obvious; when an excerpt shows a document name AND a page reference in brackets, state BOTH together, e.g. \"page 11 of the Operator Manual,\" not just the page number -- this equipment may have more than one manual on file, so the page number alone doesn't tell the user which book to check):"
                 added = False
                 for r in semantic_results:
                     if r['similarity'] > SEMANTIC_SIMILARITY_THRESHOLD:
                         page_start, page_end = r.get("page_start"), r.get("page_end")
+                        filename = r.get("filename")
                         if page_start and page_end:
                             page_ref = f" [page {page_start}]" if page_start == page_end else f" [pages {page_start}-{page_end}]"
                         else:
                             page_ref = ""
-                        sem_text += f"\n- [{r['source_type']}{page_ref}] {_strip_manual_content_prefix(r['content'])}"
+                        doc_ref = f" [document: {filename}]" if filename else ""
+                        sem_text += f"\n- [{r['source_type']}{doc_ref}{page_ref}] {_strip_manual_content_prefix(r['content'])}"
                         sources["semantic"].append({
                             "source_type": r["source_type"],
                             "source_id": str(r["source_id"]),
                             "similarity": float(r["similarity"]),
                             "page_start": page_start,
                             "page_end": page_end,
+                            "filename": filename,
                         })
                         added = True
                 if added:
