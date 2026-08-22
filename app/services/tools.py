@@ -16,6 +16,21 @@ explicit that image URLs must be copied verbatim from a knowledge record
 and never invented. A chat-authored job aid has no such source, so every
 step it creates gets image=None -- a human can attach real images during
 review.
+
+CREATE_JOB_AID_TOOL's description and its steps[].instruction field
+description both carry explicit formatting rules for a step's
+instruction text: when a step is really more than one distinct action,
+it should read as its own numbered sub-list (1, 2, 3, ... always
+restarting at 1) with a blank line between each item, not a single dense
+paragraph. That internal numbering is deliberately independent of the
+step's own `step` number (the job aid's overall step count) -- the two
+are different counters and must not be conflated. Enforced purely
+through these tool/schema descriptions (same approach chat_service.py's
+FORMATTING section uses for chat answers), not by post-processing the
+model's text in _handle_create_job_aid() -- splitting arbitrary prose
+into a numbered list programmatically (e.g. on sentence boundaries) is
+unreliable (decimals, abbreviations, etc.), whereas the model already
+knows which parts of its own generated instruction are separate actions.
 """
 from app.services.generate_job_aid import save_job_aid, make_slug
 from app.services.retrieval import build_job_aid_url
@@ -33,7 +48,20 @@ CREATE_JOB_AID_TOOL = {
         "just saves a copy. The job aid is saved as a draft for a human "
         "to review and publish -- it is never shown to technicians "
         "automatically. Tell the user it's a draft awaiting review and "
-        "share the link."
+        "share the link.\n\n"
+        "FORMATTING each step's `instruction` text: a technician reads "
+        "this in the field, so it must be easy to scan, not a dense "
+        "paragraph. If a step is really more than one distinct action "
+        "(e.g. \"isolate power, remove the cover, inspect the seal, "
+        "reassemble\"), write those actions as their own numbered list "
+        "INSIDE that instruction, always starting at 1 -- \"1. ...\", "
+        "\"2. ...\", \"3. ...\" -- with a blank line between each numbered "
+        "line. This numbering is separate from, and independent of, the "
+        "step's own `step` number in the `steps` array below -- e.g. "
+        "overall step 3 of the job aid can still internally list actions "
+        "1, 2, 3, never continuing the count from 3. If a step is genuinely "
+        "one single action, a plain sentence is fine -- don't force a list "
+        "of one item."
     ),
     "input_schema": {
         "type": "object",
@@ -61,7 +89,18 @@ CREATE_JOB_AID_TOOL = {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string", "description": "Optional short step title."},
-                        "instruction": {"type": "string", "description": "What to do in this step."},
+                        "instruction": {
+                            "type": "string",
+                            "description": (
+                                "What to do in this step. If this step covers more than "
+                                "one distinct action, format it as its own numbered list "
+                                "starting at 1 (\"1. ...\", \"2. ...\", \"3. ...\"), with a "
+                                "blank line between each numbered line -- this numbering "
+                                "always restarts at 1 for every step and is independent of "
+                                "this step's own `step` number above. A single-action step "
+                                "can just be a plain sentence."
+                            ),
+                        },
                         "precautions": {
                             "type": "array",
                             "items": {"type": "string"},
