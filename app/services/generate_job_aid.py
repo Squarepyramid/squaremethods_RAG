@@ -197,6 +197,28 @@ def call_bedrock_and_parse(prompt: str) -> dict:
         return json.loads(clean)
 
 
+def _get_equipment_image(conn, equipment_id: str, company_id: str) -> str:
+    """
+    Looks up equipment.image for the node this job aid is being created
+    for -- used by save_job_aid() as the default job_aids.image when the
+    caller doesn't supply one of its own (see save_job_aid()'s docstring).
+    Scoped by company_id and excludes soft-deleted rows, same guard
+    retrieval.py's get_equipment() uses. Returns None if the equipment
+    row doesn't exist (wrong/stale id, wrong company, deleted) or simply
+    has no image set -- both are "no default available", not an error;
+    the job aid is still created either way, just without an image.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT image FROM equipment
+            WHERE id = %s::uuid
+            AND company_id = %s::uuid
+            AND deleted_at IS NULL
+        """, (equipment_id, company_id))
+        row = cur.fetchone()
+    return row["image"] if row else None
+
+
 # ── DB writes ─────────────────────────────────────────────────────────────────
 
 def save_job_aid(
@@ -210,9 +232,25 @@ def save_job_aid(
     Save one generated job aid and its procedure steps.
     Accepts an open connection — caller handles commit/rollback.
     Returns job_aid_id.
+
+    job_aids.image defaults to the equipment node's own image
+    (equipment.image, looked up via _get_equipment_image()) so a newly
+    created job aid -- whether from the PM/WP generate() pipeline above
+    or from the chat create_job_aid tool (tools.py), both of which call
+    this same function -- has a sensible thumbnail from the moment it's
+    created, instead of a blank one until a reviewer manually attaches
+    something. `generated["image"]` can still override this explicitly if
+    a caller ever supplies one (neither current caller does today -- the
+    PM/WP prompts only ever populate per-STEP images, and the chat tool
+    never sets a job-aid-level image at all -- but honoring an explicit
+    value here, rather than always overwriting with the equipment image,
+    keeps this forward-compatible without requiring a change here later).
+    Falls back to None (no image) if the equipment has none set, or can't
+    be found -- never a broken/placeholder URL.
     """
     job_aid_id = str(uuid.uuid4())
     slug       = make_slug(generated["title"], job_aid_id)
+    image      = generated.get("image") or _get_equipment_image(conn, equipment_id, company_id)
 
     with conn.cursor() as cur:
 
@@ -220,11 +258,11 @@ def save_job_aid(
         cur.execute("""
             INSERT INTO job_aids
                 (id, company_id, title, slug, instruction, status,
-                 estimated_duration, category, created_by,
+                 estimated_duration, category, created_by, image,
                  view_count, scan_count, created_at, updated_at)
             VALUES
                 (%s::uuid, %s::uuid, %s, %s, %s, 'draft',
-                 %s, %s, %s::uuid,
+                 %s, %s, %s::uuid, %s,
                  0, 0, NOW(), NOW())
         """, (
             job_aid_id,
@@ -235,6 +273,7 @@ def save_job_aid(
             generated.get("estimated_duration"),
             generated.get("category", "Preventive Maintenance"),
             created_by,
+            image,
         ))
 
         # 2. Insert procedure steps
