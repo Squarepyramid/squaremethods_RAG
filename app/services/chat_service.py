@@ -340,11 +340,32 @@ UNFOUNDED_CITATION_FALLBACK_ANSWER = (
 # right there in the retrieved data. If the retry ALSO cites something
 # unfounded, THEN fall back to UNFOUNDED_CITATION_FALLBACK_ANSWER -- no
 # loop, exactly one extra attempt.
+#
+# CONFIRMED-IN-PRODUCTION FAILURE the trailing "this correction message
+# is internal" paragraph below was added for: asked "do you have any
+# pm?", the retry (whose problems came back clean, so `answer =
+# retry_answer` was used verbatim) started with "You're right, my
+# previous response included details that are not actually present in
+# the Equipment Knowledge provided. Let me re-check the available
+# information..." -- the model treated the correction message as a
+# normal turn in the visible conversation and replied TO it, instead of
+# producing a standalone answer to the user's actual question. The user
+# never sees CITATION_CORRECTION_TEMPLATE or the flagged first attempt --
+# only whatever the retry returns, saved and shown as-is (see
+# handle_chat_turn()) -- so a retry that narrates "you're right,"
+# "my previous answer," or "let me re-check" reads as bizarre,
+# unprompted self-correction to them, with no idea what it's referring
+# to. Fixed by explicitly telling the model this exchange is invisible
+# to the user and its reply must stand alone, not by trying to strip
+# meta-commentary out of the answer after the fact (fragile, and every
+# phrasing of "you're right" would need its own pattern).
 CITATION_CORRECTION_TEMPLATE = """CORRECTION -- your last answer to this exact question referenced source(s) that do not exist in our data for this equipment:
 
 {problem_lines}
 
-Answer the same question again from scratch, using only the manual excerpts (and any real job aids/failure modes listed above) already provided in the Equipment Knowledge block, without repeating any of the fabricated references. If the manual doesn't cover it either, say so in one short sentence per the WHEN YOU DON'T HAVE THE ANSWER rule."""
+Answer the same question again from scratch, using only the manual excerpts (and any real job aids/failure modes listed above) already provided in the Equipment Knowledge block, without repeating any of the fabricated references. If the manual doesn't cover it either, say so in one short sentence per the WHEN YOU DON'T HAVE THE ANSWER rule.
+
+IMPORTANT: this correction message and your flagged first attempt are BOTH invisible to the user -- they only ever see whatever you write in response to this message, and they have no idea a correction happened. Write your new answer as a normal, standalone reply to their original question, exactly as if it were your first and only attempt. Do NOT say things like "you're right," "my previous answer," "let me re-check," or anything else that acknowledges or references this correction -- from the user's side, a reply like that would come out of nowhere and just be confusing."""
 
 
 def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
