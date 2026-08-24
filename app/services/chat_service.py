@@ -51,9 +51,9 @@ GROUNDING:
 - This equipment can have MORE THAN ONE job aid, failure mode, and manual/document on file at once -- the block below may list several of each (it will tell you the count when there's more than one). Check EVERY one of them against the user's question before answering -- do not stop at the first job aid, failure mode, or document excerpt that looks related and answer from that alone. If more than one is genuinely relevant, use and mention all of them; if only one actually matches after checking, it's fine to cite just that one -- but make that a real judgment call against everything provided, not a default of only ever using the first item listed.
 
 CITE YOUR SOURCE:
-- The Equipment Knowledge block is labeled by where each piece came from: "Job Aid: <title>" sections, "Known Failure Modes" (aggregated from logged contributions), and manual/document excerpts. Say which one a fact came from, briefly and naturally -- e.g. "According to the equipment manual, ..." / "Per the 'Pump PM1' job aid, ..." / "Per the 'Conveyor Belt Slipping' failure mode, ...".
+- The Equipment Knowledge block is labeled by where each piece came from: "Job Aid: <title>" sections, "Known Failure Modes" (aggregated from logged contributions), and manual/document excerpts. Say which one a fact came from, briefly and naturally -- e.g. "According to the equipment manual, ..." / "Per the '<job aid title>' job aid, ..." / "Per the '<failure mode title>' failure mode, ..." -- always substituting the REAL title from the block below, never a placeholder or an example you recall from these instructions.
 - If a job aid is your source, name it (its title) so the user can find it, not just "a job aid."
-- This equipment may have MORE THAN ONE failure mode logged against it -- a resolution by itself doesn't tell the user which failure/symptom it was logged under. If a failure mode is your source, name it (its title, exactly as shown under "Known Failure Modes") the same way you would a job aid, e.g. "Per the 'Conveyor Belt Slipping' failure mode, ..." -- not just "per logged failure mode records" with no title, which is ambiguous whenever more than one failure mode is listed.
+- This equipment may have MORE THAN ONE failure mode logged against it -- a resolution by itself doesn't tell the user which failure/symptom it was logged under. If a failure mode is your source, name it (its title, exactly as shown under "Known Failure Modes") the same way you would a job aid, e.g. "Per the '<failure mode title>' failure mode, ..." (again, the real title, not a placeholder) -- not just "per logged failure mode records" with no title, which is ambiguous whenever more than one failure mode is listed.
 - Don't force a citation onto every single sentence if that gets repetitive -- one clear attribution per distinct fact or source is enough, not one per word.
 - If you're not sure which specific source a fact came from, still say generally where it's from (e.g. "from our equipment records") rather than omitting attribution -- never present database-sourced facts as if they were your own general knowledge.
 - A manual excerpt may be tagged with a page reference in brackets, like "[manual, page 243]" or "[manual, pages 243-244]" -- this equipment's manual is a scanned document, so the user may want to check the physical book. When an excerpt you're answering from has one, say it naturally, e.g. "Found on page 243 of the manual, ..." or "...(page 243)." ONLY state a page number that is literally shown in brackets in the block below for the excerpt you're actually using -- never estimate, round, infer, or recall a page number from anywhere else, and never state one at all when the excerpt you're citing has no page reference shown.
@@ -193,10 +193,12 @@ def _wants_job_aid(query: str, last_assistant_message: str = None) -> bool:
 # we'd actually seen had different shapes:
 #   - job_aids: PRECISE from the start. CHAT_SYSTEM_PROMPT_TEMPLATE's CITE
 #     YOUR SOURCE section instructs a specific citation style ("Per the
-#     'Pump PM1' job aid, ..."), and both observed fabrications matched it
-#     exactly -- so this extracts the quoted title and diffs it against
-#     the real retrieved titles. Catches an invented EXTRA title even when
-#     some real job aids exist for this equipment.
+#     '<job aid title>' job aid, ..."), and the observed fabrications
+#     matched it (or the Equipment Knowledge block's own "Job Aid: <title>"
+#     header style -- see _LABELED_JOB_AID_CITATION_RE) -- so this extracts
+#     the cited title, in either shape, and diffs it against the real
+#     retrieved titles. Catches an invented EXTRA title even when some
+#     real job aids exist for this equipment.
 #   - failure_modes: was COARSE-ONLY. The two failure-mode fabrications
 #     we'd seen did NOT share one consistent citation shape (one quoted a
 #     title, one didn't), and at the time the system prompt didn't ask for
@@ -211,8 +213,9 @@ def _wants_job_aid(query: str, last_assistant_message: str = None) -> bool:
 # multiple job aids -- a citation that doesn't name which one is exactly
 # the ambiguity problem page citations had with multiple manuals. The
 # system prompt's CITE YOUR SOURCE section now asks for a specific quoted
-# failure-mode title, same style as job aids ("Per the 'Conveyor Belt
-# Slipping' failure mode, ..."), so this can now diff a quoted title
+# failure-mode title (using a "<failure mode title>" placeholder, not a
+# concrete example -- see the job-aid header-echo incident below), so
+# this can now diff a quoted (or "Failure Mode: Title" labeled) title
 # against the real retrieved ones too. The COARSE whole-category check is
 # kept and runs FIRST, unconditionally -- it's still the only thing that
 # catches a generic, unquoted "per logged failure mode records" reference
@@ -225,6 +228,39 @@ _QUOTED_FAILURE_MODE_CITATION_RE = re.compile(
     r"['‘’]([^'‘’]{2,80})['‘’]\s+failure mode", re.IGNORECASE
 )
 _FAILURE_MODE_KEYWORD_RE = re.compile(r"failure mode", re.IGNORECASE)
+
+# CONFIRMED-IN-PRODUCTION FAILURE the two regexes below were added for:
+# asked "do you have any PMs," the model answered "Job Aid: Pump PM1 -
+# This job aid covers the recommended preventive maintenance tasks and
+# schedule for the HM25M.04 pump unit." -- "Pump PM1" was NOT a real job
+# aid retrieved for this equipment (nor, as far as we could confirm, a
+# real job aid at all); the model had lifted it from CHAT_SYSTEM_PROMPT_
+# TEMPLATE's own CITE YOUR SOURCE section, which at the time used "Pump
+# PM1" as its illustrative example title ("Per the 'Pump PM1' job aid,
+# ..."). The example got mistaken for retrievable data -- fixed at the
+# source by replacing that example with an obvious "<job aid title>" /
+# "<failure mode title>" placeholder (see CHAT_SYSTEM_PROMPT_TEMPLATE
+# above), so there's no concrete-sounding title left in the prompt for a
+# future turn to echo back as if it were real.
+#
+# But the citation SHAPE the model used -- "Job Aid: Pump PM1 - ..." --
+# is a second, independent problem worth guarding directly: it's the
+# exact "Job Aid: <title>" header format build_context() puts on every
+# REAL job aid entry in the Equipment Knowledge block itself (see
+# retrieval.py's `ja_text = f"\nJob Aid: {ja['title']}"`), not the "'X'
+# job aid" quoted style _QUOTED_JOB_AID_CITATION_RE checks for -- so this
+# specific fabrication sailed straight past that guard undetected even
+# before the prompt-example fix. A future fabrication could reuse this
+# same header-echo shape regardless of what example wording the system
+# prompt uses, since the block's own real formatting is right there for
+# the model to copy. So both citation shapes are checked from here on,
+# not just the quoted one.
+_LABELED_JOB_AID_CITATION_RE = re.compile(
+    r"\bjob aid:\s*([^\n\-–—.]{2,80})", re.IGNORECASE
+)
+_LABELED_FAILURE_MODE_CITATION_RE = re.compile(
+    r"\bfailure mode:\s*([^\n\-–—.(]{2,80})", re.IGNORECASE
+)
 
 # Third category, added after a confirmed-in-production case: asked "what
 # is the rated speed," the model answered "1750 RPM, according to the
@@ -370,33 +406,42 @@ IMPORTANT: this correction message and your flagged first attempt are BOTH invis
 
 def _find_unfounded_job_aid_citations(answer: str, real_job_aids: list) -> list:
     """
-    Returns the list of job aid titles `answer` cites (in the
-    "'Title' job aid" style) that do NOT match any title in
-    `real_job_aids` (retrieved["sources"]["job_aids"] for this same
-    turn). Non-empty means the model named a source it was never given.
+    Returns the list of job aid titles `answer` cites -- in either the
+    "'Title' job aid" quoted style the system prompt models, OR the
+    "Job Aid: Title" header style build_context() uses for real entries
+    in the Equipment Knowledge block (see _LABELED_JOB_AID_CITATION_RE's
+    comment for the confirmed-in-production case where a fabrication used
+    the latter and slipped past a quoted-only check) -- that do NOT match
+    any title in `real_job_aids` (retrieved["sources"]["job_aids"] for
+    this same turn). Non-empty means the model named a source it was
+    never given.
     """
     real_titles = {ja["title"].strip().lower() for ja in real_job_aids if ja.get("title")}
     cited_titles = {m.group(1).strip() for m in _QUOTED_JOB_AID_CITATION_RE.finditer(answer)}
-    return [title for title in cited_titles if title.lower() not in real_titles]
+    cited_titles |= {m.group(1).strip() for m in _LABELED_JOB_AID_CITATION_RE.finditer(answer)}
+    return [title for title in cited_titles if title and title.lower() not in real_titles]
 
 
 def _find_unfounded_failure_mode_citations(answer: str, real_failure_modes: list) -> list:
     """
-    Same idea as _find_unfounded_job_aid_citations(), for failure modes.
-    Returns the list of failure-mode titles `answer` cites (in the
-    "'Title' failure mode" style the system prompt now asks for) that do
-    NOT match any title in `real_failure_modes` (retrieved["sources"]
-    ["failure_modes"] for this same turn). Non-empty means the model
-    named a specific failure mode it was never given -- e.g. it correctly
-    had SOME real failure modes to work with, but attributed a resolution
-    to a title that doesn't exist among them (as distinct from citing
-    "failure mode" generically with zero real ones at all, which
-    _FAILURE_MODE_KEYWORD_RE + the empty-category check in
-    _detect_unfounded_citations() already catches on its own).
+    Same idea as _find_unfounded_job_aid_citations(), for failure modes:
+    checks both the "'Title' failure mode" quoted style the system prompt
+    asks for AND a "Failure Mode: Title" labeled style, in case the model
+    drifts to that header-like shape the same way it did for job aids.
+    Returns the failure-mode titles `answer` cites that do NOT match any
+    title in `real_failure_modes` (retrieved["sources"]["failure_modes"]
+    for this same turn). Non-empty means the model named a specific
+    failure mode it was never given -- e.g. it correctly had SOME real
+    failure modes to work with, but attributed a resolution to a title
+    that doesn't exist among them (as distinct from citing "failure mode"
+    generically with zero real ones at all, which _FAILURE_MODE_KEYWORD_RE
+    + the empty-category check in _detect_unfounded_citations() already
+    catches on its own).
     """
     real_titles = {fm["title"].strip().lower() for fm in real_failure_modes if fm.get("title")}
     cited_titles = {m.group(1).strip() for m in _QUOTED_FAILURE_MODE_CITATION_RE.finditer(answer)}
-    return [title for title in cited_titles if title.lower() not in real_titles]
+    cited_titles |= {m.group(1).strip() for m in _LABELED_FAILURE_MODE_CITATION_RE.finditer(answer)}
+    return [title for title in cited_titles if title and title.lower() not in real_titles]
 
 
 def _detect_unfounded_citations(answer: str, sources: dict, context: str) -> dict:
