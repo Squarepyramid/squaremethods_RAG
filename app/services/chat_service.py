@@ -43,6 +43,10 @@ CONVERSATION HISTORY -- READ THIS CAREFULLY, IT HAS TWO PARTS:
 WHEN YOU DON'T HAVE THE ANSWER, BE BRIEF:
 - If the Equipment Knowledge block doesn't cover the question, say so in one short sentence -- e.g. "That's not in our system for this equipment yet." Do not follow it with a paragraph of hedging, caveats, or suggestions to contact the manufacturer -- one sentence is enough.
 
+IDENTITY QUESTIONS -- ANSWER THESE DIRECTLY, DON'T OVER-THINK THEM:
+- The Equipment Knowledge block ALWAYS opens with a line like "Equipment: <name> (Type: <type>, Code: <code>, Status: <status>)" -- this equipment's own identity is always known whenever that line is present. When the user asks a basic identity question -- "what machine/equipment is this," "what is this," "what type of equipment is this" -- just answer plainly from that line (its name and/or type and/or code), the same way you'd state any other fact from the block. This is not a "not covered" situation.
+- Do NOT reinterpret a plain identity question as asking about some larger system, parent machine, or production line this equipment might be installed in -- that is a different, more specific question the user did not ask, and the block does not need to describe a larger system for you to correctly answer the one that was actually asked. Only fall back to the WHEN YOU DON'T HAVE THE ANSWER rule if the user specifically asks about that larger context and it genuinely isn't covered -- don't default to that reading on an ordinary "what is this" question.
+
 GROUNDING:
 - Answer ONLY using the "Equipment Knowledge" block below. It is built entirely from our own database for this equipment: its job aids and procedures, ingested manual excerpts, and failure modes with their logged resolutions (aggregated from every contribution made against them).
 - Do not use general industry knowledge, best practices from your training, typical values for similar equipment, or anything from the open internet -- even if you're confident it's correct. If it is not in the block below, it is unknown to you.
@@ -642,6 +646,28 @@ MAX_HISTORY_MESSAGES_FOR_MODEL = 8
 # handle_chat_turn()) still uses the user's original, unmodified `query`
 # text, so the model sees exactly what the user typed, not this
 # retrieval-only expansion.
+#
+# CONFIRMED-IN-PRODUCTION FAILURE the trigger condition below used to
+# also fire on ANY query of 7 words or fewer, regardless of whether it
+# actually referenced anything. "do you have some PMs?" (5 words, fully
+# self-contained -- no pronoun, nothing to resolve) got expanded with the
+# immediately preceding turn, "what machine is this?" -- entirely
+# unrelated to PMs/maintenance. That's not neutral: prefixing unrelated
+# text into the string semantic_search() embeds shifts the resulting
+# vector away from the "PM"/maintenance topic, not just adds context to
+# it, and diluted recall is exactly what appeared to happen -- the very
+# next turn, "what are the preventive maintenance on this machine"
+# (longer, and *its* prior-turn context was PM-related, so the expansion
+# reinforced rather than diluted), surfaced a real manual excerpt on
+# maintenance that the shorter, wrongly-expanded query had missed
+# entirely. The length threshold was meant to catch fragments too short
+# to carry their own meaning ("what about it?"), but "short" and
+# "context-dependent" aren't the same thing -- plenty of short questions
+# in this domain are already complete, standalone queries. Removed the
+# length trigger; _FOLLOWUP_REFERENCE_RE (an actual pronoun/referential
+# word) is a much more precise proxy for "this needs the previous turn to
+# make sense" and doesn't fire on a clean, self-contained short question
+# like "do you have some PMs?".
 _FOLLOWUP_REFERENCE_RE = re.compile(
     r"\b(it|that|this|they|them|same|what about|how about|why|then)\b",
     re.IGNORECASE,
@@ -650,19 +676,27 @@ _FOLLOWUP_REFERENCE_RE = re.compile(
 
 def _build_retrieval_query(current_query: str, history_messages: list) -> str:
     """
-    Returns `current_query` unchanged unless it looks like a short,
-    context-dependent follow-up (<=7 words, or contains a pronoun/
-    referential word like "it"/"that"/"same") -- in which case it's
-    prefixed with up to 2 immediately preceding USER messages (most
-    recent last) so semantic_search() has real noun phrases to embed.
-    `history_messages` is the same list handle_chat_turn() already pulled
-    from get_history() -- no extra DB round trip.
+    Returns `current_query` unchanged unless it contains a pronoun/
+    referential word (see _FOLLOWUP_REFERENCE_RE -- "it"/"that"/"same"/
+    "what about"/etc.), in which case it's prefixed with up to 2
+    immediately preceding USER messages (most recent last) so
+    semantic_search() has real noun phrases to embed instead of an
+    unresolved pronoun. `history_messages` is the same list
+    handle_chat_turn() already pulled from get_history() -- no extra DB
+    round trip.
+
+    Deliberately NOT triggered by query length alone anymore -- see the
+    CONFIRMED-IN-PRODUCTION FAILURE comment on _FOLLOWUP_REFERENCE_RE
+    above. A short query that references nothing (e.g. "do you have some
+    PMs?") is already a complete, self-contained retrieval query; forcing
+    unrelated prior-turn text into it only risks pulling the embedding
+    away from what the user actually asked.
     """
     q = (current_query or "").strip()
     if not q:
         return q
 
-    needs_context = len(q.split()) <= 7 or _FOLLOWUP_REFERENCE_RE.search(q)
+    needs_context = bool(_FOLLOWUP_REFERENCE_RE.search(q))
     if not needs_context:
         return q
 
