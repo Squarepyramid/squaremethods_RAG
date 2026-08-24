@@ -44,14 +44,11 @@ WHEN YOU DON'T HAVE THE ANSWER, BE BRIEF:
 - If the Equipment Knowledge block doesn't cover the question, say so in one short sentence -- e.g. "That's not in our system for this equipment yet." Do not follow it with a paragraph of hedging, caveats, or suggestions to contact the manufacturer -- one sentence is enough.
 
 GROUNDING:
-- Answer ONLY using the "Equipment Knowledge" block below. It is built entirely from our own database for this equipment: relevant job aids/procedures, relevant logged failure modes/resolutions, and reranked manual/document evidence.
+- Answer ONLY using the "Equipment Knowledge" block below. It is built entirely from our own database for this equipment: its job aids and procedures, ingested manual excerpts, and failure modes with their logged resolutions (aggregated from every contribution made against them).
 - Do not use general industry knowledge, best practices from your training, typical values for similar equipment, or anything from the open internet -- even if you're confident it's correct. If it is not in the block below, it is unknown to you.
-- The retrieval layer performs hybrid vector + lexical retrieval and reranking. Treat its evidence as candidate evidence, not automatic proof. A high similarity score means related text was found; it does NOT mean the text answers the question.
-- Retrieved content must match the SPECIFIC symptom, requested specification, procedure, or failure described, not merely the same component or general topic. Mentioning the same part (e.g. "flight bar") is not enough -- an entry describing that part failing to MOVE does not cover a question about that same part failing to STOP, running continuously, overheating, or any other different symptom.
-- If RETRIEVAL STATUS is NOT_COVERED, do not answer the technical question from your own knowledge. Say that the information is not on file for this equipment.
-- If RETRIEVAL STATUS is PARTIALLY_COVERED, use only the evidence that directly answers the question. If it does not actually answer the question, treat it as not covered. Do not fill the gap with inference or the closest related entry.
-- If RETRIEVAL STATUS is COVERED, still verify that the specific claim you are making is supported by the actual excerpt/source, not merely by the status label.
-- Never combine separate excerpts into a new technical conclusion unless the relationship is explicitly supported by the excerpts themselves.
+- Retrieved content must match the SPECIFIC symptom or failure described, not just the same component or general topic. Mentioning the same part (e.g. "flight bar") is not enough -- an entry describing that part failing to MOVE does not cover a question about that same part failing to STOP, running continuously, overheating, or any other different or opposite symptom. Semantic search can return content that is merely topically related, not actually responsive; you must judge relevance yourself before answering, not assume anything retrieved is on-point just because it was retrieved.
+- If nothing in the block addresses the specific symptom described, treat it as not covered -- follow the WHEN YOU DON'T HAVE THE ANSWER rule -- even when related content about the same component or equipment exists. Do not offer the closest topically-related entry as if it answers a different symptom; if you mention it at all, be explicit that it covers a different issue than the one asked about.
+- This equipment can have MORE THAN ONE job aid, failure mode, and manual/document on file at once -- the block below may list several of each (it will tell you the count when there's more than one). Check EVERY one of them against the user's question before answering -- do not stop at the first job aid, failure mode, or document excerpt that looks related and answer from that alone. If more than one is genuinely relevant, use and mention all of them; if only one actually matches after checking, it's fine to cite just that one -- but make that a real judgment call against everything provided, not a default of only ever using the first item listed.
 
 CITE YOUR SOURCE:
 - The Equipment Knowledge block is labeled by where each piece came from: "Job Aid: <title>" sections, "Known Failure Modes" (aggregated from logged contributions), and manual/document excerpts. Say which one a fact came from, briefly and naturally -- e.g. "According to the equipment manual, ..." / "Per the 'Pump PM1' job aid, ..." / "Per the 'Conveyor Belt Slipping' failure mode, ...".
@@ -552,21 +549,54 @@ def _summarize_history_turns(existing_summary: str, messages: list) -> str:
 
 MAX_HISTORY_MESSAGES_FOR_MODEL = 8
 
+# Short/pronoun-laden follow-ups ("what about the sensor?", "is it the
+# same for this one?") retrieve poorly on their own -- semantic_search()
+# embeds whatever string it's given, and a 4-word fragment with no noun
+# phrase in it just doesn't land near the right manual chunks, even
+# though a human reading the conversation would know exactly what "it" is.
+# This folds in the wording of up to 2 prior USER turns so RETRIEVAL (only
+# retrieval -- see the call site in handle_chat_turn()) has something to
+# actually embed/match against.
+#
+# Deliberately ONLY prior USER turns, never the assistant's own previous
+# answers: this system's whole grounding model (see CHAT_SYSTEM_PROMPT_
+# TEMPLATE's CONVERSATION HISTORY section, and the numeric_specs/page/
+# job-aid/failure-mode fabrication guards below) exists specifically
+# because an earlier assistant turn is not a trusted source of fact -- it
+# may have been wrong, incomplete, or fabricated. Feeding a prior
+# assistant claim into the RETRIEVAL query would risk that claim steering
+# search toward chunks that just happen to match ITS wording rather than
+# the user's actual question, which is a subtler way for a past mistake
+# to compound than the history-replay risk the CONVERSATION HISTORY
+# section already warns about. Prior user wording carries no such risk --
+# it's still just the user's own question, restated.
+#
+# This only changes what gets EMBEDDED for retrieval -- the `messages`
+# list actually sent to the model (built further down in
+# handle_chat_turn()) still uses the user's original, unmodified `query`
+# text, so the model sees exactly what the user typed, not this
+# retrieval-only expansion.
+_FOLLOWUP_REFERENCE_RE = re.compile(
+    r"\b(it|that|this|they|them|same|what about|how about|why|then)\b",
+    re.IGNORECASE,
+)
+
 
 def _build_retrieval_query(current_query: str, history_messages: list) -> str:
-    """Resolve short follow-ups using prior USER wording without treating prior assistant claims as evidence."""
+    """
+    Returns `current_query` unchanged unless it looks like a short,
+    context-dependent follow-up (<=7 words, or contains a pronoun/
+    referential word like "it"/"that"/"same") -- in which case it's
+    prefixed with up to 2 immediately preceding USER messages (most
+    recent last) so semantic_search() has real noun phrases to embed.
+    `history_messages` is the same list handle_chat_turn() already pulled
+    from get_history() -- no extra DB round trip.
+    """
     q = (current_query or "").strip()
     if not q:
         return q
 
-    # Pronoun/elliptical follow-ups need the immediately preceding user question
-    # to retrieve the right manual evidence. We deliberately use only user turns
-    # here; previous assistant answers are never injected into the retrieval query.
-    normalized = q.lower()
-    needs_context = (
-        len(q.split()) <= 7 or
-        re.search(r"\b(it|that|this|they|them|same|what about|how about|why|then)\b", normalized)
-    )
+    needs_context = len(q.split()) <= 7 or _FOLLOWUP_REFERENCE_RE.search(q)
     if not needs_context:
         return q
 
@@ -576,6 +606,7 @@ def _build_retrieval_query(current_query: str, history_messages: list) -> str:
         if m.get("role") == "user" and isinstance(m.get("content"), str)
     ]
     previous_users = [x for x in previous_users if x and x != q][:2]
+    previous_users.reverse()  # oldest-of-the-two first, most recent last
     if not previous_users:
         return q
 
@@ -635,16 +666,17 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
             equipment_path=equipment_path, equipment_id=equipment_id,
         )
 
-    # Load history before retrieval so short follow-up questions such as
-    # "what about the sensor?" can inherit the previous USER wording for
-    # retrieval. Previous assistant answers are never used as evidence.
+    # History is fetched before retrieval (not after, as before) so
+    # _build_retrieval_query() can use prior USER turns to resolve short,
+    # pronoun-laden follow-ups ("what about the sensor?") into something
+    # semantic_search() can actually embed -- see that function's
+    # docstring. Same get_history() call as previously sat further down
+    # this function; only its position moved, and what it returns is
+    # unchanged.
     history = get_history(session_id, company_id)
-    retrieval_query = _build_retrieval_query(query, history.get("messages") or [])
-    retrieved = build_context(
-        equipment_path=equipment_path,
-        company_id=company_id,
-        query=retrieval_query,
-    )
+
+    retrieval_query = _build_retrieval_query(query, history["messages"])
+    retrieved = build_context(equipment_path=equipment_path, company_id=company_id, query=retrieval_query)
 
     system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context=retrieved["context"])
 
@@ -676,7 +708,18 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     # turns are saved as a plain final-answer string via save_messages()
     # (the tool_use/tool_result exchange itself is never persisted as
     # separate chat_messages rows), so every historical row is already in
-    # the simple shape call_claude() expects.
+    # the simple shape call_claude() expects. (history was already fetched
+    # above, before retrieval, so _build_retrieval_query() could use it --
+    # not re-fetched here.)
+    #
+    # Replay is now capped to the last MAX_HISTORY_MESSAGES_FOR_MODEL
+    # messages -- the "capping how much of history is replayed" mitigation
+    # mentioned two paragraphs up is no longer just a hypothetical
+    # follow-up; maybe_summarize()'s rolling summary already keeps the
+    # OLDEST turns from growing the prompt forever, but everything within
+    # the not-yet-summarized tail was still being replayed in full. This
+    # bounds the per-turn prompt size/cost even when maybe_summarize()
+    # hasn't rolled up recently.
     messages = []
     if history["summary"]:
         messages.append({
@@ -685,12 +728,9 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
                        f"context only -- not a source of confirmed fact: {history['summary']}]",
         })
         messages.append({"role": "assistant", "content": "Understood."})
-    recent_history = [
-        m for m in (history.get("messages") or [])
-        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
-    ][-MAX_HISTORY_MESSAGES_FOR_MODEL:]
-    for m in recent_history:
-        messages.append({"role": m["role"], "content": m["content"]})
+    for m in history["messages"][-MAX_HISTORY_MESSAGES_FOR_MODEL:]:
+        if m["role"] in ("user", "assistant") and isinstance(m["content"], str):
+            messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": query})
 
     # Tool is only offered when this specific message signals creation
@@ -751,15 +791,6 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
 
     answer = extract_text(response)
 
-    # If the retrieval layer found no evidence at all, do not let the model
-    # manufacture an answer from training knowledge. The deterministic fallback
-    # is the safest response in this state. PARTIALLY_COVERED still reaches the
-    # model because it may contain a directly relevant job aid/failure mode even
-    # when manual similarity is weak.
-    retrieval_status = (retrieved.get("sources", {}).get("retrieval", {}) or {}).get("status")
-    if retrieval_status == "not_covered":
-        answer = UNFOUNDED_CITATION_FALLBACK_ANSWER
-
     # See _detect_unfounded_citations()'s comment above. Rather than
     # discarding the answer outright the moment a fabricated citation is
     # caught, give the model ONE corrective retry -- the Equipment
@@ -773,7 +804,7 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
     # safe generic message rather than keep spending calls chasing a
     # clean answer.
     problems = _detect_unfounded_citations(answer, retrieved["sources"], retrieved["context"])
-    if problems and retrieval_status != "not_covered":
+    if problems:
         print(f"UNFOUNDED CITATION (attempt 1): query={query!r} "
               f"equipment_id={equipment_id} problems={problems!r} "
               f"real_sources={retrieved['sources']!r} -- retrying once")
@@ -783,10 +814,15 @@ def handle_chat_turn(*, company_id: str, user_id: str, equipment_path: str,
             {"role": "assistant", "content": answer},
             {"role": "user", "content": correction},
         ]
+        # tools=None here (not tools_for_turn) -- this is a corrective
+        # retry of an answer that already got flagged for citing something
+        # fabricated; the model doesn't need, and shouldn't get, a second
+        # chance to trigger a side effect (e.g. create_job_aid) mid-
+        # correction. It already had its one opportunity to call a tool in
+        # the loop above -- this call is asked to re-answer in TEXT using
+        # only the corrected guidance, nothing else.
         retry_response = call_claude(
             messages=retry_messages, system=system_prompt,
-            # Correction is answer-only; do not permit a second side-effecting
-            # tool invocation while fixing a citation/grounding problem.
             tools=None, max_tokens=1500,
             temperature=CHAT_TEMPERATURE,
         )
