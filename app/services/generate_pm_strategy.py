@@ -56,14 +56,15 @@ CHANGE LOG (2026-08-28 revision -- reliability/consistency pass):
   throttle another's job with zero visibility into which tenant did it.
   Changes below:
 
-  - MODEL: BEDROCK_MODEL now defaults to a Haiku 4.5-class model (see
-    the constant below) instead of claude-3-haiku-20240307, which is
-    now legacy on Bedrock. VERIFY THE EXACT MODEL ID IN YOUR OWN BEDROCK
-    CONSOLE / MODEL CATALOG FOR YOUR REGION BEFORE DEPLOYING -- the ID
-    below is correct as of this writing but Anthropic/AWS model IDs and
-    version suffixes do change, and this is exactly the kind of typo
-    that fails loudly (ValidationException on an unknown model ID) so
-    it's a cheap thing to double check once rather than trust blindly.
+  - MODEL: model selection now lives entirely in app/services/bedrock_client.py
+    (MODEL_ID / BEDROCK_MODEL_ID env var), not here -- this file just calls
+    call_claude() and has no model ID of its own. That module's default was
+    bumped off claude-3-haiku-20240307 (legacy on Bedrock) to a Haiku 4.5-class
+    model. UPDATE 2026-08-28: the unverified ID from this change did in fact
+    break in production -- see bedrock_client.py's own changelog for the
+    incident and the fix (Haiku 4.5-class models need an inference profile,
+    not a bare on-demand model ID; MODEL_ID there now defaults to the "us."
+    profile pending confirmation of this account's data-residency needs).
     For maximum extraction quality on customer-facing samples (more
     reliable category classification on dense/ambiguous manuals, at
     higher per-call cost/latency), swap to a Sonnet-tier model instead

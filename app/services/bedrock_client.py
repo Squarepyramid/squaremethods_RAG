@@ -53,6 +53,59 @@ the generate_pm_strategy.py rewrite):
     relied on to actually diagnose the PM generation incidents. Passing
     log_context is optional and backward compatible; omitting it just
     drops the prefix.
+
+CHANGE LOG ADDENDUM (same day): explicit direction that PM strategy
+generation should optimize for reliability over speed, given its Lambda
+has up to 15 minutes to work with and isn't latency-sensitive. Deliberately
+NOT reflected here as "make every retry setting much more patient" --
+this module is shared with /chat, which IS latency-sensitive (a human is
+waiting on a response in real time), so cranking read_timeout or
+total_max_attempts way up here would make chat hang longer under
+throttling too, trading away UX this module has no business trading away
+on chat's behalf. The one change made here that's a universal improvement
+regardless of latency sensitivity: retries mode switched from "standard"
+to "adaptive", which self-throttles client-side based on observed error
+rates rather than retrying blindly -- this benefits every caller without
+making any of them slower under normal (non-throttled) conditions.
+Everything else that's actually "be patient, we have 15 minutes" lives in
+generate_pm_strategy.py's own new application-level retry loop instead
+(PM_CATEGORY_MAX_ATTEMPTS, GENERATION_DEADLINE_SECONDS) -- layered ON TOP
+of this module's calls, specific to that one workload, not pushed down
+into the shared client where it would leak into chat's behavior too.
+
+CHANGE LOG ADDENDUM 2 (2026-08-28, production incident): the "VERIFY THIS
+EXACT MODEL ID" warning above was not academic -- it happened. Every call
+through this module started failing with:
+  ValidationException: Invocation of model ID
+  anthropic.claude-haiku-4-5-20251001-v1:0 with on-demand throughput
+  isn't supported. Retry your request with the ID or ARN of an inference
+  profile that contains this model.
+The model ID string itself was correct (Bedrock recognized it -- that's
+why the error is about invocation mode, not "model not found"), but
+Haiku 4.5-class models are not invokable via a bare on-demand model ID in
+this account/region. Bedrock requires routing the call through an
+inference profile instead. Confirmed via AWS's own "Accelerate generative
+AI innovation in Canada with Amazon Bedrock cross-region inference" blog
+post: there is no Canada-only profile for ca-central-1 -- calls route
+through either the "us." geography profile (requests may land on
+us-east-1/us-east-2/us-west-2 capacity) or the "global." profile (may
+land anywhere Bedrock operates). MODEL_ID below now defaults to the "us."
+profile rather than "global." -- a deliberate, conservative choice to
+keep routing within North America rather than worldwide, since neither I
+nor this codebase knows this account's actual data-residency
+obligations. THIS DEFAULT NEEDS A HUMAN DECISION, not just a code fix:
+confirm with whoever owns SquareMethods' data-handling commitments
+(contracts with customers like Maple Lodge Farm may say something about
+where their OEM manual content is processed) whether "us." routing is
+acceptable, whether "global." is fine, or whether this instead means
+staying off Haiku 4.5 / this cross-region mechanism entirely (e.g.
+Provisioned Throughput pinned to ca-central-1, if that's ever justified
+by volume). Until that's confirmed, "us." is what's deployed. Also
+important: this MODEL_ID default is what every caller of this module
+gets unless BEDROCK_MODEL_ID is overridden per-environment, so this same
+ValidationException was very likely also breaking /chat, ingest_document.py,
+and generate_job_aid.py at the same time as PM generation, not just PM
+generation -- worth confirming those recovered too once this deploys.
 """
 import json
 import logging
@@ -64,17 +117,23 @@ from botocore.config import Config
 
 log = logging.getLogger(__name__)
 
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-haiku-4-5-20251001-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 BEDROCK_REGION = os.environ.get("AWS_REGION", "ca-central-1")
 
-# Applies to every call through this module. total_max_attempts=6 in
-# "standard" mode matches AWS's current documented guidance for handling
-# Bedrock throttling (Scaling and throughput best practices, Amazon
-# Bedrock user guide) -- previously there was no Config at all here.
+# Applies to every call through this module -- including /chat, which is
+# latency-sensitive, so these values are deliberately NOT pushed to the
+# extreme "we have 15 minutes" patience PM strategy generation now uses in
+# its own retry loop (see generate_pm_strategy.py). total_max_attempts=6
+# matches AWS's current documented guidance for handling Bedrock
+# throttling (Scaling and throughput best practices, Amazon Bedrock user
+# guide) -- previously there was no Config at all here. mode="adaptive"
+# (changed from "standard") self-throttles client-side based on observed
+# error rates rather than retrying blindly on a fixed schedule -- a
+# universal improvement that doesn't cost normal-case callers anything.
 BEDROCK_CLIENT_CONFIG = Config(
     connect_timeout=10,
     read_timeout=90,
-    retries={"total_max_attempts": 6, "mode": "standard"},
+    retries={"total_max_attempts": 6, "mode": "adaptive"},
 )
 
 _client = None
