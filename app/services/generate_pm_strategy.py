@@ -62,9 +62,12 @@ CHANGE LOG (2026-08-28 revision -- reliability/consistency pass):
     bumped off claude-3-haiku-20240307 (legacy on Bedrock) to a Haiku 4.5-class
     model. UPDATE 2026-08-28: the unverified ID from this change did in fact
     break in production -- see bedrock_client.py's own changelog for the
-    incident and the fix (Haiku 4.5-class models need an inference profile,
-    not a bare on-demand model ID; MODEL_ID there now defaults to the "us."
-    profile pending confirmation of this account's data-residency needs).
+    incident (Haiku 4.5-class models need an inference profile, not a bare
+    on-demand model ID). All processing must stay in ca-central-1, so
+    MODEL_ID there now has NO default and call_claude() raises loudly if
+    it isn't explicitly set to a verified, Canada-scoped model or
+    inference profile ID -- see that file for the exact AWS CLI commands
+    to confirm the right value before setting BEDROCK_MODEL_ID anywhere.
     For maximum extraction quality on customer-facing samples (more
     reliable category classification on dense/ambiguous manuals, at
     higher per-call cost/latency), swap to a Sonnet-tier model instead
@@ -358,7 +361,25 @@ MAX_TOKENS      = 8192
 # raise the effective ceiling. Treat this semaphore as a partial
 # mitigation, not the fix for cross-tenant throttling.
 BEDROCK_CALL_CONCURRENCY = int(os.environ.get("PM_BEDROCK_CALL_CONCURRENCY", 3))
-_bedrock_semaphore = asyncio.Semaphore(BEDROCK_CALL_CONCURRENCY)
+
+# NOTE: the actual asyncio.Semaphore is NOT created here anymore -- see
+# CHANGE LOG entry below (2026-08-28, "bound to a different event loop").
+# It used to be a module-level global (_bedrock_semaphore = asyncio.Semaphore(...)),
+# which broke in production: a Semaphore binds to whichever asyncio event
+# loop is running when it's first used, but this module stays imported
+# across warm Lambda invocations while each invocation can get its OWN
+# fresh event loop. A semaphore created (or first touched) under one
+# invocation's loop raises "bound to a different event loop" the moment a
+# later, separate invocation's loop tries to use that same cached object.
+# Cold starts always worked (fresh import, fresh loop, no mismatch yet);
+# it only surfaced on a warm container reusing a stale semaphore against a
+# new loop -- which matches exactly what was seen ("worked twice" then
+# broke). Fixed by creating the Semaphore fresh inside generate() on every
+# call instead, and passing it down as a parameter -- see generate(),
+# call_claude_for_pm_type(), and _attempt_bedrock_call() below. This is
+# also the semantically correct scope: this semaphore was only ever meant
+# to cap ONE job's own 10 concurrent category calls (see the comment
+# above), not to persist across the whole process lifetime.
 
 # How long, in seconds, generate() is willing to let its 10 category calls
 # (including their retries -- see PM_CATEGORY_MAX_ATTEMPTS below) keep
@@ -490,8 +511,19 @@ WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top")
 # opposed to one that's legitimately empty because the manual doesn't
 # cover it) -- see build_excel. Previously both looked identical: a
 # header row followed by no data rows.
-ERROR_FILL    = PatternFill("solid", start_color="C0392B", end_color="C0392B")
-ERROR_FONT    = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+#
+# CHANGE 2026-08-28: was bright red / bold white ("GENERATION ERROR",
+# C0392B) -- explicit direction was to keep this quiet rather than
+# alarming: still a distinct, visible row (never silently dropped --
+# a maintenance document silently missing a Safety Inspection or
+# Calibration category is a real gap, not a cosmetic one, and this job
+# already always returns a valid file for whatever categories DID
+# succeed -- generate()/generate_with_filename() never raise or fail
+# the whole job over a partial error, so there was never anything
+# here actually "faulting out" the job itself, just this loud styling),
+# but toned down to a neutral note instead of a red banner.
+INCOMPLETE_FILL = PatternFill("solid", start_color="F2F2F2", end_color="F2F2F2")
+INCOMPLETE_FONT = Font(italic=True, color="595959", name="Arial", size=10)
 
 # Approx characters that fit on one wrapped line within the instruction
 # column width (col width 60 -> roughly 60-65 chars/line at Arial 10).
@@ -935,12 +967,18 @@ def attach_images_to_steps(steps: list, manual_images: list) -> dict:
     return tally
 
 
-async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str) -> tuple[Optional[list], Optional[str], dict]:
+async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str, bedrock_semaphore: asyncio.Semaphore) -> tuple[Optional[list], Optional[str], dict]:
     """
     One attempt at the Bedrock call + response parsing for a single
     category. Split out of call_claude_for_pm_type so the retry loop
     below can call this repeatedly without re-running retrieval (which
     is deterministic and not worth repeating) each time.
+
+    bedrock_semaphore: created fresh per-invocation by generate() and
+    threaded down through call_claude_for_pm_type -- NOT a module-level
+    global. See the CHANGE LOG note above BEDROCK_CALL_CONCURRENCY for
+    why a module-level asyncio.Semaphore broke across warm Lambda
+    invocations ("bound to a different event loop").
 
     Returns (steps_or_None, error_reason_or_None, raw_response_dict).
     steps is None (not []) specifically when this attempt failed --
@@ -955,7 +993,7 @@ async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str) -> t
         # the actual boto3 client, its retry/timeout Config, and the
         # raw-body/stop_reason/usage logging -- /chat and ingest_document.py
         # get the same hardening through that same shared call.
-        async with _bedrock_semaphore:
+        async with bedrock_semaphore:
             raw = await loop.run_in_executor(
                 None,
                 lambda: call_claude(
@@ -1014,6 +1052,7 @@ async def call_claude_for_pm_type(
     company_id: str,
     manual_images: list,
     deadline: float,
+    bedrock_semaphore: asyncio.Semaphore,
 ) -> tuple[str, str, list, str]:
     """
     Returns (pm_code, pm_name, steps, status) where status is one of:
@@ -1038,6 +1077,12 @@ async def call_claude_for_pm_type(
     see the module changelog for why this matters more now that
     individual attempts are allowed to take their time rather than fail
     fast.
+
+    bedrock_semaphore: created fresh by generate() on every call and
+    passed down here and into _attempt_bedrock_call -- see the CHANGE LOG
+    note above BEDROCK_CALL_CONCURRENCY for why this can't be a
+    module-level global in a Lambda that reuses warm containers across
+    invocations with different event loops.
     """
     log.debug(f"[company={company_id}] {pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
     loop = asyncio.get_event_loop()
@@ -1095,7 +1140,7 @@ async def call_claude_for_pm_type(
                 f"(previous attempt failed: {last_reason})"
             )
 
-        result_steps, error_reason, _raw = await _attempt_bedrock_call(prompt, company_id, pm_code)
+        result_steps, error_reason, _raw = await _attempt_bedrock_call(prompt, company_id, pm_code, bedrock_semaphore)
 
         if error_reason is None:
             # result_steps is a real list here, possibly empty -- an
@@ -1211,13 +1256,17 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
             # Flagged distinctly from a legitimately empty category so the
             # reviewer (or the salesperson sending this to a customer)
             # doesn't mistake "generation failed for this category" for
-            # "the manual just doesn't cover this".
+            # "the manual just doesn't cover this" -- kept quiet rather
+            # than alarming (see INCOMPLETE_FILL/INCOMPLETE_FONT comment
+            # above) but deliberately still visible, never silently
+            # dropped, so a reviewer always has a way to notice this
+            # category needs a retry before the document goes out.
             error_cell = ws.cell(
                 row=current_row, column=1,
-                value=f"GENERATION ERROR - {pm_code} failed to generate, retry this category. Do not treat as empty.",
+                value=f"{pm_code} not generated this run -- recommend regenerating this category before sending.",
             )
-            error_cell.font = ERROR_FONT
-            error_cell.fill = ERROR_FILL
+            error_cell.font = INCOMPLETE_FONT
+            error_cell.fill = INCOMPLETE_FILL
             error_cell.alignment = Alignment(vertical="center")
             ws.row_dimensions[current_row].height = 20
             ws.merge_cells(
@@ -1372,8 +1421,19 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     # deadline all 10 tasks check against, not 10 independent budgets.
     deadline = time.monotonic() + GENERATION_DEADLINE_SECONDS
 
+    # Created fresh on every call to generate(), inside whatever event
+    # loop is actually running THIS invocation -- deliberately NOT a
+    # module-level global. See the CHANGE LOG note above
+    # BEDROCK_CALL_CONCURRENCY: a semaphore created once at import time
+    # stays bound to the first event loop that used it, but this module
+    # stays imported across warm Lambda invocations that can each get
+    # their own fresh loop, which produced "bound to a different event
+    # loop" RuntimeErrors on every category call once a warm container
+    # reused a stale semaphore against a new loop.
+    bedrock_semaphore = asyncio.Semaphore(BEDROCK_CALL_CONCURRENCY)
+
     tasks = [
-        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, deadline)
+        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, deadline, bedrock_semaphore)
         for pm_code, pm_name in PM_TYPES
     ]
     results = await asyncio.gather(*tasks)
