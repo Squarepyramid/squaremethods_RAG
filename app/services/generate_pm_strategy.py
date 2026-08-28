@@ -41,7 +41,146 @@ PM Types:
   PM8 - Safety Inspection
   PM9 - Software Back-up
 
-CHANGE LOG (this revision):
+CHANGE LOG (2026-08-28 revision -- reliability/consistency pass):
+  This revision addresses three production incidents traced back to this
+  file: a Bedrock ThrottlingException mid-generation (job codes mlf001/
+  mlf003), a WP category silently returning 0 steps because Claude
+  returned key-value text instead of JSON, and a reproducible PM8
+  json.JSONDecodeError. All three trace back to the same root design
+  choice -- asking Claude for free-text JSON and then hoping
+  raw_text.find("[") / rfind("]") / json.loads() succeeds -- plus a
+  missing temperature setting that made every rerun of the same manual
+  produce a different number of populated categories. Also: this
+  deployment is multi-tenant, and Bedrock's on-demand quota is account
+  + region + model level, not per-tenant, so one tenant's burst can
+  throttle another's job with zero visibility into which tenant did it.
+  Changes below:
+
+  - MODEL: BEDROCK_MODEL now defaults to a Haiku 4.5-class model (see
+    the constant below) instead of claude-3-haiku-20240307, which is
+    now legacy on Bedrock. VERIFY THE EXACT MODEL ID IN YOUR OWN BEDROCK
+    CONSOLE / MODEL CATALOG FOR YOUR REGION BEFORE DEPLOYING -- the ID
+    below is correct as of this writing but Anthropic/AWS model IDs and
+    version suffixes do change, and this is exactly the kind of typo
+    that fails loudly (ValidationException on an unknown model ID) so
+    it's a cheap thing to double check once rather than trust blindly.
+    For maximum extraction quality on customer-facing samples (more
+    reliable category classification on dense/ambiguous manuals, at
+    higher per-call cost/latency), swap to a Sonnet-tier model instead
+    via the BEDROCK_MODEL_ID env var -- no code change needed either way.
+
+  - STRUCTURED OUTPUT VIA FORCED TOOL USE: replaced the "return ONLY a
+    valid JSON array" free-text instruction + raw_text.find("[")/
+    rfind("]")/json.loads() extraction with Anthropic's tool-use
+    mechanism: a single EXTRACTION_TOOL schema is sent on every call
+    with tool_choice forcing Claude to call it. The model's structured
+    arguments come back in response["content"][*]["input"] as an
+    ALREADY-PARSED object -- no bracket-finding, no json.loads() on
+    model-generated text, no way for a stray unescaped quote in an
+    instruction field to corrupt the whole array, and no way for the
+    model to "forget" and return prose instead (that's what caused the
+    WP category's silent 0-step failures). This works on every Claude
+    model on Bedrock, not just the newest ones -- it's not tied to the
+    model swap above.
+
+  - TEMPERATURE: added temperature=0 to every call. Previously unset
+    (Bedrock default ~1.0), which is what let the exact same manual
+    produce 5/10 populated categories on one run and 7/10 on the next.
+    This is an extraction task ("find every task matching category X in
+    this manual"), not a creative one -- there's no reason to want
+    sampling variance here. This alone won't make output byte-identical
+    run to run (floating-point non-associativity in batched inference
+    means even temperature=0 isn't perfectly deterministic) but it
+    removes the dominant source of variance.
+
+  - stop_reason NOW LOGGED: previously nothing inspected
+    raw.get("stop_reason"), so a response truncated by hitting MAX_TOKENS
+    was indistinguishable in the logs from a clean parse failure. Now
+    logged explicitly per call, and MAX_TOKENS raised from 4096 to 8192
+    for headroom on categories that can legitimately produce 20+
+    multi-step tasks (PM1, PM8 have both done this in production).
+
+  - PER-CATEGORY STATUS ("ok" / "empty" / "error"): call_claude_for_pm_type
+    now returns a status alongside the steps list instead of collapsing
+    every failure mode (throttling, timeout, malformed response, a
+    legitimately empty category) into an indistinguishable []. A category
+    that errored is marked visibly in the Excel output instead of looking
+    identical to "the manual doesn't cover this" -- see build_excel.
+
+  - RETRY CONFIG: BEDROCK_CLIENT_CONFIG retries raised from
+    {"max_attempts": 2, "mode": "standard"} to
+    {"total_max_attempts": 6, "mode": "standard"}, matching AWS's current
+    documented guidance for handling Bedrock throttling
+    (see: Scaling and throughput best practices, Amazon Bedrock docs).
+
+  - IN-PROCESS CONCURRENCY CAP: a semaphore now caps how many of this
+    job's own 10 category calls hit Bedrock at the same instant
+    (BEDROCK_CALL_CONCURRENCY, default 5) instead of firing all 10
+    simultaneously. NOTE: this only smooths out the burst a single job
+    creates by itself -- it does NOT coordinate across separate Lambda
+    invocations or tenants. The actual cross-tenant throttling problem
+    (tenant A's burst throttling tenant B's job) needs an infra-level
+    fix outside this file: a Lambda reserved-concurrency cap, a shared
+    token bucket (DynamoDB/ElastiCache), and/or Bedrock cross-region
+    inference to raise the effective ceiling. This semaphore is a
+    partial mitigation, not the full fix.
+
+  - TENANT-SCOPED LOGGING: company_id is now included in every log line
+    in this module. Previously it was only present in SQL query
+    parameters, not in the log messages themselves, which made it
+    impossible to filter "show me only this tenant's generation logs"
+    without cross-referencing DB queries by hand.
+
+  Everything below this point (retrieval, image matching, Excel
+  building, filename generation) is UNCHANGED from the prior revision
+  except for the log-line company_id additions noted above.
+
+CHANGE LOG ADDENDUM (same day, second pass): this file originally built
+its own boto3 bedrock-runtime client and its own request body directly
+(duplicating model ID, retry Config, and response logging that also
+needed to exist, separately, in app/services/bedrock_client.py for
+/chat, ingest_document.py, and generate_job_aid.py). Reworked to call
+app.services.bedrock_client.call_claude() instead: BEDROCK_MODEL,
+BEDROCK_CLIENT_CONFIG, and the bedrock client construction that used to
+live in this file are gone (see bedrock_client.py's own changelog for
+what replaced them there); call_claude_for_pm_type() no longer takes a
+`bedrock` client parameter, and the invoke_model/body-read/stop_reason
+logging that used to be inline here now happens once, centrally, inside
+call_claude(). Net effect: the retry/timeout hardening and structured
+tool-use call from this revision now protect every Bedrock call site in
+the app, not just PM strategy generation.
+
+CHANGE LOG ADDENDUM (same day, third pass -- optimize for reliability, not
+speed): explicit direction that this Lambda has up to 15 minutes to work
+with, generation isn't latency-sensitive, and every prior fix should lean
+toward resilience over throughput. Changes:
+  - BEDROCK_CALL_CONCURRENCY lowered from 5 to 3 (env-overridable): a
+    smaller burst per job is gentler on the shared Bedrock quota for a
+    modest wall-clock cost this workload can easily absorb.
+  - NEW: an application-level retry loop per category (PM_CATEGORY_MAX_ATTEMPTS,
+    default 3, with linear backoff via PM_CATEGORY_RETRY_BACKOFF_SECONDS).
+    Previously a category that got a usable HTTP response but an unusable
+    one (no tool_use block, an anomaly worth retrying rather than the
+    empty-array case) had zero retries and was permanently lost -- the
+    only retries in the whole system were botocore's, and only for
+    network-level failures. This is layered on top of those, not a
+    replacement for them.
+  - NEW: GENERATION_DEADLINE_SECONDS, a shared time.monotonic() cutoff
+    (default 720s / 12 min, leaving a buffer against the 15-min Lambda
+    ceiling) that every category's retry loop checks before each attempt.
+    Without this, a generous per-category retry budget creates a new risk:
+    one bad category retrying for a long time could push the WHOLE
+    invocation past Lambda's hard timeout, which kills the process
+    outright and loses every category's work, including the 9 that
+    already succeeded. The shared deadline makes categories fail
+    gracefully into "error" status individually instead, so generate()
+    still returns a real (if partial) file rather than nothing at all.
+  - bedrock_client.py's retry Config was also revisited in the same pass
+    (see that file's own changelog) -- total_max_attempts raised further
+    and retries mode switched to "adaptive", both leaning on the newly
+    available time budget rather than failing fast.
+
+PRIOR CHANGE LOG (retained for context):
   - RETRIEVAL REWORK (fixes slow/unreliable generation on large, normal
     -- i.e. non-scanned -- manuals): fetch_all_manual_chunks() used to
     pull EVERY chunk ever ingested for the equipment node, uncapped, and
@@ -116,24 +255,29 @@ runs this job (its own function timeout, SQS visibility timeout, etc.)
 should stay comfortably above BEDROCK_CLIENT_CONFIG's read_timeout * the
 retry count, so a legitimately slow Bedrock call doesn't get killed by the
 outer timeout before botocore's own retry/timeout logic has a chance to
-resolve it.
+resolve it. With total_max_attempts now at 6 (up from 2 retries), that
+budget is larger than before -- worst case is roughly
+read_timeout(90s) * 6 = 540s if every attempt were to hit the full read
+timeout (unlikely in practice, since most retries fire fast on an
+immediate ThrottlingException rather than waiting out the full timeout,
+but budget the outer timeout as if it could happen).
 """
 
 import io
-import json
 import logging
 import asyncio
 import re
+import time
 from typing import Optional
 
 import boto3
 import os
-from botocore.config import Config
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.utils.db import get_db_connection
 from app.services.embeddings import get_embedding
+from app.services.bedrock_client import call_claude
 
 log = logging.getLogger(__name__)
 
@@ -177,25 +321,71 @@ PM_QUERY_TEXT = {
     "PM9": "software backup firmware configuration PLC controller electronic control module restore",
 }
 
-BEDROCK_MODEL   = "anthropic.claude-3-haiku-20240307-v1:0"
+# Model selection AND the Bedrock client's retry/timeout Config now live in
+# app.services.bedrock_client (call_claude()), shared with /chat,
+# ingest_document.py, and generate_job_aid.py, instead of being duplicated
+# here. See that module's 2026-08-28 changelog entry for why (short
+# version: this file used to build its own boto3 client with no Config at
+# all, which meant every other caller of the shared client had the same
+# undocumented-default-timeout exposure this incident was about, just
+# unfixed). BEDROCK_REGION is kept here only because presign_manual_image_url()
+# below needs a region for its own S3 client -- unrelated to Bedrock's region.
 BEDROCK_REGION  = os.environ.get("AWS_REGION", "ca-central-1")
-MAX_TOKENS      = 4096
 
-# Explicit timeout/retry config for the bedrock-runtime client. Previously
-# there was no Config at all here, which meant a slow invoke_model call
-# (much more likely under the old unbounded-context prompts) rode on
-# botocore's undocumented default read timeout, failed silently, and got
-# swallowed by call_claude_for_pm_type's broad except-clause -- coming
-# back indistinguishable from "Claude legitimately found nothing in this
-# manual." read_timeout is sized generously above what a bounded,
-# RETRIEVAL_TOP_K-limited prompt should ever need; if it's still being
-# hit regularly, that's a real signal worth surfacing, not something to
-# raise further without checking why.
-BEDROCK_CLIENT_CONFIG = Config(
-    connect_timeout=10,
-    read_timeout=90,
-    retries={"max_attempts": 2, "mode": "standard"},
-)
+# Raised from 4096. Categories that legitimately produce 20+ multi-step
+# tasks with numbered multi-line instructions (PM1, PM8 have both done this
+# in production) can plausibly need more headroom than the old cap gave
+# them. stop_reason is now logged per call inside call_claude() (see
+# app.services.bedrock_client) so a truncated response is visible going
+# forward instead of silently corrupting the parsed output.
+MAX_TOKENS      = 8192
+
+# Caps how many of THIS JOB's 10 category calls hit Bedrock at the same
+# instant, instead of firing all 10 simultaneously via asyncio.gather.
+# Lowered from 5 to 3: this Lambda has up to 15 minutes to work with and
+# generation isn't user-facing/latency-sensitive, so there's no reason to
+# maximize parallelism -- a smaller burst per job is strictly gentler on
+# the shared Bedrock quota (see the multi-tenant discussion below) for a
+# modest increase in this job's own wall-clock time, which is a trade this
+# workload can easily afford. This only smooths the burst a single job
+# creates by itself -- it does NOT coordinate across separate Lambda
+# invocations or tenants. Bedrock's on-demand quota is account+region+
+# model level, not per-tenant, so the real fix for one tenant's job
+# throttling another tenant's job is an infra-level concurrency gate
+# outside this file (a Lambda reserved-concurrency cap, or a shared token
+# bucket in DynamoDB/ElastiCache) plus Bedrock cross-region inference to
+# raise the effective ceiling. Treat this semaphore as a partial
+# mitigation, not the fix for cross-tenant throttling.
+BEDROCK_CALL_CONCURRENCY = int(os.environ.get("PM_BEDROCK_CALL_CONCURRENCY", 3))
+_bedrock_semaphore = asyncio.Semaphore(BEDROCK_CALL_CONCURRENCY)
+
+# How long, in seconds, generate() is willing to let its 10 category calls
+# (including their retries -- see PM_CATEGORY_MAX_ATTEMPTS below) keep
+# trying before giving up on whatever hasn't finished and returning a
+# partial-but-real result. Set well under the Lambda function's actual
+# timeout (per this deployment, up to 15 minutes = 900s) so a slow or
+# repeatedly-throttled category produces a clean, logged "error" status on
+# JUST that category instead of the WHOLE invocation being hard-killed by
+# Lambda at 900s -- which would lose every category's work, including the
+# ones that already succeeded. Defaults to 720s (12 min), leaving a
+# 3-minute buffer for retrieval, Excel building, and whatever the caller
+# does with the returned bytes afterward. Tune via env var if your actual
+# Lambda timeout differs from 15 minutes -- this should always be
+# comfortably below it, never equal to it.
+GENERATION_DEADLINE_SECONDS = int(os.environ.get("PM_GENERATION_DEADLINE_SECONDS", 720))
+
+# Application-level retries of a WHOLE category call (retrieval is NOT
+# repeated on retry -- see call_claude_for_pm_type). Layered ON TOP OF
+# call_claude()'s own botocore-level retries inside a single invoke_model
+# call (network errors, throttling -- see bedrock_client.py's
+# total_max_attempts). This is what actually uses the newly-available time
+# budget: previously a category that got a usable HTTP response but an
+# unusable one (e.g. no tool_use block) had zero retries and was
+# permanently lost. 3 attempts, with linear backoff between them
+# (PM_CATEGORY_RETRY_BACKOFF_SECONDS * attempt number, capped by whatever
+# time is actually left against GENERATION_DEADLINE_SECONDS).
+PM_CATEGORY_MAX_ATTEMPTS = int(os.environ.get("PM_CATEGORY_MAX_ATTEMPTS", 3))
+PM_CATEGORY_RETRY_BACKOFF_SECONDS = 15
 
 # How many of the most relevant chunks (by embedding similarity) to pull
 # per PM type. ~40 chunks at ~500 words/chunk is roughly 20k words --
@@ -206,6 +396,73 @@ BEDROCK_CLIENT_CONFIG = Config(
 # Textract), this simply returns everything -- no behavior change for
 # the currently-working case.
 RETRIEVAL_TOP_K = 40
+
+# ── Structured output tool definition ──────────────────────────────────────
+#
+# Every WP/PM extraction call is forced (via tool_choice) to call this one
+# tool instead of being asked to "return ONLY a valid JSON array" as free
+# text. Anthropic parses and validates the arguments against this schema
+# server-side; what comes back in the response is an ALREADY-PARSED object
+# at content[*]["input"], not a string that this code has to bracket-find
+# and json.loads() itself. This is what eliminates the WP "returned prose
+# instead of JSON" failures and the PM8 json.JSONDecodeError -- both were
+# symptoms of parsing model-generated text, and this removes that step
+# entirely. Works on every Claude model on Bedrock (not just newer ones),
+# so it's independent of whichever model app.services.bedrock_client is
+# configured to use.
+#
+# The field descriptions here intentionally stay short -- the detailed
+# per-field guidance (what counts as PM8 vs PM4, how to format the
+# instruction field's numbered steps, etc.) lives in the prompt text in
+# build_pm_prompt/build_working_principle_prompt, same as before. This
+# schema only constrains shape and types; the prompt still teaches content.
+EXTRACTION_TOOL = {
+    "name": "record_extracted_steps",
+    "description": (
+        "Record the list of steps/tasks extracted from the equipment "
+        "manual for this category. Call this even if no steps were found "
+        "-- pass an empty tasks list rather than omitting the call."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "One entry per extracted step or task, in sequence order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": "Sequential step number, e.g. 'Operation_010', 'Operation_020'.",
+                        },
+                        "task_list_description": {"type": "string"},
+                        "frequency": {"type": "string"},
+                        "hrs": {
+                            "type": ["number", "string"],
+                            "description": "Decimal hours, or blank string if not specified.",
+                        },
+                        "work_needed": {"type": "integer"},
+                        "system_condition": {"type": "integer"},
+                        "material_number": {"type": "string"},
+                        "component": {"type": "string"},
+                        "instruction": {
+                            "type": "string",
+                            "description": "Numbered steps, each on its own line, separated by a blank line.",
+                        },
+                        "failure_modes": {"type": "string"},
+                    },
+                    "required": [
+                        "operation", "task_list_description", "frequency", "hrs",
+                        "work_needed", "system_condition", "material_number",
+                        "component", "instruction", "failure_modes",
+                    ],
+                },
+            },
+        },
+        "required": ["tasks"],
+    },
+}
 
 COLUMNS = [
     "Operation",
@@ -227,6 +484,13 @@ SUBHEAD_FILL  = PatternFill("solid", start_color="D6E4F0", end_color="D6E4F0")
 SUBHEAD_FONT  = Font(bold=True, name="Arial", size=10)
 DATA_FONT     = Font(name="Arial", size=10)
 WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top")
+
+# Row/fill used to flag a category that errored during generation (as
+# opposed to one that's legitimately empty because the manual doesn't
+# cover it) -- see build_excel. Previously both looked identical: a
+# header row followed by no data rows.
+ERROR_FILL    = PatternFill("solid", start_color="C0392B", end_color="C0392B")
+ERROR_FONT    = Font(bold=True, color="FFFFFF", name="Arial", size=10)
 
 # Approx characters that fit on one wrapped line within the instruction
 # column width (col width 60 -> roughly 60-65 chars/line at Arial 10).
@@ -321,7 +585,7 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
 
     clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
     full_text = "\n\n".join(clean_chunks)
-    log.info(f"Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
+    log.info(f"[company={company_id}] Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
     return full_text
 
 
@@ -369,7 +633,7 @@ def fetch_relevant_manual_chunks(equipment_id: str, company_id: str, query_text:
     clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
     full_text = "\n\n".join(clean_chunks)
     log.info(
-        f"Retrieved {len(clean_chunks)}/{top_k} chunks ({len(full_text.split())} words) "
+        f"[company={company_id}] Retrieved {len(clean_chunks)}/{top_k} chunks ({len(full_text.split())} words) "
         f"for equipment {equipment_id}, query={query_text[:60]!r}"
     )
     return full_text
@@ -390,9 +654,16 @@ def build_working_principle_prompt(manual_text: str) -> str:
     onto that specific vocabulary (screw airend, oil injection,
     receiver-separator) and started projecting compressor terminology
     onto completely unrelated equipment. The example here only
-    demonstrates the JSON shape and the *kind* of engineering
-    reasoning expected -- every actual term must come from the
-    manual provided, never from this example.
+    demonstrates the reasoning style expected -- every actual term must
+    come from the manual provided, never from this example.
+
+    NOTE: this used to end with a "Return ONLY a valid JSON array" +
+    literal JSON example block. That's no longer needed -- the caller
+    forces this response through the record_extracted_steps tool (see
+    EXTRACTION_TOOL), which constrains the shape server-side. The
+    field-by-field guidance below still matters (it's what teaches the
+    model what belongs in each field); only the now-redundant formatting
+    instructions were removed.
     """
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
@@ -418,24 +689,7 @@ For each functional stage, extract:
 - instruction: a clear, detailed engineering explanation of what physically happens at this stage and why, using only terms and mechanisms the manual actually describes. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space.
 - failure_modes: leave blank (not applicable)
 
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-If the manual has no engineering description of how the machine functions anywhere, return an empty array: []
-
-Example format (illustrates JSON shape and reasoning style only -- "Stage" and "Component" below are placeholders; replace with whatever this manual's actual machine and components are):
-[
-  {{
-    "operation": "Operation_010",
-    "task_list_description": "[First functional stage from the manual] - [Component that performs it]",
-    "frequency": "",
-    "hrs": "",
-    "work_needed": 0,
-    "system_condition": 1,
-    "material_number": "",
-    "component": "[Component name from the manual]",
-    "instruction": "1. [What physically enters or triggers this stage, per the manual].\\n\\n2. [What the component does to it, and how, per the manual].\\n\\n3. [What results, and what happens next in the sequence, per the manual].",
-    "failure_modes": ""
-  }}
-]
+Call the record_extracted_steps tool with your findings. If the manual has no engineering description of how the machine functions anywhere, call it with an empty tasks list.
 
 EQUIPMENT MANUAL:
 {manual_text}"""
@@ -455,6 +709,14 @@ PM_TYPE_GUIDANCE = {
 
 
 def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str) -> str:
+    """
+    NOTE: this used to end with a "Return ONLY a valid JSON array" +
+    literal JSON example block, same as build_working_principle_prompt
+    above. Removed for the same reason -- tool_choice now enforces the
+    output shape, so that instruction block was redundant (and one of
+    the sources of drift: the model would sometimes narrate instead of
+    strictly following it). The category guidance below is unchanged.
+    """
     category_guidance = PM_TYPE_GUIDANCE.get(pm_code, "")
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
@@ -476,24 +738,7 @@ For each task you find, extract the following fields:
 - instruction: step-by-step work instruction a technician can follow. Number each step starting at 1. Put EACH numbered step on its own line, with a blank line between steps -- use a literal "\\n\\n" (newline, newline) between step N and step N+1, never a space. Be specific.
 - failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
 
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-If no tasks of type {pm_name} are found in the manual, return an empty array: []
-
-Example format:
-[
-  {{
-    "operation": "Operation_010",
-    "task_list_description": "Main Drive assembly - Bearings x4",
-    "frequency": "2W",
-    "hrs": 0.1,
-    "work_needed": 1,
-    "system_condition": 0,
-    "material_number": "",
-    "component": "Bearings x4",
-    "instruction": "1. Isolate and lock out the drive.\\n\\n2. Remove guard.\\n\\n3. Apply 2 shots of grease per nipple using grease gun.",
-    "failure_modes": "Bearing seizure, overheating"
-  }}
-]
+Call the record_extracted_steps tool with your findings. If no tasks of type {pm_name} are found in the manual, call it with an empty tasks list.
 
 EQUIPMENT MANUAL:
 {manual_text}"""
@@ -605,7 +850,7 @@ def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> lis
     finally:
         conn.close()
 
-    log.info(f"Loaded {len(rows)} manual images for equipment {equipment_id}")
+    log.info(f"[company={company_id}] Loaded {len(rows)} manual images for equipment {equipment_id}")
     return [
         {"s3_key": r["s3_key"], "context_text": (r["context_text"] or "").lower(), "page_number": r["page_number"]}
         for r in rows
@@ -689,115 +934,207 @@ def attach_images_to_steps(steps: list, manual_images: list) -> dict:
     return tally
 
 
+async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str) -> tuple[Optional[list], Optional[str], dict]:
+    """
+    One attempt at the Bedrock call + response parsing for a single
+    category. Split out of call_claude_for_pm_type so the retry loop
+    below can call this repeatedly without re-running retrieval (which
+    is deterministic and not worth repeating) each time.
+
+    Returns (steps_or_None, error_reason_or_None, raw_response_dict).
+    steps is None (not []) specifically when this attempt failed --
+    an empty list is a legitimate "Claude found nothing" result and
+    should NOT be retried, only a None/error result should be.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        # Capped so this job's category calls don't all fire in the same
+        # instant -- see BEDROCK_CALL_CONCURRENCY for what this does and
+        # does not solve. call_claude() (app.services.bedrock_client) owns
+        # the actual boto3 client, its retry/timeout Config, and the
+        # raw-body/stop_reason/usage logging -- /chat and ingest_document.py
+        # get the same hardening through that same shared call.
+        async with _bedrock_semaphore:
+            raw = await loop.run_in_executor(
+                None,
+                lambda: call_claude(
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[EXTRACTION_TOOL],
+                    tool_choice={"type": "tool", "name": EXTRACTION_TOOL["name"]},
+                    max_tokens=MAX_TOKENS,
+                    temperature=0,
+                    log_context=f"[company={company_id}] {pm_code}",
+                ),
+            )
+    except Exception as invoke_err:
+        log.error(f"[company={company_id}] {pm_code} CALL_CLAUDE FAILED: {type(invoke_err).__name__}: {invoke_err}")
+        return None, f"{type(invoke_err).__name__}: {invoke_err}", {}
+
+    # call_claude() already logged raw body length, stop_reason, and token
+    # usage (with the log_context prefix above).
+    stop_reason = raw.get("stop_reason")
+
+    # Structured output via forced tool use: the model's arguments come
+    # back as an ALREADY-PARSED object in a "tool_use" content block's
+    # "input" field, not as text this code has to bracket-find and
+    # json.loads() itself. This is what removes the whole class of bug
+    # that hit WP (returned prose instead of JSON) and PM8 (malformed
+    # JSON from an escaping mistake) -- there's no free-text parsing step
+    # left for either failure mode to occur in.
+    steps = None
+    for block in raw.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == EXTRACTION_TOOL["name"]:
+            steps = block.get("input", {}).get("tasks")
+            break
+
+    if steps is None:
+        # tool_choice forces this tool, so its absence is a real anomaly
+        # worth retrying rather than a quiet "empty" -- most likely a
+        # response that got cut off (check stop_reason) before the tool
+        # call was emitted.
+        reason = f"no tool_use block in response, stop_reason={stop_reason!r}"
+        log.error(
+            f"[company={company_id}] {pm_code} {reason}. "
+            f"Raw content preview: {str(raw.get('content'))[:300]}"
+        )
+        return None, reason, raw
+    if not isinstance(steps, list):
+        reason = f"tool_use input.tasks was not a list: {type(steps).__name__}"
+        log.error(f"[company={company_id}] {pm_code} {reason}")
+        return None, reason, raw
+
+    return steps, None, raw
+
+
 async def call_claude_for_pm_type(
-    bedrock,
     pm_code: str,
     pm_name: str,
     equipment_id: str,
     company_id: str,
     manual_images: list,
-) -> tuple[str, str, list]:
-    log.debug(f"{pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
+    deadline: float,
+) -> tuple[str, str, list, str]:
+    """
+    Returns (pm_code, pm_name, steps, status) where status is one of:
+      "ok"    -- steps were extracted normally
+      "empty" -- Claude legitimately found nothing for this category
+                 (a valid, expected outcome, not a failure) -- NOT retried
+      "error" -- every attempt failed (retrieval, invoke_model, or a
+                 response that never produced a usable tool_use block) --
+                 previously indistinguishable from "empty" in the output,
+                 and previously never retried at all.
+    See build_excel for how "error" is surfaced in the spreadsheet.
+
+    deadline: a time.monotonic() cutoff shared across all 10 categories
+    in this job (see GENERATION_DEADLINE_SECONDS / generate()). Checked
+    before every attempt, including the first, so that if this job is
+    already running long by the time this particular category's task
+    gets scheduled, it fails fast and gracefully into "error" rather than
+    starting an attempt it has no realistic time budget to retry. This is
+    what keeps one slow/throttled category from eating the time every
+    other category needed too, and stops the whole Lambda invocation from
+    being hard-killed at its timeout with nothing to show for it --
+    see the module changelog for why this matters more now that
+    individual attempts are allowed to take their time rather than fail
+    fast.
+    """
+    log.debug(f"[company={company_id}] {pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
     loop = asyncio.get_event_loop()
 
     # Retrieval runs per-PM-type and concurrently with the other nine
     # (via run_in_executor, since get_embedding()/psycopg2 are blocking
     # calls) rather than once upfront for the whole document -- see the
     # CHANGE LOG at the top of this file for why full-recall was replaced
-    # with per-type similarity search.
+    # with per-type similarity search. Done ONCE here, not repeated across
+    # retries below -- it's deterministic (same query, same embeddings,
+    # same top-K), so re-running it would only burn time budget for no
+    # benefit.
     query_text = PM_QUERY_TEXT.get(pm_code, pm_name)
     try:
         manual_text = await loop.run_in_executor(
             None, fetch_relevant_manual_chunks, equipment_id, company_id, query_text
         )
     except Exception as retrieval_err:
-        log.error(f"{pm_code} RETRIEVAL FAILED: {type(retrieval_err).__name__}: {retrieval_err}")
-        return pm_code, pm_name, []
+        log.error(f"[company={company_id}] {pm_code} RETRIEVAL FAILED: {type(retrieval_err).__name__}: {retrieval_err}")
+        return pm_code, pm_name, [], "error"
 
     if pm_code == "WP":
         prompt = build_working_principle_prompt(manual_text)
     else:
         prompt = build_pm_prompt(pm_code, pm_name, manual_text)
-    log.debug(f"{pm_code} PROMPT BUILT, length={len(prompt)}")
+    log.debug(f"[company={company_id}] {pm_code} PROMPT BUILT, length={len(prompt)}")
+    log.info(f"[company={company_id}] {pm_code} PROMPT LENGTH (chars): {len(prompt)}")
 
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens":        MAX_TOKENS,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-    })
-
-    log.info(f"{pm_code} PROMPT LENGTH (chars): {len(prompt)}")
-
-    try:
-        try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: bedrock.invoke_model(
-                    modelId     = BEDROCK_MODEL,
-                    body        = body,
-                    contentType = "application/json",
-                    accept      = "application/json",
-                )
+    # Application-level retry loop, layered ON TOP OF call_claude()'s own
+    # botocore-level retries (network errors, throttling within a single
+    # invoke_model call -- see bedrock_client.py). This loop instead
+    # catches "the call succeeded at the network level but the response
+    # wasn't usable" -- a fresh sample from the model on the next attempt
+    # often just avoids whatever made the first one unusable. Previously
+    # there was no retry here at all: one bad response permanently lost
+    # that category. Now that speed isn't the priority (up to 15 minutes
+    # available in Lambda per the infra this runs on), this trades time
+    # budget for a real second and third chance instead of giving up
+    # after one shot.
+    steps: list = []
+    status = "error"
+    last_reason = "not attempted"
+    for attempt in range(1, PM_CATEGORY_MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.error(
+                f"[company={company_id}] {pm_code} out of time budget before attempt {attempt}/"
+                f"{PM_CATEGORY_MAX_ATTEMPTS} (last failure: {last_reason}) -- giving up on this category"
             )
-        except Exception as invoke_err:
-            log.error(f"{pm_code} INVOKE_MODEL FAILED: {type(invoke_err).__name__}: {invoke_err}")
-            raise
+            break
 
-        try:
-            raw_body = response["body"].read()
-            log.info(f"{pm_code} RAW BODY LENGTH: {len(raw_body)} bytes")
-            log.info(f"{pm_code} RAW BODY PREVIEW: {raw_body[:500]}")
-        except Exception as read_err:
-            log.error(f"{pm_code} BODY READ FAILED: {type(read_err).__name__}: {read_err}")
-            raise
-
-        raw = json.loads(raw_body)
-        raw_text = raw["content"][0]["text"].strip()
-
-        # Claude sometimes prepends explanatory text before the JSON array
-        # (e.g. "Based on the equipment manual provided, here are the
-        # maintenance tasks..."), despite being instructed to return only
-        # JSON. Extract the array substring directly instead of assuming
-        # the entire response is valid JSON.
-        start_bracket = raw_text.find("[")
-        end_bracket   = raw_text.rfind("]")
-
-        if start_bracket != -1 and end_bracket != -1 and end_bracket > start_bracket:
-            json_str = raw_text[start_bracket:end_bracket + 1]
-            try:
-                steps = json.loads(json_str)
-            except json.JSONDecodeError as parse_err:
-                log.error(f"{pm_code} JSON parse failed after extraction: {parse_err}. Extracted: {json_str[:300]}")
-                steps = []
-        else:
-            log.warning(f"{pm_code} no JSON array found in response, treating as empty. Raw text: {raw_text[:300]}")
-            steps = []
-
-        if not isinstance(steps, list):
-            steps = []
-
-        log.info(f"{pm_code} ({pm_name}): {len(steps)} steps extracted")
-
-        # Resolve manual images for this type's steps now. Purely local
-        # (DB already fetched, presigning is local signing) -- no network
-        # call, so this can't hang. Runs for WP too -- its components
-        # (e.g. "Airend", "Pressure Regulator") are genuine physical
-        # parts, same as PM1-PM9's.
-        tally = attach_images_to_steps(steps, manual_images)
-        matched = tally["part_number"] + tally["keyword"]
-        if steps:
-            log.info(
-                f"{pm_code} images: {matched}/{len(steps)} steps matched "
-                f"({tally['part_number']} by part number, {tally['keyword']} by keyword)"
+        if attempt > 1:
+            log.warning(
+                f"[company={company_id}] {pm_code} attempt {attempt}/{PM_CATEGORY_MAX_ATTEMPTS} "
+                f"(previous attempt failed: {last_reason})"
             )
 
-        return pm_code, pm_name, steps
+        result_steps, error_reason, _raw = await _attempt_bedrock_call(prompt, company_id, pm_code)
 
-    except Exception as e:
-        log.error(f"Claude call failed for {pm_code} ({pm_name}): {type(e).__name__}: {e}")
-        return pm_code, pm_name, []
+        if error_reason is None:
+            # result_steps is a real list here, possibly empty -- an
+            # empty list is Claude legitimately finding nothing, which is
+            # a valid outcome and NOT retried.
+            steps = result_steps
+            status = "ok" if steps else "empty"
+            break
+
+        last_reason = error_reason
+        if attempt < PM_CATEGORY_MAX_ATTEMPTS:
+            # Linear backoff between application-level retries (separate
+            # from, and on top of, botocore's own backoff inside a single
+            # call_claude() invocation). Capped against whatever time
+            # budget is actually left so this never itself becomes the
+            # reason the shared deadline gets blown.
+            backoff = min(PM_CATEGORY_RETRY_BACKOFF_SECONDS * attempt, max(remaining - 5, 0))
+            if backoff > 0:
+                await asyncio.sleep(backoff)
+
+    if status == "error":
+        log.error(
+            f"[company={company_id}] {pm_code} exhausted all attempts, last failure: {last_reason}"
+        )
+
+    log.info(f"[company={company_id}] {pm_code} ({pm_name}): {len(steps)} steps extracted, status={status}")
+
+    # Resolve manual images for this type's steps now. Purely local (DB
+    # already fetched, presigning is local signing) -- no network call, so
+    # this can't hang. Runs for WP too -- its components (e.g. "Airend",
+    # "Pressure Regulator") are genuine physical parts, same as PM1-PM9's.
+    tally = attach_images_to_steps(steps, manual_images)
+    matched = tally["part_number"] + tally["keyword"]
+    if steps:
+        log.info(
+            f"[company={company_id}] {pm_code} images: {matched}/{len(steps)} steps matched "
+            f"({tally['part_number']} by part number, {tally['keyword']} by keyword)"
+        )
+
+    return pm_code, pm_name, steps, status
 
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
@@ -827,9 +1164,14 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
     Build the PM strategy Excel file from Claude's structured output.
     Format matches PM_strategy.xlsx exactly.
 
-    pm_results: list of (pm_code, pm_name, steps_list) tuples in PM1-PM9 order.
-    All PM types are written -- empty ones show the header and column row
-    with no data rows, ready for the reviewer to fill in manually.
+    pm_results: list of (pm_code, pm_name, steps_list, status) tuples in
+    PM1-PM9 order. status is "ok" / "empty" / "error" (see
+    call_claude_for_pm_type). All PM types are written -- empty ones show
+    the header and column row with no data rows, ready for the reviewer
+    to fill in manually. A category with status "error" gets a visibly
+    flagged row instead of looking identical to a legitimately empty one
+    -- previously there was no way to tell the two apart just by looking
+    at the file.
     """
     wb   = Workbook()
     ws   = wb.active
@@ -841,7 +1183,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
 
     current_row = 1
 
-    for pm_code, pm_name, steps in pm_results:
+    for pm_code, pm_name, steps, status in pm_results:
 
         # PM type header row (e.g. "PM2 - Lubrication")
         header_cell = ws.cell(row=current_row, column=1, value=f"{pm_code} - {pm_name}")
@@ -863,6 +1205,25 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
             cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
         ws.row_dimensions[current_row].height = 30
         current_row += 1
+
+        if status == "error":
+            # Flagged distinctly from a legitimately empty category so the
+            # reviewer (or the salesperson sending this to a customer)
+            # doesn't mistake "generation failed for this category" for
+            # "the manual just doesn't cover this".
+            error_cell = ws.cell(
+                row=current_row, column=1,
+                value=f"GENERATION ERROR - {pm_code} failed to generate, retry this category. Do not treat as empty.",
+            )
+            error_cell.font = ERROR_FONT
+            error_cell.fill = ERROR_FILL
+            error_cell.alignment = Alignment(vertical="center")
+            ws.row_dimensions[current_row].height = 20
+            ws.merge_cells(
+                start_row=current_row, start_column=1,
+                end_row=current_row, end_column=len(COLUMNS)
+            )
+            current_row += 1
 
         # Data rows -- skipped naturally if steps is empty
         for step in steps:
@@ -928,7 +1289,7 @@ def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
         conn.close()
 
     if not row:
-        log.warning(f"No equipment record found for {equipment_id}, falling back to equipment_id in filename")
+        log.warning(f"[company={company_id}] No equipment record found for {equipment_id}, falling back to equipment_id in filename")
         return {"name": "", "reference_code": ""}
 
     return {"name": row.get("name") or "", "reference_code": row.get("reference_code") or ""}
@@ -964,9 +1325,14 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     2. Run ten parallel Claude calls (Working Principle + nine PM types),
        each retrieving its own most-relevant manual chunks (see
        fetch_relevant_manual_chunks) and resolving its own stock
-       component images inline
+       component images inline. Concurrency to Bedrock is capped at
+       BEDROCK_CALL_CONCURRENCY (see that constant's comment for what
+       this does and does not solve).
     3. Build and return the Excel file as bytes
-       -- always returns a valid file even if all PM types are empty
+       -- always returns a valid file even if all PM types are empty;
+       any category that errored (as opposed to legitimately empty) is
+       flagged visibly in the file rather than looking identical to an
+       empty one -- see build_excel.
 
     Return type is unchanged (bytes only) so nothing already calling
     generate() directly breaks. For a real filename bundled with the
@@ -987,8 +1353,6 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
             "Please upload and ingest a document for this node first."
         )
 
-    bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION, config=BEDROCK_CLIENT_CONFIG)
-
     # Fetched once, up front -- this equipment's own manual images are
     # matched in-memory against every step's component keyword, rather
     # than one DB round-trip per keyword. No network client needed for
@@ -1002,16 +1366,34 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
     # that needs to change to turn image matching off end-to-end.
     manual_images = fetch_manual_images_for_equipment(equipment_id, company_id) if IMAGE_MATCHING_ENABLED else []
 
+    # Shared across every category's retry loop -- see GENERATION_DEADLINE_SECONDS
+    # and call_claude_for_pm_type's docstring for why this needs to be one
+    # deadline all 10 tasks check against, not 10 independent budgets.
+    deadline = time.monotonic() + GENERATION_DEADLINE_SECONDS
+
     tasks = [
-        call_claude_for_pm_type(bedrock, pm_code, pm_name, equipment_id, company_id, manual_images)
+        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, deadline)
         for pm_code, pm_name in PM_TYPES
     ]
     results = await asyncio.gather(*tasks)
 
     pm_results = list(results)
 
-    populated = sum(1 for _, _, steps in pm_results if steps)
-    log.info(f"Generation complete. {populated} / {len(PM_TYPES)} PM types have tasks.")
+    ok_count    = sum(1 for _, _, _, status in pm_results if status == "ok")
+    empty_count = sum(1 for _, _, _, status in pm_results if status == "empty")
+    error_count = sum(1 for _, _, _, status in pm_results if status == "error")
+    log.info(
+        f"[company={company_id}] Generation complete for equipment {equipment_id}. "
+        f"{ok_count} ok / {empty_count} legitimately empty / {error_count} errored "
+        f"(of {len(PM_TYPES)} PM types)."
+    )
+    if error_count:
+        log.warning(
+            f"[company={company_id}] {error_count} PM type(s) errored during generation for "
+            f"equipment {equipment_id} -- these are flagged in the output Excel, but this job "
+            f"should probably be retried or surfaced to the caller rather than treated as fully "
+            f"successful just because a file was produced."
+        )
 
     return build_excel(equipment_id, pm_results)
 
