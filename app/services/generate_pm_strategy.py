@@ -16,6 +16,48 @@ PM Types:
   PM3 - Calibration            PM8 - Safety Inspection
   PM4 - Replacements           PM9 - Software Back-up
 
+CHANGE LOG (2026-09-22 -- fixes from the Next Gen 500E (mlf001) review)
+--------------------------------------------------------------------------
+The first real run showed the right structure but untrustworthy content:
+21 of 38 OEM schedule lines had a wrong or missing frequency, the same
+chain/belt tasks appeared in three categories, HMI screens inflated PM3/PM6,
+per-cover tasks inflated PM8, Tier A had 106 lines (cables, push buttons),
+recommended tasks invented measurement methods, and Material Number held
+unit codes and the wrong part. Changes:
+
+  A. OEM SCHEDULE PASS. The schedule table / lube chart is extracted once,
+     one row per printed line (SCHEDULE_TOOL), and each row is assigned to
+     ONE category by verb rules (classify_action). Frequency comes from the
+     row; a row whose column can't be read gets NO frequency (never a guess)
+     plus a review note. An enrichment call writes instructions only
+     (frequency/category are locked). Category prompts get the captured
+     rows and are told not to re-extract them.
+  B. INGEST SAFETY NET. flat_schedule_warning() flags a schedule chunk
+     whose column layout was lost at ingestion. The real fix is the
+     ingest_document.py table patch; this note tells the reviewer until
+     each manual is re-ingested.
+  C. POST-PROCESSING, in order: category validation by verbs -> HMI/recipe
+     parameter entries moved to Setpoints -> tasks more frequent than per
+     shift (automatic functions) and counter/log readings dropped ->
+     per-instance tasks consolidated (>= 3 near-identical) -> fuzzy dedupe
+     across categories (same action class + token overlap coefficient
+     >= 0.8, schedule rows win) -> material numbers validated against the
+     parts list (must be that component's part) and filled only on a
+     unique head-noun + assembly match -> default owners.
+  D. CRITICAL SPARES. Cables, wires, relays, guides, levers, cams and push
+     buttons excluded or demoted; generic "nozzle" is Tier B; bare "switch"
+     no longer means sensor.
+  E. RECOMMENDED TASKS. Only Tier A gaps + safety devices + setpoints;
+     coverage matched by head noun; max 12; similar parts in one task; no
+     measurement methods without a manual reference value; PM8 only for
+     safety devices. Recommended tasks go through the same cleanup.
+  F. PARTS LIST. Each batch gets the preceding chunk's tail so continuation
+     tables keep their assembly; assembly names canonicalized ("X 2 (081A)"
+     -> "X (081A)"); dedupe key is (assembly, item, part number).
+  G. LABOR. PM Summary uses DEFAULT_TASK_HOURS by PM type when the manual
+     gives no time, shown as Hrs Basis "Default" (the import sheet's Hrs
+     column stays manual-only).
+
 CHANGE LOG (2026-09-21 -- "robust PM" revision)
 -----------------------------------------------
 Goal: produce the same kind of output a reliability engineer builds by
@@ -196,7 +238,8 @@ PARTS_BATCH_CHUNKS = int(os.environ.get("PM_PARTS_BATCH_CHUNKS", 5))
 PARTS_MAX_BATCHES = int(os.environ.get("PM_PARTS_MAX_BATCHES", 40))
 PARTS_MAX_SPLIT_DEPTH = 3
 PARTS_CANDIDATE_MIN_SCORE = 8
-MAX_RECOMMENDED_TASKS = 25
+PARTS_PRECEDING_CHARS = 600
+MAX_RECOMMENDED_TASKS = 12
 MAX_CONTEXT_TASK_LINES = 150
 MAX_CONTEXT_PART_LINES = 60
 
@@ -361,6 +404,75 @@ REVIEW_TOOL = {
         "required": ["notes"],
     },
 }
+
+SCHEDULE_TOOL = {
+    "name": "record_schedule_rows",
+    "description": "Record every row of the manual's maintenance schedule tables and lube charts. Empty list if none.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "area": {"type": "string", "description": "Row group / assembly heading, e.g. 'Gripper Chains'."},
+                        "task": {"type": "string", "description": "The task text exactly as printed."},
+                        "frequency": {"type": "string", "description": "Normalized code, or blank if not recoverable."},
+                        "frequency_evidence": {"type": "string", "description": "Column header or text the frequency was read from, as printed."},
+                        "column_ambiguous": {"type": "boolean", "description": "True if the text does not show which column the mark is under."},
+                        "source_ref": {"type": "string"},
+                    },
+                    "required": ["area", "task", "frequency", "column_ambiguous"],
+                },
+            },
+        },
+        "required": ["rows"],
+    },
+}
+
+SCHEDULE_ENRICH_TOOL = {
+    "name": "record_schedule_task_details",
+    "description": "Record work-instruction details for each numbered OEM schedule row.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "details": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "row_index": {"type": "integer"},
+                        "task_list_description": {"type": "string"},
+                        "component": {"type": "string"},
+                        "instruction": {"type": "string"},
+                        "failure_modes": {"type": "string"},
+                        "acceptance_criteria": {"type": "string"},
+                        "owner": {"type": "string", "enum": ["Operator", "Technician", "Electrician", "Specialist"]},
+                        "system_condition": {"type": "integer"},
+                        "work_needed": {"type": "integer"},
+                    },
+                    "required": ["row_index", "task_list_description", "component", "instruction"],
+                },
+            },
+        },
+        "required": ["details"],
+    },
+}
+
+# Planning defaults used ONLY in the "PM Summary" sheet when the manual
+# gives no task time. Shown with Hrs Basis = "Default" so nobody mistakes
+# them for OEM data; the PM Strategy sheet's Hrs column stays manual-only.
+DEFAULT_TASK_HOURS = {
+    "PM1": 0.1, "PM2": 0.25, "PM3": 0.25, "PM4": 0.5, "PM5": 4.0,
+    "PM6": 0.1, "PM7": 0.25, "PM8": 0.25, "PM9": 0.25,
+}
+
+SCHEDULE_TOP_K = 12
+SCHEDULE_ENRICH_BATCH = 25
+CONSOLIDATE_MIN_GROUP = 3
+DUP_OVERLAP_THRESHOLD = 0.8
+CONSOLIDATE_SIMILARITY = 0.75
 
 COLUMNS = [
     "Operation",
@@ -591,13 +703,13 @@ EQUIPMENT MANUAL:
 PM_TYPE_GUIDANCE = {
     "PM1": "Inspection means a routine visual or physical CHECK with no scheduled part replacement -- e.g. checking for leaks, fastener tightness, fluid level, belt/chain condition, setup gaps. If the task's end action is replacing a part, it does NOT belong here -- that's PM4.",
     "PM2": "Lubrication means applying, topping up, or changing a lubricant, grease, or coolant itself (greasing points on a lube chart, topping up oil, changing gear oil, filling an air-line lubricator). Filter/element swaps belong in PM4.",
-    "PM3": "Calibration means adjusting a device or setting to a specified reference value: regulator pressures, speeds, torques, gaps/clearances, sensor positions, temperatures, chain/belt tension to a spec -- even if the manual's heading doesn't say 'calibration'.",
+    "PM3": "Calibration means periodically verifying or adjusting a device to a specified reference value: regulator pressures, speeds, torques, gaps/clearances, sensor positions, temperatures, chain/belt tension to a spec. NOT recipe or HMI parameter entry (initial values, product settings, 'set X to Y on the touch panel') -- those are setup settings, not PM tasks; skip them.",
     "PM4": "Replacements means the routine, scheduled swap of a wearable part or consumable on a fixed interval (filters, elements, belts, blades, knives, seals, springs, fluids). This is the ONLY category for recurring replacement tasks -- do not also list them under PM2, PM5, or PM6.",
     "PM5": "Overhaul means major teardown, rebuild, or reconditioning of an assembly. Not routine replacement (PM4) or routine fluid changes (PM2). If the manual says overhauls are outside its scope or must go to an authorized service department, return an EMPTY list.",
-    "PM6": "Condition Monitoring means measuring or observing a parameter against a threshold (temperature, pressure, vibration, noise, current, oil level trend, diagnostic/fault log review) WITHOUT a replacement in the same task.",
+    "PM6": "Condition Monitoring means measuring or observing a parameter against a threshold that indicates degradation (temperature, pressure, vibration, noise, current, repeat fault codes) WITHOUT a replacement in the same task. Do NOT create tasks for reading counters, runtime/power-on timers, production totals, or operation logs unless the manual gives a threshold that triggers maintenance. Monitor several readings on the same screen as ONE task, not one task per reading.",
     "PM7": "Cleaning means removing dirt, grease, glue, product, debris, or buildup from a component that stays installed. Not tasks whose primary action is replacing a part.",
-    "PM8": "Safety Inspection means checking safety-critical items specifically: guards, interlocks, emergency stops, safety valves, safety decals/labels, lockout devices, and fasteners or panels tied to injury risk.",
-    "PM9": "Software Back-up means backing up or restoring configuration, recipes, firmware, or software on a PLC, HMI, controller, or electronic module. If the manual describes none, return an EMPTY list.",
+    "PM8": "Safety Inspection means checking safety-critical items specifically: guards, interlocks, emergency stops, safety valves, safety decals/labels, lockout devices. Test all guard/cover interlocks as ONE task (list the covers in component), not one task per cover. Ordinary valves, sensors and fasteners are not safety inspection.",
+    "PM9": "Software Back-up means backing up or restoring configuration, recipes, firmware, or software on a PLC, HMI, controller, or electronic module. If the controller backs up automatically, create ONE periodic task to verify the automatic backup is enabled and working, plus a manual backup before program changes -- never a task at the automatic interval. If the manual describes none, return an EMPTY list.",
 }
 
 _FREQUENCY_GUIDANCE = (
@@ -626,8 +738,13 @@ def _setpoints_block(setpoints_text: str) -> str:
     )
 
 
-def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str, setpoints_text: str = "") -> str:
+def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str, setpoints_text: str = "", captured_text: str = "") -> str:
     category_guidance = PM_TYPE_GUIDANCE.get(pm_code, "")
+    captured_block = (
+        "\n\nALREADY CAPTURED FROM THE MANUAL'S MAINTENANCE SCHEDULE TABLE (area | task | frequency). "
+        "Do NOT extract these again in any wording -- only extract tasks that are NOT in this list:\n"
+        f"{captured_text}\n"
+    ) if captured_text else ""
     return f"""You are a maintenance engineering expert. You have been given an equipment manual excerpt below.
 
 Your task is to extract ALL maintenance tasks that fall under the category: {pm_code} - {pm_name}
@@ -638,6 +755,11 @@ If a task genuinely fits more than one category, extract it under the SINGLE mos
 
 Tasks can come from a maintenance schedule table, a lube chart or drawing legend, a component description ("rollers should be scraped clean before each shift"), a troubleshooting note that states a routine check, or a setup section that gives a value to verify. Look in all of these.
 
+Granularity rules:
+- One task per check activity, not per instance: identical checks on several identical items (covers, heaters CH1-CH3, sensors) are ONE task with the items listed in component.
+- Do not add "x1" or any quantity the manual does not state.
+- Do not describe measurement methods (thickness, diameter, pitch) or tools the manual does not mention.
+
 For each task, extract:
 - operation: "Operation_010", "Operation_020", ... (increment by 10)
 - task_list_description: "Assembly - Subassembly - Component x[quantity]". Preserve quantities.
@@ -645,7 +767,7 @@ For each task, extract:
 - hrs: technician time for the task as decimal hours (e.g. 0.1, 0.5, 1.0) -- NOT the interval. Leave blank if the manual gives no time.
 - work_needed: 1 if active work is required, 0 if observation only. Default 1.
 - system_condition: 0 machine stopped, 1 machine running. Default 0.
-- material_number: the manual's OWN part/drawing/catalog number for this item if printed (e.g. "341047", "992-03377", "SR29-T-2-9.5"), copied exactly. Blank only if none is given.
+- material_number: the manual's OWN part number for THIS component, copied exactly, only if the manual prints it for this component. Never an assembly/unit code (e.g. "072"), an electrical rating, or a part number of a different component. Blank if unsure -- blanks are filled later from the parts list.
 - component: the component name only, e.g. "Bearings x8"
 - instruction: step-by-step work instruction a technician can follow. Number each step from 1, each on its own line with a blank line between steps (a literal "\\n\\n" between step N and N+1). Be specific; include the lubricant/grade, tool, or reference value when the manual gives one.
 - failure_modes: comma-separated failure modes this task prevents. Blank if not inferable from the manual.
@@ -654,7 +776,7 @@ For each task, extract:
 - source_ref: where in the manual this task comes from (section, page, table, or drawing as printed). If the manual gives DIFFERENT intervals for the same task in two places, use the SHORTER interval in frequency and state both in source_ref (e.g. "Lube chart: weekly; Sched. Maint. p.29: monthly").
 - {_OWNER_GUIDANCE}
 
-Call the record_extracted_steps tool with your findings. If no {pm_name} tasks are found, call it with an empty tasks list.{_setpoints_block(setpoints_text)}
+Call the record_extracted_steps tool with your findings. If no {pm_name} tasks are found, call it with an empty tasks list.{captured_block}{_setpoints_block(setpoints_text)}
 
 EQUIPMENT MANUAL:
 {manual_text}"""
@@ -681,11 +803,16 @@ EQUIPMENT MANUAL:
 {manual_text}"""
 
 
-def build_parts_prompt(manual_text: str) -> str:
+def build_parts_prompt(manual_text: str, preceding_text: str = "") -> str:
+    preceding = (
+        "\n\nPRECEDING TEXT (context only, do NOT extract rows from it): the text just before this excerpt. "
+        "If the first rows of the excerpt continue a table from here, use this assembly name for them:\n"
+        f"{preceding_text}\n"
+    ) if preceding_text else ""
     return f"""You are extracting an equipment parts list. The text below is from an equipment manual and may contain one or more parts-list tables (often OCR'd from scans, so columns may be run together).
 
 Record EVERY parts-list row you can identify:
-- assembly: the assembly / parts-list title the row belongs to (carry it forward to every row under that heading).
+- assembly: the assembly / parts-list title the row belongs to, copied exactly as printed including any code in parentheses (carry it forward to every row under that heading). Never invent a new assembly name such as "X 2" for a continuation page -- reuse the heading the table continues.
 - parts_list_ref: the parts list or drawing number of that assembly if printed (e.g. "400 A 22105PM").
 - item_no: the item/position number as printed ("" if none).
 - part_number: the part/drawing/catalog number EXACTLY as printed (keep spaces, hyphens, suffixes). "" if the row has none, e.g. "See electrical docs".
@@ -695,7 +822,7 @@ Record EVERY parts-list row you can identify:
 
 Rules: do not invent rows, merge rows, or fill in missing part numbers. Skip blank template rows. Skip text that is not a parts table (troubleshooting, instructions).
 
-Call record_parts_list_rows. Empty list if there is no parts table in this text.
+Call record_parts_list_rows. Empty list if there is no parts table in this text.{preceding}
 
 MANUAL TEXT:
 {manual_text}"""
@@ -705,14 +832,16 @@ def build_recommended_prompt(tasks_summary: str, gaps_summary: str, setpoints_te
     return f"""You are a senior reliability engineer reviewing a PM plan that was extracted from an OEM manual. The OEM content is often thin: it lists a few lubrication and replacement tasks but misses condition checks, safety function tests, and setup verification. Your job is to propose ONLY the gap-filling tasks that are clearly justified by the items listed under GAPS, using the manual excerpt for component names and context.
 
 Propose a task only for:
-1. A Tier A/B wear or critical part in GAPS with no existing task: an inspection, measurement, or replacement-on-condition task for its likely failure mode.
-2. A safety device the manual mentions (emergency stop, interlock, guard door, safety limit sensor, safety valve) with no existing functional test: a periodic functional test (PM8).
+1. A Tier A part in GAPS with no existing task: an inspection or replace-on-condition task for its likely failure mode. Similar parts (e.g. several belts, several photo-eyes) go in ONE task with the parts listed in component and material_number.
+2. A safety device the manual mentions (emergency stop, interlock, guard door, safety limit sensor, safety valve) with no existing functional test: ONE periodic functional test covering all of them (PM8). PM8 is only for safety devices.
 3. A setpoint in REFERENCE SETPOINTS that no existing task checks: a periodic verification (PM3 or PM1).
 4. The machine's primary output quality (e.g. seal, cut, weld, fill), if the manual describes it and nothing checks it: a quick per-shift check (PM6).
 
 Hard rules:
 - Do NOT duplicate or reword an EXISTING TASK.
 - Numeric limits ONLY from REFERENCE SETPOINTS or the manual excerpt. Otherwise acceptance_criteria must be "No limit in manual -- record baseline at first PM and trend".
+- Methods limited to what a technician can do without manual-specific data: visual check, rotate or move by hand, listen, compare to a setpoint or baseline, check the HMI I/O monitor if the manual has one. Do NOT prescribe measurements (thickness, diameter, pitch, resistance) unless the manual gives the reference value.
+- Only use a part as the subject if its description clearly is that kind of part; if a GAPS line is ambiguous (e.g. a "nozzle" that is really a duct), skip it.
 - Use the manual's component names and part numbers (material_number) where given.
 - source must be "Recommended". source_ref: the part number, setpoint, or manual section that justifies the task.
 - rationale: one sentence naming the gap.
@@ -749,6 +878,47 @@ Call record_review_notes. Empty list if nothing qualifies.
 
 PLAN TASKS (pm_code | task | component | frequency | source_ref):
 {tasks_summary or "(none)"}
+{_setpoints_block(setpoints_text)}
+MANUAL EXCERPT:
+{manual_text}"""
+
+
+def build_schedule_prompt(manual_text: str) -> str:
+    return f"""You are extracting the OEM preventive maintenance schedule from an equipment manual excerpt.
+
+Find every maintenance schedule table, PM chart, lube chart or lube-point legend, and scheduled-maintenance list. Record ONE row per task line, exactly as printed:
+- area: the row group or assembly heading the line sits under (e.g. "Gripper Chains").
+- task: the task text as printed. Do not merge or split lines.
+- frequency: one normalized code: "Shift", "1D", "1W", "2W" (bi-weekly), "1M", "2M" (bi-monthly), "3M", "6M", "1Y", "<n>H" (operating hours), or "Event" (after startup/repair).
+- frequency_evidence: the column header or phrase the frequency was read from, as printed (e.g. "Bi-Weekly column", "every 3,000 hours").
+- column_ambiguous: tables often mark frequency with a symbol (*, X, check) under a column. If the text is a proper table (Markdown | cells) the mark's column is known. If the text has lost the column layout (marks run together with the task text and you cannot tell which column a mark is under), set column_ambiguous=true and frequency to "". NEVER guess a column.
+- source_ref: section/page/drawing name.
+
+Include lube-point legends ("LUBE ALL POINTS WEEKLY: 1 kicker pivot, 2 top idlers...") as one row per listed point with that frequency. Skip troubleshooting tables and parts lists.
+
+Call record_schedule_rows. Empty list if there is no schedule in this text.
+
+MANUAL TEXT:
+{manual_text}"""
+
+
+def build_schedule_enrich_prompt(rows_text: str, setpoints_text: str, manual_text: str) -> str:
+    return f"""You are writing work instructions for OEM preventive maintenance tasks. Each numbered row below is a task printed in the manual's maintenance schedule. Frequency and category are already fixed -- do not change or restate them.
+
+For EVERY row, return:
+- row_index: the row number.
+- task_list_description: "Area - Component - Action", using the manual's terms.
+- component: the component name only, no invented quantities.
+- instruction: numbered steps (each on its own line, blank line between) that carry out exactly the printed task. You may split a compound task ("lubricate drive chain and check it for tension") into steps and add the obvious safe-access step (stop / lock out) when the machine must be stopped. Use lubricant grades, values and methods ONLY if they appear in the manual excerpt or setpoints. Do not invent measurements or tools.
+- failure_modes: what this task prevents, in the manual's terms where possible.
+- acceptance_criteria: a value from the manual or REFERENCE SETPOINTS, else exactly "No limit in manual -- record baseline at first PM".
+- {_OWNER_GUIDANCE}
+- system_condition: 0 stopped, 1 running. work_needed: 1 active work, 0 observation.
+
+Call record_schedule_task_details with one entry per row.
+
+ROWS (index | area | task | frequency):
+{rows_text}
 {_setpoints_block(setpoints_text)}
 MANUAL EXCERPT:
 {manual_text}"""
@@ -985,6 +1155,7 @@ async def call_claude_for_pm_type(
     bedrock_semaphore: asyncio.Semaphore,
     setpoints_text: str = "",
     anchor_chunks: Optional[list] = None,
+    captured_text: str = "",
 ) -> tuple:
     """
     Returns (pm_code, pm_name, steps, status), status in "ok"/"empty"/"error".
@@ -1011,7 +1182,7 @@ async def call_claude_for_pm_type(
         if pm_code == "WP":
             p = build_working_principle_prompt(manual_text)
         else:
-            p = build_pm_prompt(pm_code, pm_name, manual_text, setpoints_text)
+            p = build_pm_prompt(pm_code, pm_name, manual_text, setpoints_text, captured_text)
         return p + (CONCISE_RETRY_SUFFIX if concise else "")
 
     log.info(f"[company={company_id}] {pm_code} PROMPT LENGTH (chars): {len(build_prompt(False))}")
@@ -1067,7 +1238,8 @@ async def extract_setpoints(equipment_id: str, company_id: str, deadline: float,
 # ── Parts list pass ──────────────────────────────────────────────────────────
 
 async def _extract_parts_batch(chunks: list, company_id: str, label: str, deadline: float,
-                               bedrock_semaphore: asyncio.Semaphore, depth: int = 0) -> tuple:
+                               bedrock_semaphore: asyncio.Semaphore, depth: int = 0,
+                               preceding_text: str = "") -> tuple:
     """
     Extract parts rows from a batch of chunks. On truncation, split the
     batch in half and recurse (up to PARTS_MAX_SPLIT_DEPTH). Returns
@@ -1075,7 +1247,7 @@ async def _extract_parts_batch(chunks: list, company_id: str, label: str, deadli
     """
     text = "\n\n".join(chunks)
     rows, status, reason = await _call_with_retries(
-        lambda concise: build_parts_prompt(text),
+        lambda concise: build_parts_prompt(text, preceding_text),
         PARTS_TOOL, "parts", company_id, label, deadline, bedrock_semaphore,
         retry_on_truncation=False,
     )
@@ -1085,24 +1257,47 @@ async def _extract_parts_batch(chunks: list, company_id: str, label: str, deadli
         mid = len(chunks) // 2
         log.info(f"[company={company_id}] {label} truncated; splitting {len(chunks)} chunks into {mid}+{len(chunks) - mid}")
         (a_rows, a_ok), (b_rows, b_ok) = await asyncio.gather(
-            _extract_parts_batch(chunks[:mid], company_id, f"{label}a", deadline, bedrock_semaphore, depth + 1),
-            _extract_parts_batch(chunks[mid:], company_id, f"{label}b", deadline, bedrock_semaphore, depth + 1),
+            _extract_parts_batch(chunks[:mid], company_id, f"{label}a", deadline, bedrock_semaphore, depth + 1, preceding_text),
+            _extract_parts_batch(chunks[mid:], company_id, f"{label}b", deadline, bedrock_semaphore, depth + 1,
+                                 chunks[mid - 1][-PARTS_PRECEDING_CHARS:]),
         )
         return a_rows + b_rows, (a_ok and b_ok)
     return [], False
 
 
+_ASM_CONTINUATION_RE = re.compile(r"\s+(\d{1,2}|cont(inued|'d|\.)?)(?=\s*(\(|$))", re.IGNORECASE)
+
+
+def canonical_assembly(name: str) -> str:
+    """
+    "FRONT SIDE BELT 2 (081A)" -> "FRONT SIDE BELT (081A)"; "END SEALER COVER(072)"
+    -> "END SEALER COVER (072)". Continuation pages must not become new assemblies.
+    """
+    n = re.sub(r"\s+", " ", (name or "").strip())
+    n = re.sub(r"\s*\(", " (", n).strip()
+    n = _ASM_CONTINUATION_RE.sub("", n)
+    return n.strip()
+
+
+def _pn_key(pn: str) -> str:
+    return re.sub(r"[\s\-./_]", "", (pn or "").lower())
+
+
 def _dedupe_parts(rows: list) -> list:
-    """Chunk overlap can emit the same row twice; keep the first."""
+    """
+    Normalize assembly names, then drop repeats from chunk overlap and batch
+    splits. Key is (assembly, item no, part no) -- description is left out
+    because OCR can render the same row's description slightly differently.
+    """
     seen, out = set(), []
     for r in rows:
-        key = (
-            (r.get("assembly") or "").strip().lower(),
-            (r.get("item_no") or "").strip().lower(),
-            (r.get("part_number") or "").strip().lower(),
-            (r.get("description") or "").strip().lower(),
-        )
-        if key in seen or not (r.get("description") or r.get("part_number")):
+        if not ((r.get("description") or "").strip() or (r.get("part_number") or "").strip()):
+            continue
+        r["assembly"] = canonical_assembly(r.get("assembly", ""))
+        item = (r.get("item_no") or "").strip().lower()
+        pn = _pn_key(r.get("part_number"))
+        key = (r["assembly"].lower(), item, pn) if (item or pn) else (r["assembly"].lower(), _norm(r.get("description")))
+        if key in seen:
             continue
         seen.add(key)
         out.append(r)
@@ -1136,14 +1331,19 @@ async def extract_parts_list(equipment_id: str, company_id: str, deadline: float
         keep = {i for i, _, _ in sorted(candidates, key=lambda t: -t[2])[:cap]}
         candidates = [t for t in candidates if t[0] in keep]
     candidate_texts = [c for _, c, _ in candidates]  # ingest order preserved
+    candidate_idx = [i for i, _, _ in candidates]
     log.info(f"[company={company_id}] PARTS: {len(candidate_texts)}/{len(all_chunks)} chunks look like parts tables")
     if not candidate_texts:
         return [], "empty", notes
 
-    batches = [candidate_texts[i:i + PARTS_BATCH_CHUNKS] for i in range(0, len(candidate_texts), PARTS_BATCH_CHUNKS)]
+    batches, preceding = [], []
+    for i in range(0, len(candidate_texts), PARTS_BATCH_CHUNKS):
+        batches.append(candidate_texts[i:i + PARTS_BATCH_CHUNKS])
+        prev_idx = candidate_idx[i] - 1  # the chunk just before this batch in DOCUMENT order, candidate or not
+        preceding.append(all_chunks[prev_idx][-PARTS_PRECEDING_CHARS:] if prev_idx >= 0 else "")
     results = await asyncio.gather(*[
-        _extract_parts_batch(b, company_id, f"PARTS#{n + 1}", deadline, bedrock_semaphore)
-        for n, b in enumerate(batches)
+        _extract_parts_batch(b, company_id, f"PARTS#{n + 1}", deadline, bedrock_semaphore, preceding_text=pre)
+        for n, (b, pre) in enumerate(zip(batches, preceding))
     ])
     rows = [r for batch_rows, _ok in results for r in batch_rows]
     failed = sum(1 for _rows, ok in results if not ok)
@@ -1172,12 +1372,12 @@ _A_RULES = [
     (r"\bknife|\bblade|\bcutter\b", "Cutting", "Edge wear or chipping; poor cut"),
     (r"(?<!for )mechanical (shaft )?seal|seal kit|\bsealer\b|seal ring", "Sealing", "Seal wear or leakage"),
     (r"heater|heating element", "Heating", "Element burnout; temperature not reached"),
-    (r"nozzle", "Dispensing", "Clogging; uneven or missing pattern"),
+    (r"nozzle.*(glue|adhesive|spray|orifice|dia)|(glue|adhesive|spray) nozzle", "Dispensing", "Clogging; uneven or missing pattern"),
     (r"heated hose|automatic hose|hose, heated", "Dispensing", "Hose heater failure"),
     (r"\bbelt\b|timing belt|round belt|conveyor belt|conveyer belt", "Belts", "Wear, cracking, stretch, slip"),
     (r"lamella|\bvane\b|impeller|\brotor\b|\blining\b|wear plate|wear strip|wear ring|rubber base", "Wear parts", "Wear; loss of capacity or function"),
     (r"rubber bushing|coupling insert|\bspider\b|coupling element", "Couplings", "Elastomer wear or cracking"),
-    (r"sensor|proximity|\bprox\b|photo ?(eye|cell|electric)|hall effect|encoder|\bswitch\b", "Sensors", "Sensor failure or misalignment stops the cycle"),
+    (r"sensor|proximity|\bprox\b|photo ?(eye|cell)|photo ?electric|hall effect|limit switch|pressure switch|float switch|\bencoder\b", "Sensors", "Sensor failure or misalignment stops the cycle"),
     (r"solenoid|valve unit", "Pneumatic valves", "Coil or spool failure"),
     (r"servo", "Drives", "Motor/encoder failure; long lead time"),
     (r"filter element|element, filter", "Filtration", "Element loading"),
@@ -1185,6 +1385,7 @@ _A_RULES = [
 _B_RULES = [
     (r"\bchain\b|chain link|connecting link", "Chains", "Elongation or stiff links; tension loss"),
     (r"cylinder", "Pneumatics", "Seal leakage; slow or weak actuation"),
+    (r"nozzle", "Nozzles", "Blockage"),
     (r"ball bushing|linear bush|linear bearing|slide bush|oilite|drymet|\bbushing\b|\bbush\b", "Bushings", "Wear or play; binding"),
     (r"oil seal|dust seal|radial seal|o-ring|\bgasket\b|packing|wiper|\bfelt\b", "Seals", "Leakage or dry running"),
     (r"spring", "Springs", "Fatigue or breakage; force loss"),
@@ -1198,6 +1399,7 @@ _C_RULES = [
     (r"roller|rollar", "Rollers", "Seized or worn roller"),
     (r"regulator|regulater|gauge|gage|flow control|speed control|quick exhaust", "Pneumatic controls", "Drift or damage"),
     (r"\bfan\b", "Cooling", "Broken fan; overheating"),
+    (r"push ?button|pilot light|selector switch", "Controls", "Contact wear or damage"),
 ]
 _A_RULES_C = [(re.compile(p, re.I), c, f) for p, c, f in _A_RULES]
 _B_RULES_C = [(re.compile(p, re.I), c, f) for p, c, f in _B_RULES]
@@ -1213,10 +1415,16 @@ bolt bolts screw screws nut nuts washer washers rivet stud spacer shim bracket b
 cover frame panel label sign decal post channel standoff stand weldment housing house base leg bar extrusion guard
 handle knob pull clip cotter keystock key kye support stay block box stopper hinge catch grommet arrow duct liner
 tube pipe elbow nipple union tee plug cap collar pin shaft rod rail track flange strut hook holder sleeve boss joint
-dog flag lug nose mount sub-base fitting ring glass
+dog flag lug nose mount sub-base fitting ring glass guide guides cable cables wire wires harness cord cam lever
+relay connector terminal button
 """.split())
 # Head phrases that ARE wear parts even though their head noun is excluded.
 _HEAD_OVERRIDE_RE = re.compile(r"wear plate|wear strip|wear ring|rubber base|seal ring", re.I)
+
+
+# Wiring and switchgear rows (cables, relays, breakers...) are electrical
+# BOM items, not wear spares, wherever the keyword sits in the description.
+_ELECTRICAL_EXCLUDE_RE = re.compile(r"\b(cable|wire|wires|wiring|harness|relay|breaker|contactor|terminal|fuse holder)\b", re.I)
 
 
 def _head_phrase(description: str) -> str:
@@ -1235,7 +1443,8 @@ def classify_part(description: str, wear_flag: bool = False, spare_flag: bool = 
     full = (description or "").lower()
     head = _head_phrase(full)
     head_noun = head.split()[-1] if head.split() else ""
-    excluded = head_noun.rstrip(".") in _EXCLUDED_HEAD_NOUNS and not _HEAD_OVERRIDE_RE.search(head)
+    excluded = (head_noun.rstrip(".") in _EXCLUDED_HEAD_NOUNS and not _HEAD_OVERRIDE_RE.search(head)) \
+        or bool(_ELECTRICAL_EXCLUDE_RE.search(full))
 
     result = None
     if not excluded:
@@ -1306,59 +1515,27 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
-def dedupe_across_categories(pm_results: list) -> tuple:
-    """
-    Collapse exact duplicates (same normalized task description + component)
-    across PM categories into the most specific one (DEDUPE_PRIORITY).
-    WP is never touched. Returns (new_pm_results, removed_count).
-    """
-    rank = {code: i for i, code in enumerate(DEDUPE_PRIORITY)}
-    owner = {}
-    for code, _name, steps, _status in pm_results:
-        if code == "WP":
-            continue
-        for s in steps:
-            key = (_norm(s.get("task_list_description")), _norm(s.get("component")))
-            if key == ("", ""):
-                continue
-            if key not in owner or rank.get(code, 99) < rank.get(owner[key], 99):
-                owner[key] = code
-
-    removed, out, kept_keys = 0, [], set()
-    for code, name, steps, status in pm_results:
-        if code == "WP":
-            out.append((code, name, steps, status))
-            continue
-        new_steps = []
-        for s in steps:
-            key = (_norm(s.get("task_list_description")), _norm(s.get("component")))
-            if key != ("", "") and (owner.get(key) != code or (code, key) in kept_keys):
-                removed += 1
-                continue
-            kept_keys.add((code, key))
-            new_steps.append(s)
-        out.append((code, name, new_steps, status))
-    return out, removed
-
-
 def renumber_operations(steps: list) -> None:
     for i, s in enumerate(steps, 1):
         s["operation"] = f"Operation_{i * 10:03d}"
 
 
 def _task_covers_part(step: dict, spare: dict) -> bool:
-    pn = (spare.get("part_number") or "").strip().lower()
-    mat = (step.get("material_number") or "").lower()
-    if len(pn) >= MIN_PART_NUMBER_MATCH_LENGTH and pn in mat:
+    """
+    A part counts as covered if a task names its part number or its head
+    noun ("belt", "knife", "sensor"). Coarse on purpose: the recommended
+    pass should fill real gaps, not re-cover belts the OEM plan already checks.
+    """
+    pn = _pn_key(spare.get("part_number"))
+    if len(pn) >= MIN_PART_NUMBER_MATCH_LENGTH and pn in _pn_key(step.get("material_number")):
         return True
-    words = [w for w in _norm(spare.get("description")).split() if len(w) > 3]
-    hay = _norm(f"{step.get('component', '')} {step.get('task_list_description', '')}")
-    return bool(words) and all(w in hay for w in words[:2])
+    head = _part_head(spare.get("description", ""))
+    return bool(head) and head in _tokens(_task_text(step), step.get("_schedule_text", ""), (step.get("instruction") or "")[:200])
 
 
 def find_uncovered_spares(pm_results: list, spares: list) -> list:
     all_steps = [s for code, _n, steps, _st in pm_results if code != "WP" for s in steps]
-    return [sp for sp in spares if sp["tier"] in ("A", "B") and not any(_task_covers_part(s, sp) for s in all_steps)]
+    return [sp for sp in spares if sp["tier"] == "A" and not any(_task_covers_part(s, sp) for s in all_steps)]
 
 
 def summarize_tasks_for_prompt(pm_results: list, with_ref: bool = False) -> str:
@@ -1471,453 +1648,357 @@ def deterministic_review_notes(pm_results: list, setpoints: list, parts: list, d
     return notes
 
 
-# ── Frequency → annual labor ─────────────────────────────────────────────────
 
-_FREQ_WORDS = {
-    "SHIFT": None, "EVERYSHIFT": None, "PERSHIFT": None,
-    "DAILY": ("D", 1), "WEEKLY": ("W", 1), "BIWEEKLY": ("W", 2), "MONTHLY": ("M", 1),
-    "BIMONTHLY": ("M", 2), "QUARTERLY": ("M", 3), "SEMIANNUAL": ("M", 6), "SEMIANNUALLY": ("M", 6),
-    "ANNUAL": ("Y", 1), "ANNUALLY": ("Y", 1), "YEARLY": ("Y", 1),
-}
+# ── OEM schedule pass (2026-09-22) ──────────────────────────────────────────
+#
+# The manual's own schedule table is extracted ONCE, one row per printed
+# line, and each row is assigned to exactly one PM category by the verb
+# rules below. Previously nine category prompts each re-read the same
+# table, which produced the same chain/belt task in three categories with
+# three different frequencies.
+
+_ACTION_RULES = [
+    ("PM4", r"\b(change|replace|replacement|renew|install new|swap)\b"),
+    ("PM2", r"\b(lubricat\w*|grease\w*|oil|oiling|lube|top up|refill)\b"),
+    ("PM7", r"\b(clean\w*|wash\w*|wipe\w*|scrap\w*|blow out|sanitiz\w*|remove (?:\w+ )?(?:buildup|build-up|debris))\b"),
+    ("PM8", r"\b(guard|interlock|e-?stop|emergency stop|safety|lockout|light curtain)\b"),
+    ("PM9", r"\b(back ?up|backup|restore|firmware)\b"),
+    ("PM5", r"\b(overhaul|rebuild|recondition\w*)\b"),
+    ("PM3", r"\b(adjust\w*|calibrat\w*|set to|re-?align\w*)\b"),
+    ("PM6", r"\b(monitor\w*|measure\w*|trend\w*|vibration|temperature reading)\b"),
+]
+_ACTION_RULES_C = [(code, re.compile(rx, re.I)) for code, rx in _ACTION_RULES]
 
 
-def occurrences_per_year(freq: str) -> Optional[float]:
+def classify_action(text: str) -> str:
+    """First matching verb class wins; plain checks/inspections are PM1."""
+    for code, rx in _ACTION_RULES_C:
+        if rx.search(text or ""):
+            return code
+    return "PM1"
+
+
+_STOP_WORDS = set("""
+a an the and or of for to on in at with by from as is are be it its this that these those
+check checks checking inspect inspection verify ensure make sure proper properly condition
+x1 system assembly assemblies all each any
+""".split())
+
+
+def _stem(w: str) -> str:
+    for suf in ("ation", "ment", "ing", "ers", "ate", "ion", "er", "es", "s", "ed"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[: -len(suf)]
+    return w
+
+
+def _tokens(*texts) -> set:
+    words = re.findall(r"[a-z0-9]+", " ".join(t or "" for t in texts).lower())
+    return {_stem(w) for w in words if w not in _STOP_WORDS and len(w) > 1}
+
+
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def _overlap(a: set, b: set) -> float:
+    """Overlap coefficient |A∩B| / min(|A|,|B|)."""
+    return len(a & b) / min(len(a), len(b)) if a and b else 0.0
+
+
+def _task_text(t: dict) -> str:
+    return f"{t.get('task_list_description', '')} {t.get('component', '')}"
+
+
+def flat_schedule_warning(chunks: list) -> bool:
     """
-    Normalized frequency code -> occurrences per year, using the
-    OPERATING_* assumptions. None for blank/Event/unparseable, so the
-    summary shows a blank rather than a wrong number.
+    True if a chunk looks like a frequency table whose column layout was
+    lost at ingestion (frequency headers + several marks, but no Markdown
+    table pipes). Frequencies read from such a chunk cannot be trusted.
     """
-    f = re.sub(r"[\s\-_]", "", (freq or "").upper())
-    if not f or f.startswith("EVENT"):
-        return None
-    if f in ("SHIFT", "S", "1S", "EVERYSHIFT", "PERSHIFT"):
-        return float(OPERATING_DAYS_PER_YEAR * SHIFTS_PER_DAY)
-    if f in _FREQ_WORDS and _FREQ_WORDS[f]:
-        unit, n = _FREQ_WORDS[f]
-        f = f"{n}{unit}"
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)(D|W|M|Y|H|HR|HRS|HOURS)", f)
-    if not m:
-        return None
-    n, unit = float(m.group(1)), m.group(2)
-    if n <= 0:
-        return None
-    if unit == "D":
-        return OPERATING_DAYS_PER_YEAR / n
-    if unit == "W":
-        return 52 / n
-    if unit == "M":
-        return 12 / n
-    if unit == "Y":
-        return 1 / n
-    return OPERATING_HOURS_PER_YEAR / n
+    for c in chunks:
+        low = c.lower()
+        headers = sum(1 for h in ("daily", "weekly", "monthly") if h in low)
+        marks = len(re.findall(r"(?<![\w*])[*✓✔xX](?![\w*])", c))
+        if headers >= 2 and marks >= 4 and "|" not in c:
+            return True
+    return False
 
 
-def _hours(value) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-# ── Excel builder ─────────────────────────────────────────────────────────────
-
-def compose_instruction(step: dict) -> str:
-    """
-    Long Text (Instruction) cell content: the instruction plus Acceptance,
-    Owner and Source lines when present. Keeps the import format's column
-    set unchanged while still carrying the new fields.
-    """
-    parts = [(step.get("instruction") or "").strip()]
-    acc = (step.get("acceptance_criteria") or "").strip()
-    if acc:
-        parts.append(f"Acceptance: {acc}")
-    owner = (step.get("owner") or "").strip()
-    if owner:
-        parts.append(f"Owner: {owner}")
-    source = (step.get("source") or "").strip()
-    ref = (step.get("source_ref") or "").strip()
-    if source == "Recommended":
-        basis = "; ".join(b for b in (ref, (step.get("rationale") or "").strip()) if b)
-        parts.append("Source: Recommended (not in OEM manual) -- validate before use" + (f". Basis: {basis}" if basis else ""))
-    elif ref:
-        parts.append(f"Source: OEM manual -- {ref}")
-    return "\n\n".join(p for p in parts if p)
-
-
-def _estimate_row_height(instruction: str) -> int:
-    if not instruction:
-        return MIN_ROW_HEIGHT
-    line_count = 0
-    for segment in instruction.split("\n"):
-        if segment == "":
-            line_count += 1
-        else:
-            line_count += max(1, -(-len(segment) // INSTRUCTION_COL_CHARS_PER_LINE))
-    return max(MIN_ROW_HEIGHT, line_count * LINE_HEIGHT)
-
-
-def _write_table(ws, start_row: int, headers: list, rows: list, widths: list, wrap_cols=None, tier_col=None) -> int:
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(row=start_row, column=c, value=h)
-        cell.font, cell.fill = HEADER_FONT, HEADER_FILL
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-    r = start_row + 1
-    for row in rows:
-        for c, v in enumerate(row, 1):
-            cell = ws.cell(row=r, column=c, value=v)
-            cell.font = DATA_FONT
-            cell.alignment = WRAP_ALIGN
-            if tier_col and c == tier_col and v in TIER_FILLS:
-                cell.fill = TIER_FILLS[v]
-                cell.alignment = Alignment(horizontal="center", vertical="top")
-        r += 1
-    ws.freeze_panes = ws.cell(row=start_row + 1, column=1)
-    if rows:
-        ws.auto_filter.ref = f"A{start_row}:{ws.cell(row=r - 1, column=len(headers)).coordinate}"
-    return r
-
-
-def _title(ws, title: str, note: str) -> None:
-    ws.cell(row=1, column=1, value=title).font = Font(bold=True, name="Arial", size=12)
-    ws.cell(row=2, column=1, value=note).font = NOTE_FONT
-
-
-def _add_summary_sheet(wb, pm_results: list) -> None:
-    ws = wb.create_sheet("PM Summary")
-    _title(ws, "PM Summary (one row per task)",
-           f"Annual hours assume {OPERATING_DAYS_PER_YEAR} operating days/yr, {SHIFTS_PER_DAY} shifts/day, "
-           f"{OPERATING_HOURS_PER_YEAR} operating hours/yr (env PM_OPERATING_*). Blank = interval or task time not given.")
-    rows = []
-    totals = defaultdict(float)
-    for code, name, steps, _status in pm_results:
-        if code == "WP":
-            continue
-        for s in steps:
-            occ = occurrences_per_year(s.get("frequency", ""))
-            hrs = _hours(s.get("hrs"))
-            annual = round(occ * hrs, 1) if (occ is not None and hrs is not None) else None
-            owner = s.get("owner") or ""
-            if annual:
-                totals[owner or "Unassigned"] += annual
-            rows.append([
-                f"{code}-{s.get('operation', '')}", f"{code} - {name}", s.get("task_list_description", ""),
-                s.get("component", ""), s.get("frequency", ""), round(occ, 1) if occ is not None else None,
-                hrs, annual, owner, "Running" if str(s.get("system_condition")) == "1" else "Stopped",
-                s.get("source") or "OEM", s.get("source_ref", ""), s.get("acceptance_criteria", ""),
-            ])
-    r = _write_table(ws, 4, ["Task ID", "PM Type", "Task", "Component", "Frequency", "Occurrences / Year",
-                             "Est. Hrs", "Annual Hrs", "Owner", "Machine State", "Source", "Source Ref", "Acceptance Criteria"],
-                     rows, [18, 22, 40, 24, 10, 11, 8, 9, 12, 11, 12, 30, 40])
-    r += 1
-    ws.cell(row=r, column=1, value="Annual hours by owner").font = SUBHEAD_FONT
-    for owner, hrs in sorted(totals.items()):
-        r += 1
-        ws.cell(row=r, column=1, value=owner).font = DATA_FONT
-        ws.cell(row=r, column=2, value=round(hrs, 1)).font = DATA_FONT
-    oem = sum(1 for row in rows if row[10] == "OEM")
-    r += 2
-    ws.cell(row=r, column=1, value=f"Tasks: {len(rows)} ({oem} OEM, {len(rows) - oem} Recommended)").font = DATA_FONT
-
-
-def _add_extra_sheets(wb, pm_results: list, extras: dict) -> None:
-    _add_summary_sheet(wb, pm_results)
-
-    ws = wb.create_sheet("Setpoints")
-    _title(ws, "Setpoints (as printed in the manual)",
-           "Referenced by PM acceptance criteria. Enter plant-approved values in 'Plant Standard' where they differ.")
-    _write_table(ws, 4, ["Parameter", "Value", "Component", "Source Ref", "Plant Standard"],
-                 [[s.get("parameter", ""), s.get("value", ""), s.get("component", ""), s.get("source_ref", ""), None]
-                  for s in extras.get("setpoints", [])], [40, 28, 26, 26, 18])
-
-    ws = wb.create_sheet("Critical Spares")
-    _title(ws, "Critical Spares (starting tiers -- re-rank with failure history)",
-           "Tier A: stock on site. Tier B: stock or confirm lead time. Tier C: buy on condition. "
-           "Rule-based from part descriptions plus the manual's own W/S flags.")
-    _write_table(ws, 4, ["Tier", "Category", "Assembly", "Item No.", "Description", "Part No.", "Qty",
-                         "Total Qty (same P/N)", "Manual Flags", "Likely Failure Mode", "Min On-Hand", "Lead Time"],
-                 [[s["tier"], s["category"], s["assembly"], s["item_no"], s["description"], s["part_number"], s["qty"],
-                   s["total_qty"], s["manual_flags"], s["failure_mode"], None, None] for s in extras.get("spares", [])],
-                 [6, 18, 26, 7, 34, 22, 8, 10, 8, 36, 11, 11], tier_col=1)
-
-    ws = wb.create_sheet("Parts List")
-    _title(ws, "Parts List (as printed in the manual)", "Verify against the manual before ordering.")
-    _write_table(ws, 4, ["Assembly", "Parts List Ref", "Item No.", "Part No.", "Description", "Qty", "Wear (W)", "Spare (S)"],
-                 [[p.get("assembly", ""), p.get("parts_list_ref", ""), p.get("item_no", ""), p.get("part_number", ""),
-                   p.get("description", ""), p.get("qty", ""), "W" if p.get("wear_part_flag") else "",
-                   "S" if p.get("spare_part_flag") else ""] for p in extras.get("parts", [])],
-                 [30, 20, 8, 24, 44, 9, 8, 8])
-
-    ws = wb.create_sheet("Review Notes")
-    _title(ws, "Review Notes (resolve before using the plan)",
-           "Conflicts, missing documents, missing part numbers, and gaps found during generation.")
-    order = {"conflict": 0, "missing_document": 1, "gap": 2, "missing_part_number": 3, "clarification": 4}
-    notes = sorted(extras.get("review_notes", []), key=lambda n: order.get(n.get("note_type"), 9))
-    _write_table(ws, 4, ["Type", "Detail", "Affected", "Source Ref"],
-                 [[n.get("note_type", ""), n.get("detail", ""), n.get("affected", ""), n.get("source_ref", "")] for n in notes],
-                 [18, 80, 24, 24])
-
-
-def build_excel(equipment_id: str, pm_results: list, extras: Optional[dict] = None) -> bytes:
-    """
-    Sheet 1 "PM Strategy" matches PM_strategy.xlsx exactly (same columns,
-    same block layout). pm_results: (pm_code, pm_name, steps, status)
-    tuples. status "error" gets a quiet but visible "not generated" row.
-
-    extras (optional, 2026-09-21): {"setpoints", "parts", "spares",
-    "review_notes"} -> extra sheets after "PM Strategy" when
-    EXTRA_SHEETS_ENABLED. Omit to get the old single-sheet output.
-    """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "PM Strategy"
-
-    col_widths = [15, 55, 12, 8, 13, 17, 16, 35, 60, 35, 40]
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
-
-    current_row = 1
-    for pm_code, pm_name, steps, status in pm_results:
-        header_cell = ws.cell(row=current_row, column=1, value=f"{pm_code} - {pm_name}")
-        header_cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-        header_cell.fill = HEADER_FILL
-        header_cell.alignment = Alignment(vertical="center")
-        ws.row_dimensions[current_row].height = 20
-        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(COLUMNS))
-        current_row += 1
-
-        for col_idx, col_name in enumerate(COLUMNS, 1):
-            cell = ws.cell(row=current_row, column=col_idx, value=col_name)
-            cell.font = SUBHEAD_FONT
-            cell.fill = SUBHEAD_FILL
-            cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
-        ws.row_dimensions[current_row].height = 30
-        current_row += 1
-
-        if status == "error":
-            error_cell = ws.cell(
-                row=current_row, column=1,
-                value=f"{pm_code} not generated this run -- recommend regenerating this category before sending.",
-            )
-            error_cell.font = INCOMPLETE_FONT
-            error_cell.fill = INCOMPLETE_FILL
-            error_cell.alignment = Alignment(vertical="center")
-            ws.row_dimensions[current_row].height = 20
-            ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(COLUMNS))
-            current_row += 1
-
-        for step in steps:
-            instruction = compose_instruction(step)
-            image_url = step.get("image_url", "")
-            row_values = [
-                step.get("operation", ""),
-                step.get("task_list_description", ""),
-                step.get("frequency", ""),
-                step.get("hrs", ""),
-                step.get("work_needed", ""),
-                step.get("system_condition", ""),
-                step.get("material_number", ""),
-                step.get("component", ""),
-                instruction,
-                step.get("failure_modes", ""),
-                image_url,
-            ]
-            for col_idx, value in enumerate(row_values, 1):
-                cell = ws.cell(row=current_row, column=col_idx, value=value)
-                cell.font = DATA_FONT
-                cell.alignment = WRAP_ALIGN
-                if col_idx == len(COLUMNS) and image_url:
-                    cell.hyperlink = image_url
-                    cell.font = Font(name="Arial", size=10, color="0563C1", underline="single")
-            ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
-            current_row += 1
-
-        current_row += 1
-
-    ws.freeze_panes = "A3"
-
-    if extras is not None and EXTRA_SHEETS_ENABLED:
-        _add_extra_sheets(wb, pm_results, extras)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
-    """Equipment name + reference_code for the filename (soft-delete aware)."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT name, reference_code
-                FROM equipment
-                WHERE id = %s::uuid
-                AND company_id = %s::uuid
-                AND deleted_at IS NULL
-            """, (equipment_id, company_id))
-            row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        log.warning(f"[company={company_id}] No equipment record found for {equipment_id}, falling back to equipment_id in filename")
-        return {"name": "", "reference_code": ""}
-    return {"name": row.get("name") or "", "reference_code": row.get("reference_code") or ""}
-
-
-def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
-    from datetime import date
-
-    label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
-    if not label:
-        label = equipment_id
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")[:80]
-    return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
-
-
-# ── Main entry point ──────────────────────────────────────────────────────────
-
-async def generate(equipment_id: str, company_id: str) -> bytes:
-    """
-    Full pipeline (return type unchanged: bytes).
-
-    Phase 1  setpoints pass + schedule anchor retrieval (concurrent)
-    Phase 2  WP + PM1-PM9 extraction and the parts-list pass (concurrent,
-             all sharing one per-invocation semaphore), bounded by
-             deadline - FINAL_PHASE_RESERVE_SECONDS
-    Post     cross-category dedupe, critical spares, coverage check
-    Phase 3  recommended-tasks pass + review-notes pass (concurrent),
-             bounded by the full deadline
-    Build    Excel: "PM Strategy" (import format) + extra sheets
-
-    Every stage degrades independently; a real file is always returned.
-    """
-    if not _has_any_manual_chunks(equipment_id, company_id):
-        raise ValueError(
-            f"No manual chunks found for equipment {equipment_id}. "
-            "Please upload and ingest a document for this node first."
-        )
-
-    manual_images = fetch_manual_images_for_equipment(equipment_id, company_id) if IMAGE_MATCHING_ENABLED else []
-
-    start = time.monotonic()
-    deadline = start + GENERATION_DEADLINE_SECONDS
-    final_phase_on = RECOMMENDED_TASKS_ENABLED or REVIEW_NOTES_ENABLED
-    main_deadline = deadline - (FINAL_PHASE_RESERVE_SECONDS if final_phase_on else 0)
-
-    # Per-invocation semaphore -- never module-level (warm-container event-loop bug).
-    bedrock_semaphore = asyncio.Semaphore(BEDROCK_CALL_CONCURRENCY)
+async def extract_schedule_rows(equipment_id: str, company_id: str, anchor_chunks: list,
+                                deadline: float, bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """Returns (rows, status, schedule_text)."""
     loop = asyncio.get_running_loop()
-    stage_status = {}
+    try:
+        chunks = await loop.run_in_executor(
+            None, fetch_relevant_chunk_list, equipment_id, company_id, SCHEDULE_QUERY_TEXT, SCHEDULE_TOP_K
+        )
+    except Exception as e:
+        log.error(f"[company={company_id}] SCHEDULE RETRIEVAL FAILED: {type(e).__name__}: {e}")
+        chunks = []
+    text = "\n\n".join(_merge_chunks(chunks, anchor_chunks))
+    if not text.strip():
+        return [], "empty", ""
+    rows, status, _ = await _call_with_retries(
+        lambda concise: build_schedule_prompt(text), SCHEDULE_TOOL, "rows", company_id, "SCHEDULE",
+        deadline, bedrock_semaphore,
+    )
+    rows = [r for r in rows if (r.get("task") or "").strip()]
+    seen, unique = set(), []
+    for r in rows:
+        key = (_norm(r.get("area")), _norm(r.get("task")))
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+    for r in unique:
+        if r.get("column_ambiguous"):
+            r["frequency"] = ""  # never keep a guessed column
+    log.info(f"[company={company_id}] SCHEDULE: {len(unique)} rows, status={status}, "
+             f"{sum(1 for r in unique if r.get('column_ambiguous'))} with ambiguous columns")
+    return unique, status, text
 
-    # ── Phase 1 ──
-    async def _anchor():
-        try:
-            return await loop.run_in_executor(
-                None, fetch_relevant_chunk_list, equipment_id, company_id, SCHEDULE_QUERY_TEXT, SCHEDULE_ANCHOR_TOP_K
-            )
-        except Exception as e:
-            log.error(f"[company={company_id}] SCHEDULE ANCHOR RETRIEVAL FAILED: {type(e).__name__}: {e}")
-            return []
 
-    async def _setpoints():
-        if not SETPOINTS_ENABLED:
-            return [], "disabled"
-        return await extract_setpoints(equipment_id, company_id, main_deadline, bedrock_semaphore)
-
-    anchor_chunks, (setpoints, sp_status) = await asyncio.gather(_anchor(), _setpoints())
-    stage_status["Setpoints"] = sp_status
-    setpoints_text = format_setpoints_text(setpoints)
-
-    # ── Phase 2 ── PM categories and parts batches share one semaphore, so
-    # total concurrent Bedrock calls for this job stay at BEDROCK_CALL_CONCURRENCY.
-    pm_coros = [
-        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, main_deadline,
-                                bedrock_semaphore, setpoints_text=setpoints_text, anchor_chunks=anchor_chunks)
-        for pm_code, pm_name in PM_TYPES
-    ]
-
-    async def _parts():
-        if not PARTS_EXTRACTION_ENABLED:
-            return [], "disabled", []
-        return await extract_parts_list(equipment_id, company_id, main_deadline, bedrock_semaphore)
-
-    *pm_results, (parts, parts_status, parts_notes) = await asyncio.gather(*pm_coros, _parts())
-    pm_results = list(pm_results)
-    stage_status["Parts List"] = parts_status
-
-    # ── Post-processing ──
-    pm_results, duplicates_removed = dedupe_across_categories(pm_results)
-    spares = build_critical_spares(parts)
-    uncovered = find_uncovered_spares(pm_results, spares)
-    log.info(f"[company={company_id}] {len(spares)} spares ({sum(1 for s in spares if s['tier'] == 'A')} Tier A), "
-             f"{len(uncovered)} Tier A/B without a covering task, {duplicates_removed} duplicate tasks removed")
-
-    # ── Phase 3 ──
-    async def _recommended():
-        if not RECOMMENDED_TASKS_ENABLED:
-            return [], "disabled"
-        return await generate_recommended_tasks(pm_results, uncovered, setpoints_text, equipment_id, company_id,
-                                                deadline, bedrock_semaphore)
-
-    async def _review():
-        if not REVIEW_NOTES_ENABLED:
-            return [], "disabled"
-        return await generate_review_notes(pm_results, setpoints_text, equipment_id, company_id, deadline, bedrock_semaphore)
-
-    (recommended, rec_status), (llm_notes, review_status) = await asyncio.gather(_recommended(), _review())
-    stage_status["Recommended tasks"] = rec_status
-    stage_status["Review notes"] = review_status
+async def schedule_rows_to_tasks(rows: list, setpoints_text: str, schedule_text: str, company_id: str,
+                                 deadline: float, bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """
+    Turns schedule rows into full tasks. Category comes from classify_action()
+    and frequency from the row itself -- the enrichment call only writes the
+    instruction text, and anything it returns for frequency is ignored. A row
+    the enrichment call misses still becomes a minimal task from the printed
+    text, so no OEM line is ever dropped. Returns ({pm_code: [tasks]}, status).
+    """
+    details = {}
+    status = "ok"
+    for start in range(0, len(rows), SCHEDULE_ENRICH_BATCH):
+        batch = rows[start:start + SCHEDULE_ENRICH_BATCH]
+        rows_text = "\n".join(
+            f"{start + i} | {r.get('area', '')} | {r.get('task', '')} | {r.get('frequency') or 'not stated'}"
+            for i, r in enumerate(batch)
+        )
+        items, st, _ = await _call_with_retries(
+            lambda concise, rt=rows_text: build_schedule_enrich_prompt(rt, setpoints_text, schedule_text)
+            + (CONCISE_RETRY_SUFFIX if concise else ""),
+            SCHEDULE_ENRICH_TOOL, "details", company_id, f"SCHEDULE_ENRICH@{start}", deadline, bedrock_semaphore,
+        )
+        if st == "error":
+            status = "partial"
+        for d in items:
+            if isinstance(d.get("row_index"), int):
+                details[d["row_index"]] = d
 
     by_code = defaultdict(list)
-    for t in recommended:
-        by_code[t.pop("pm_code")].append(t)
-    merged = []
-    for code, name, steps, status in pm_results:
-        steps = steps + by_code.get(code, [])
-        if code != "WP":
-            renumber_operations(steps)
-        if by_code.get(code):
-            attach_images_to_steps(by_code[code], manual_images)
-        merged.append((code, name, steps, status))
-    pm_results = merged
-
-    review_notes = list(parts_notes) + list(llm_notes) + deterministic_review_notes(
-        pm_results, setpoints, parts, duplicates_removed, stage_status
-    )
-    if recommended:
-        review_notes.append({
-            "note_type": "clarification",
-            "detail": f"{len(recommended)} Recommended task(s) were added to close gaps the OEM manual leaves open. "
-                      "They are marked 'Source: Recommended' in the instruction text -- review and approve each before use.",
-            "affected": "PM Strategy", "source_ref": "system",
+    for i, r in enumerate(rows):
+        d = details.get(i, {})
+        area, task_text = (r.get("area") or "").strip(), (r.get("task") or "").strip()
+        code = classify_action(task_text)
+        by_code[code].append({
+            "operation": "",
+            "task_list_description": d.get("task_list_description") or f"{area} - {task_text}",
+            "frequency": r.get("frequency", ""),
+            "hrs": "",
+            "work_needed": d.get("work_needed", 1),
+            "system_condition": d.get("system_condition", 0),
+            "material_number": "",
+            "component": d.get("component") or area,
+            "instruction": d.get("instruction") or f"1. {task_text}",
+            "failure_modes": d.get("failure_modes", ""),
+            "acceptance_criteria": d.get("acceptance_criteria") or "No limit in manual -- record baseline at first PM",
+            "owner": d.get("owner", ""),
+            "source": "OEM",
+            "source_ref": "; ".join(x for x in (r.get("source_ref"), r.get("frequency_evidence")) if x),
+            "_origin": "schedule",
+            "_schedule_text": f"{area} {task_text}",
         })
-
-    ok_count = sum(1 for _, _, _, st in pm_results if st == "ok")
-    empty_count = sum(1 for _, _, _, st in pm_results if st == "empty")
-    error_count = sum(1 for _, _, _, st in pm_results if st == "error")
-    log.info(
-        f"[company={company_id}] Generation complete for equipment {equipment_id} in {time.monotonic() - start:.0f}s. "
-        f"{ok_count} ok / {empty_count} empty / {error_count} errored (of {len(PM_TYPES)} PM types); "
-        f"stages: {stage_status}; {len(parts)} parts, {len(spares)} spares, {len(setpoints)} setpoints, "
-        f"{len(recommended)} recommended tasks, {len(review_notes)} review notes."
-    )
-    if error_count or any(v == "error" for v in stage_status.values()):
-        log.warning(f"[company={company_id}] Partial generation for equipment {equipment_id}; flagged in the output file.")
-
-    extras = {"setpoints": setpoints, "parts": parts, "spares": spares, "review_notes": review_notes}
-    return build_excel(equipment_id, pm_results, extras)
+    return dict(by_code), status
 
 
-async def generate_with_filename(equipment_id: str, company_id: str) -> tuple:
+# ── Post-processing (2026-09-22) ────────────────────────────────────────────
+
+_REQUIRED_VERB_CLASS = {"PM2", "PM4", "PM7"}
+
+
+def validate_categories(pm_results: list) -> int:
     """
-    Preferred entry point for API endpoints: (excel_bytes, filename), e.g.
-    "PM_Strategy_P185WJD_Compressor_1_A102_2026-08-05.xlsx".
+    Moves narrative-extracted tasks whose verbs don't fit their category:
+    a "Replacements" task with no replace/change verb, a "Lubrication" task
+    with no lube verb, and so on. Schedule rows are already classified.
+    PM3/PM5/PM6/PM8/PM9 keep their assignment unless the verbs clearly say
+    replace/lubricate/clean (those checks are about intent, not verbs).
     """
-    excel_bytes = await generate(equipment_id, company_id)
-    equipment_info = fetch_equipment_info(equipment_id, company_id)
-    filename = build_output_filename(equipment_id, equipment_info)
-    return excel_bytes, filename
+    moved = 0
+    buckets = {code: [] for code, *_ in pm_results}
+    for code, _name, steps, _st in pm_results:
+        for s in steps:
+            if code == "WP" or s.get("_origin") == "schedule" or s.get("source") == "Recommended":
+                buckets[code].append(s)
+                continue
+            verb_code = classify_action(f"{s.get('task_list_description', '')} {s.get('instruction', '')[:200]}")
+            target = code
+            if code in _REQUIRED_VERB_CLASS and verb_code != code:
+                target = verb_code
+            elif code not in _REQUIRED_VERB_CLASS and verb_code in _REQUIRED_VERB_CLASS and code != "PM8":
+                target = verb_code
+            if target != code and target in buckets:
+                moved += 1
+                buckets[target].append(s)
+            else:
+                buckets[code].append(s)
+    for i, (code, name, _steps, st) in enumerate(pm_results):
+        pm_results[i] = (code, name, buckets[code], st)
+    return moved
+
+
+def dedupe_across_categories(pm_results: list) -> tuple:
+    """
+    Fuzzy dedupe across ALL categories: two tasks are duplicates when they
+    have the same action class and their description+component tokens
+    overlap >= DUP_OVERLAP_THRESHOLD (overlap coefficient). Keep order: OEM schedule rows
+    first, then narrative tasks by DEDUPE_PRIORITY, then Recommended.
+    WP is never touched. Returns (new_pm_results, removed_count).
+    """
+    rank = {code: i for i, code in enumerate(DEDUPE_PRIORITY)}
+    entries = []
+    for code, _n, steps, _st in pm_results:
+        if code == "WP":
+            continue
+        for idx, s in enumerate(steps):
+            origin = 0 if s.get("_origin") == "schedule" else (2 if s.get("source") == "Recommended" else 1)
+            entries.append((origin, rank.get(code, 99), code, idx, s))
+    entries.sort(key=lambda e: e[:4])
+
+    kept, drop = [], set()
+    for _o, _r, code, idx, s in entries:
+        toks = _tokens(s.get("_schedule_text") or _task_text(s))
+        act = classify_action(f"{s.get('_schedule_text') or s.get('task_list_description', '')} {(s.get('instruction') or '')[:120]}")
+        # Overlap coefficient, not Jaccard: a short narrative restatement
+        # ("Indexer - Drive chain") is fully contained in the printed schedule
+        # line and must count as a duplicate; distinct instances ("Front-Left"
+        # vs "Front-Right" cover) differ in a key token and stay apart.
+        if any(a == act and _overlap(toks, t) >= DUP_OVERLAP_THRESHOLD for t, a, c in kept):
+            drop.add((code, idx))
+        else:
+            kept.append((toks, act, code))
+
+    out = []
+    for code, name, steps, st in pm_results:
+        out.append((code, name, [s for i, s in enumerate(steps) if (code, i) not in drop], st))
+    return out, len(drop)
+
+
+_SETUP_PARAM_RE = re.compile(r"initial value|recipe|touch panel|\bscreen\b|product setting", re.I)
+_INITIAL_VALUE_RE = re.compile(r"initial value (?:of |is |= ?)?([\w.%/-]+(?: to [\w.%/-]+)?)", re.I)
+
+
+def move_setup_params(pm_results: list, setpoints: list) -> int:
+    """
+    HMI/recipe parameter entries ("set seal time to the initial value of
+    250") are setup data, not recurring PM. Event/blank-frequency PM3 tasks
+    that read like that are moved to the Setpoints list.
+    """
+    moved = 0
+    for i, (code, name, steps, st) in enumerate(pm_results):
+        if code != "PM3":
+            continue
+        keep = []
+        for s in steps:
+            freq = (s.get("frequency") or "").strip().lower()
+            text = f"{s.get('task_list_description', '')} {s.get('instruction', '')}"
+            if freq in ("", "event") and _SETUP_PARAM_RE.search(text):
+                m = _INITIAL_VALUE_RE.search(text)
+                setpoints.append({
+                    "parameter": s.get("task_list_description", ""),
+                    "value": m.group(1).rstrip(".,;") if m else (s.get("acceptance_criteria") or ""),
+                    "component": s.get("component", ""),
+                    "source_ref": s.get("source_ref", "") or "moved from PM3 (setup parameter)",
+                })
+                moved += 1
+            else:
+                keep.append(s)
+        pm_results[i] = (code, name, keep, st)
+    return moved
+
+
+_COUNTER_RE = re.compile(r"counter|integrated timer|operation log|product management|power[- ]on time|running time|idling time|pack distance", re.I)
+
+
+def drop_noise_tasks(pm_results: list) -> list:
+    """
+    Removes tasks that aren't PM work: anything scheduled more often than
+    every shift (an automatic function, e.g. an hourly auto-backup), and
+    counter/timer/log readings with no numeric threshold. Returns notes.
+    """
+    notes = []
+    per_shift = OPERATING_DAYS_PER_YEAR * SHIFTS_PER_DAY
+    auto, counters = [], []
+    for i, (code, name, steps, st) in enumerate(pm_results):
+        if code == "WP":
+            continue
+        keep = []
+        for s in steps:
+            occ = occurrences_per_year(s.get("frequency", ""))
+            text = f"{s.get('task_list_description', '')} {s.get('component', '')}"
+            if occ is not None and occ > per_shift * 1.01:
+                auto.append(f"{code}: {s.get('task_list_description', '')} ({s.get('frequency')})")
+                continue
+            if code in ("PM6", "PM1") and _COUNTER_RE.search(text) and not re.search(r"\d", s.get("acceptance_criteria") or ""):
+                counters.append(s.get("task_list_description", ""))
+                continue
+            keep.append(s)
+        pm_results[i] = (code, name, keep, st)
+    if auto:
+        notes.append({"note_type": "clarification",
+                      "detail": "Removed tasks scheduled more often than every shift (these are automatic functions, not PM work): "
+                                + "; ".join(auto[:6]) + ". Verify the automatic function is enabled during a periodic check instead.",
+                      "affected": "PM Strategy", "source_ref": "system"})
+    if counters:
+        notes.append({"note_type": "clarification",
+                      "detail": f"Removed {len(counters)} counter/timer/log reading task(s) with no maintenance threshold (e.g. "
+                                + "; ".join(counters[:4]) + "). Use these HMI values as usage triggers for other tasks instead.",
+                      "affected": "PM6", "source_ref": "system"})
+    return notes
+
+
+def consolidate_instances(pm_results: list) -> int:
+    """
+    Merges groups of >= CONSOLIDATE_MIN_GROUP near-identical tasks in the
+    same category and frequency (same instruction text apart from the
+    instance name: seven safety covers, three heater channels, six belts)
+    into one task listing every instance. Returns tasks removed.
+    """
+    removed = 0
+    for i, (code, name, steps, st) in enumerate(pm_results):
+        if code == "WP" or len(steps) < CONSOLIDATE_MIN_GROUP:
+            continue
+        groups, used = [], set()
+        toks = []
+        for s in steps:
+            instr = re.sub(re.escape(s.get("component") or "\x00"), " ", s.get("instruction") or "", flags=re.I)
+            toks.append(_tokens(instr))
+        for a in range(len(steps)):
+            if a in used or steps[a].get("_origin") == "schedule":
+                continue
+            group = [a]
+            for b in range(a + 1, len(steps)):
+                if b in used or steps[b].get("_origin") == "schedule":
+                    continue
+                if (steps[a].get("frequency") == steps[b].get("frequency")
+                        and steps[a].get("source") == steps[b].get("source")
+                        and _jaccard(toks[a], toks[b]) >= CONSOLIDATE_SIMILARITY):
+                    group.append(b)
+            if len(group) >= CONSOLIDATE_MIN_GROUP:
+                used.update(group)
+                groups.append(group)
+        if not groups:
+            continue
+        new_steps, grouped_first = [], {g[0]: g for g in groups}
+        for idx, s in enumerate(steps):
+            if idx in used and idx not in grouped_first:
+                continue
+            if idx in grouped_first:
+                members = [steps[j] for j in grouped_first[idx]]
+                comps = [m.get("component", "") for m in members if m.get("component")]
+                prefix = os.path.commonprefix([m.get("task_list_description", "") for m in members]).rstrip(" -")
+                merged = dict(s)
+                merged["task_list_description"] = f"{prefix or s.get('task_list_description', '')} (all {len(members)})"
+                merged["component"] = "; ".join(comps)
+                m
