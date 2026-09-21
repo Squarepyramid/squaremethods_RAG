@@ -4,267 +4,102 @@ SquareMethods - PM Strategy Generation Service
 Place this file at: app/services/generate_pm_strategy.py
 
 Pulls the manual chunks most relevant to each PM type for an equipment
-node, then runs ten parallel async Claude calls (Working Principle +
-nine PM types) to extract and structure maintenance tasks into a
-downloadable Excel file.
-
-*** IMAGE MATCHING IS CURRENTLY DISABLED (IMAGE_MATCHING_ENABLED = False) ***
-This mirrors ingest_document.py's IMAGE_EXTRACTION_ENABLED flag -- since
-ingest no longer writes to equipment_manual_images, there's nothing for
-this step to match against anyway, so this flag just skips the (now
-pointless) DB round-trip rather than querying an always-empty table on
-every generation run. The "Image" column stays in the Excel output
-(the import format expects it) but every cell comes back blank while
-this is off. All the matching logic (match_manual_image,
-resolve_component_image_url, attach_images_to_steps,
-fetch_manual_images_for_equipment) is untouched and ready to go the
-moment both flags are flipped back to True.
-
-The Excel output matches the PM_strategy.xlsx format exactly so
-the reviewer can fill gaps, add image URLs, then upload it via
-the import endpoint. Use generate_with_filename() rather than calling
-generate() directly if you want the file to come with a real,
-human-readable name (e.g. "PM_Strategy_Compressor_1_A102_2026-08-05.xlsx")
-instead of having to build one yourself -- see that function's docstring.
+node, runs structured (forced tool-use) Claude calls to extract and
+structure maintenance tasks, and returns a downloadable Excel file whose
+FIRST sheet ("PM Strategy") matches the PM_strategy.xlsx import format
+exactly. Use generate_with_filename() for a real, human-readable filename.
 
 PM Types:
-  WP  - Working Principle (step-by-step operating procedure, not a
-        maintenance task -- placed first as the foundational section
-        the rest of the strategies build on)
-  PM1 - Inspection
-  PM2 - Lubrication
-  PM3 - Calibration
-  PM4 - Replacements
-  PM5 - Overhaul
-  PM6 - Condition Monitoring
-  PM7 - Cleaning
-  PM8 - Safety Inspection
-  PM9 - Software Back-up
+  WP  - Working Principle      PM5 - Overhaul
+  PM1 - Inspection             PM6 - Condition Monitoring
+  PM2 - Lubrication            PM7 - Cleaning
+  PM3 - Calibration            PM8 - Safety Inspection
+  PM4 - Replacements           PM9 - Software Back-up
 
-CHANGE LOG (2026-08-28 revision -- reliability/consistency pass):
-  This revision addresses three production incidents traced back to this
-  file: a Bedrock ThrottlingException mid-generation (job codes mlf001/
-  mlf003), a WP category silently returning 0 steps because Claude
-  returned key-value text instead of JSON, and a reproducible PM8
-  json.JSONDecodeError. All three trace back to the same root design
-  choice -- asking Claude for free-text JSON and then hoping
-  raw_text.find("[") / rfind("]") / json.loads() succeeds -- plus a
-  missing temperature setting that made every rerun of the same manual
-  produce a different number of populated categories. Also: this
-  deployment is multi-tenant, and Bedrock's on-demand quota is account
-  + region + model level, not per-tenant, so one tenant's burst can
-  throttle another's job with zero visibility into which tenant did it.
-  Changes below:
+CHANGE LOG (2026-09-21 -- "robust PM" revision)
+-----------------------------------------------
+Goal: produce the same kind of output a reliability engineer builds by
+hand from an OEM manual (parts list, critical spares, setpoints,
+acceptance criteria, owner, OEM vs recommended tasks, gaps/conflicts),
+instead of only a verbatim restatement of the manual's maintenance table.
+Everything is ADDITIVE: generate() / generate_with_filename() keep their
+signatures and return types, the "PM Strategy" sheet keeps its exact
+column layout and stays the first sheet, and every new stage can be
+switched off by env var.
 
-  - MODEL: model selection now lives entirely in app/services/bedrock_client.py
-    (MODEL_ID / BEDROCK_MODEL_ID env var), not here -- this file just calls
-    call_claude() and has no model ID of its own. That module's default was
-    bumped off claude-3-haiku-20240307 (legacy on Bedrock) to a Haiku 4.5-class
-    model. UPDATE 2026-08-28: the unverified ID from this change did in fact
-    break in production -- see bedrock_client.py's own changelog for the
-    incident (Haiku 4.5-class models need an inference profile, not a bare
-    on-demand model ID). All processing must stay in ca-central-1, so
-    MODEL_ID there now has NO default and call_claude() raises loudly if
-    it isn't explicitly set to a verified, Canada-scoped model or
-    inference profile ID -- see that file for the exact AWS CLI commands
-    to confirm the right value before setting BEDROCK_MODEL_ID anywhere.
-    For maximum extraction quality on customer-facing samples (more
-    reliable category classification on dense/ambiguous manuals, at
-    higher per-call cost/latency), swap to a Sonnet-tier model instead
-    via the BEDROCK_MODEL_ID env var -- no code change needed either way.
+  1. SCHEDULE ANCHOR CHUNKS. A manual's maintenance schedule/lube chart
+     usually lives in one or two chunks that may not rank in the top-K for
+     every category's similarity query. Those chunks are now retrieved
+     once (SCHEDULE_QUERY_TEXT) and appended to every PM category's
+     context, deduplicated.
 
-  - STRUCTURED OUTPUT VIA FORCED TOOL USE: replaced the "return ONLY a
-    valid JSON array" free-text instruction + raw_text.find("[")/
-    rfind("]")/json.loads() extraction with Anthropic's tool-use
-    mechanism: a single EXTRACTION_TOOL schema is sent on every call
-    with tool_choice forcing Claude to call it. The model's structured
-    arguments come back in response["content"][*]["input"] as an
-    ALREADY-PARSED object -- no bracket-finding, no json.loads() on
-    model-generated text, no way for a stray unescaped quote in an
-    instruction field to corrupt the whole array, and no way for the
-    model to "forget" and return prose instead (that's what caused the
-    WP category's silent 0-step failures). This works on every Claude
-    model on Bedrock, not just the newest ones -- it's not tied to the
-    model swap above.
+  2. SETPOINTS PASS (new). One up-front call extracts every operating
+     setting the manual prints (pressures, temperatures, gaps, torques,
+     speeds, fluid grades/quantities). The result feeds every PM prompt as
+     a REFERENCE SETPOINTS block (so tasks can cite real limits) and is
+     written to a "Setpoints" sheet.
 
-  - TEMPERATURE: added temperature=0 to every call. Previously unset
-    (Bedrock default ~1.0), which is what let the exact same manual
-    produce 5/10 populated categories on one run and 7/10 on the next.
-    This is an extraction task ("find every task matching category X in
-    this manual"), not a creative one -- there's no reason to want
-    sampling variance here. This alone won't make output byte-identical
-    run to run (floating-point non-associativity in batched inference
-    means even temperature=0 isn't perfectly deterministic) but it
-    removes the dominant source of variance.
+  3. RICHER TASK FIELDS. EXTRACTION_TOOL gains OPTIONAL fields:
+     acceptance_criteria, source ("OEM"/"Recommended"), source_ref, owner.
+     They are optional in the schema, so old-shaped responses still parse.
+     In the PM Strategy sheet they are appended to the Long Text
+     (Instruction) cell as "Acceptance:", "Owner:" and "Source:" lines --
+     no new columns, so the import format is untouched. Frequency is now
+     requested in normalized codes (Shift, 1D, 1W, 2W, 1M, 3M, 6M, 1Y,
+     3000H) so annual labor can be computed.
 
-  - stop_reason NOW LOGGED: previously nothing inspected
-    raw.get("stop_reason"), so a response truncated by hitting MAX_TOKENS
-    was indistinguishable in the logs from a clean parse failure. Now
-    logged explicitly per call, and MAX_TOKENS raised from 4096 to 8192
-    for headroom on categories that can legitimately produce 20+
-    multi-step tasks (PM1, PM8 have both done this in production).
+  4. PARTS LIST PASS (new). Parts lists are spread over many pages and
+     are mostly tables, so similarity top-K retrieval misses most of them.
+     This pass fetches ALL chunks for the equipment, keeps the ones that
+     look like parts tables (_parts_chunk_score), and extracts rows in
+     small batches. A batch that hits max_tokens is split in half and
+     retried (up to PARTS_MAX_SPLIT_DEPTH) instead of silently truncating
+     -- a single call cannot return 1,000+ rows.
 
-  - PER-CATEGORY STATUS ("ok" / "empty" / "error"): call_claude_for_pm_type
-    now returns a status alongside the steps list instead of collapsing
-    every failure mode (throttling, timeout, malformed response, a
-    legitimately empty category) into an indistinguishable []. A category
-    that errored is marked visibly in the Excel output instead of looking
-    identical to "the manual doesn't cover this" -- see build_excel.
+  5. CRITICAL SPARES (deterministic, no LLM). Parts are classified into
+     Tier A/B/C with a keyword rule set (classify_part) plus the manual's
+     own wear/spare flags when printed. Deterministic on purpose: the same
+     parts list always yields the same spares list.
 
-  - RETRY CONFIG: BEDROCK_CLIENT_CONFIG retries raised from
-    {"max_attempts": 2, "mode": "standard"} to
-    {"total_max_attempts": 6, "mode": "standard"}, matching AWS's current
-    documented guidance for handling Bedrock throttling
-    (see: Scaling and throughput best practices, Amazon Bedrock docs).
+  6. CROSS-CATEGORY DEDUPE + RENUMBER. Exact duplicate tasks (same
+     normalized description + component) that leaked into two categories
+     are collapsed into the most specific category (DEDUPE_PRIORITY), and
+     operations are renumbered Operation_010, _020... per category.
 
-  - IN-PROCESS CONCURRENCY CAP: a semaphore now caps how many of this
-    job's own 10 category calls hit Bedrock at the same instant
-    (BEDROCK_CALL_CONCURRENCY, default 5) instead of firing all 10
-    simultaneously. NOTE: this only smooths out the burst a single job
-    creates by itself -- it does NOT coordinate across separate Lambda
-    invocations or tenants. The actual cross-tenant throttling problem
-    (tenant A's burst throttling tenant B's job) needs an infra-level
-    fix outside this file: a Lambda reserved-concurrency cap, a shared
-    token bucket (DynamoDB/ElastiCache), and/or Bedrock cross-region
-    inference to raise the effective ceiling. This semaphore is a
-    partial mitigation, not the full fix.
+  7. RECOMMENDED TASKS PASS (new). Tier A/B parts with no covering task,
+     safety devices with no functional test, and setpoints with no check
+     are sent to one call that proposes gap-filling tasks. Every such task
+     is labelled "Source: Recommended (not in OEM manual) -- validate
+     before use", and the prompt forbids numeric limits that are not in
+     the manual or setpoints ("record baseline at first PM" instead). This
+     matches the grounding rule used in /chat: nothing presented as manual
+     content that isn't in the manual.
 
-  - TENANT-SCOPED LOGGING: company_id is now included in every log line
-    in this module. Previously it was only present in SQL query
-    parameters, not in the log messages themselves, which made it
-    impossible to filter "show me only this tenant's generation logs"
-    without cross-referencing DB queries by hand.
+  8. REVIEW NOTES PASS (new). One call looks for conflicts (two intervals
+     or values for the same item), referenced-but-missing supplier
+     documents, and items needing clarification; deterministic notes are
+     added for errored categories, parts without part numbers, capped
+     batches, and removed duplicates. Written to a "Review Notes" sheet.
 
-  Everything below this point (retrieval, image matching, Excel
-  building, filename generation) is UNCHANGED from the prior revision
-  except for the log-line company_id additions noted above.
+  9. PHASED DEADLINE. The shared 12-minute deadline is split: setpoints
+     first, then PM categories and parts batches together, with
+     FINAL_PHASE_RESERVE_SECONDS held back so recommended/review passes
+     always get time. Each stage degrades to "error"/"partial" on its own;
+     the job still returns a real file.
 
-CHANGE LOG ADDENDUM (same day, second pass): this file originally built
-its own boto3 bedrock-runtime client and its own request body directly
-(duplicating model ID, retry Config, and response logging that also
-needed to exist, separately, in app/services/bedrock_client.py for
-/chat, ingest_document.py, and generate_job_aid.py). Reworked to call
-app.services.bedrock_client.call_claude() instead: BEDROCK_MODEL,
-BEDROCK_CLIENT_CONFIG, and the bedrock client construction that used to
-live in this file are gone (see bedrock_client.py's own changelog for
-what replaced them there); call_claude_for_pm_type() no longer takes a
-`bedrock` client parameter, and the invoke_model/body-read/stop_reason
-logging that used to be inline here now happens once, centrally, inside
-call_claude(). Net effect: the retry/timeout hardening and structured
-tool-use call from this revision now protect every Bedrock call site in
-the app, not just PM strategy generation.
+  10. TRUNCATION HANDLING. A response with stop_reason "max_tokens" is now
+      treated as a failed attempt. PM categories retry with a
+      conciseness instruction; parts batches split instead.
 
-CHANGE LOG ADDENDUM (same day, third pass -- optimize for reliability, not
-speed): explicit direction that this Lambda has up to 15 minutes to work
-with, generation isn't latency-sensitive, and every prior fix should lean
-toward resilience over throughput. Changes:
-  - BEDROCK_CALL_CONCURRENCY lowered from 5 to 3 (env-overridable): a
-    smaller burst per job is gentler on the shared Bedrock quota for a
-    modest wall-clock cost this workload can easily absorb.
-  - NEW: an application-level retry loop per category (PM_CATEGORY_MAX_ATTEMPTS,
-    default 3, with linear backoff via PM_CATEGORY_RETRY_BACKOFF_SECONDS).
-    Previously a category that got a usable HTTP response but an unusable
-    one (no tool_use block, an anomaly worth retrying rather than the
-    empty-array case) had zero retries and was permanently lost -- the
-    only retries in the whole system were botocore's, and only for
-    network-level failures. This is layered on top of those, not a
-    replacement for them.
-  - NEW: GENERATION_DEADLINE_SECONDS, a shared time.monotonic() cutoff
-    (default 720s / 12 min, leaving a buffer against the 15-min Lambda
-    ceiling) that every category's retry loop checks before each attempt.
-    Without this, a generous per-category retry budget creates a new risk:
-    one bad category retrying for a long time could push the WHOLE
-    invocation past Lambda's hard timeout, which kills the process
-    outright and loses every category's work, including the 9 that
-    already succeeded. The shared deadline makes categories fail
-    gracefully into "error" status individually instead, so generate()
-    still returns a real (if partial) file rather than nothing at all.
-  - bedrock_client.py's retry Config was also revisited in the same pass
-    (see that file's own changelog) -- total_max_attempts raised further
-    and retries mode switched to "adaptive", both leaning on the newly
-    available time budget rather than failing fast.
+Extra sheets written after "PM Strategy": PM Summary, Setpoints,
+Critical Spares, Parts List, Review Notes. If the import endpoint ever
+rejects multi-sheet workbooks, set PM_EXTRA_SHEETS_ENABLED=false.
 
-PRIOR CHANGE LOG (retained for context):
-  - RETRIEVAL REWORK (fixes slow/unreliable generation on large, normal
-    -- i.e. non-scanned -- manuals): fetch_all_manual_chunks() used to
-    pull EVERY chunk ever ingested for the equipment node, uncapped, and
-    paste that single blob into all ten prompts unconditionally ("no
-    vector search -- full recall", per the old docstring). A small
-    scanned manual (a few thousand words) stayed fast; a large,
-    genuinely dense native-text manual (tens of thousands of words, or
-    an equipment node with more than one manual attached, since the old
-    query wasn't even scoped to a single doc_id) turned into a huge
-    prompt on all ten concurrent Bedrock calls -- slower, more likely to
-    hit a timeout somewhere in the chain, and worse extraction quality
-    from a small model (Haiku) reasoning over a much larger, noisier
-    context. Replaced with fetch_relevant_manual_chunks(): a real
-    pgvector similarity search, one per PM type, against a short
-    type-specific query (see PM_QUERY_TEXT), capped at
-    RETRIEVAL_TOP_K chunks. This uses the SAME embeddings already
-    generated and stored per chunk at ingest time (see save_chunks() in
-    ingest_document.py) -- they were always intended for retrieval, just
-    not previously queried by vector similarity here. For a manual small
-    enough that its total chunk count is under RETRIEVAL_TOP_K, this
-    returns everything anyway, so small manuals (including the scanned
-    ones going through Textract) see no behavior change at all.
-  - Bedrock client now has an explicit timeout/retry Config
-    (BEDROCK_CLIENT_CONFIG) instead of relying on botocore's undocumented
-    default. Previously, a slow invoke_model call (more likely with the
-    old unbounded context) would silently hit that default and get
-    swallowed by call_claude_for_pm_type's broad except-clause, coming
-    back as an empty PM type with no visible error -- indistinguishable
-    from "Claude found nothing in this manual." The explicit
-    read_timeout/connect_timeout below are sized for the now much
-    smaller, bounded prompts this revision produces.
-  - Image matching now tries an exact match on the manual's own part
-    number (material_number) before falling back to the fuzzy
-    keyword-in-page-text match on the component description. This is
-    strictly additive: if material_number is blank or doesn't match
-    anything, behavior is identical to before. See match_manual_image().
-  - The material_number field instruction in build_pm_prompt was
-    broadened from "SAP material number if mentioned" to also capture
-    a manual's own parts-list number when the manual provides one --
-    it was previously easy for Claude to leave this blank on manuals
-    that don't use SAP terminology even when they clearly list part
-    numbers (e.g. "341047").
-  - fetch_all_manual_chunks / fetch_relevant_manual_chunks both handle
-    the 4-segment content prefix ("equipment_id | doc_id | bom_items |
-    text") written by the updated ingest_document.py, in addition to the
-    older 2- and 3-segment formats, so this keeps working against both
-    old and newly-ingested chunks without a backfill.
-  - Image matching disabled via IMAGE_MATCHING_ENABLED (see note above).
-  - Added generate_with_filename(), a thin wrapper around generate()
-    that also returns a real filename instead of leaving that as a
-    separate step for the caller to remember. generate() itself is
-    unchanged in its return type (still bytes only) so nothing already
-    calling it directly breaks.
-
-NOTE ON WHERE THE "TIMEOUT SOMETIMES" WAS ACTUALLY COMING FROM: generation
-already runs off a queue once the job is submitted -- API Gateway's 29s
-ceiling only bounds the initial submit call, not this function, so it was
-never the source of the reported timeouts. The real exposure was inside
-this module itself: call_claude_for_pm_type()'s ten concurrent
-invoke_model calls had no explicit timeout, so they inherited botocore's
-undocumented default, and a slow call (more likely with the old unbounded,
-full-recall prompt) would eventually hit that default and get swallowed by
-the broad except-clause -- coming back as an empty PM type with no visible
-error, indistinguishable from "Claude found nothing in this manual." That
-still counts as a timeout from the caller's point of view even with no
-API Gateway involved. The retrieval rework above shrinks and bounds every
-prompt, and BEDROCK_CLIENT_CONFIG below makes the timeout explicit and
-sized for that smaller prompt, so a genuinely slow call now fails fast and
-visibly (logged, retried by botocore) instead of silently stalling out to
-an empty result. Whatever timeout wraps the worker Lambda/consumer that
-runs this job (its own function timeout, SQS visibility timeout, etc.)
-should stay comfortably above BEDROCK_CLIENT_CONFIG's read_timeout * the
-retry count, so a legitimately slow Bedrock call doesn't get killed by the
-outer timeout before botocore's own retry/timeout logic has a chance to
-resolve it. With total_max_attempts now at 6 (up from 2 retries), that
-budget is larger than before -- worst case is roughly
-read_timeout(90s) * 6 = 540s if every attempt were to hit the full read
-timeout (unlikely in practice, since most retries fire fast on an
-immediate ThrottlingException rather than waiting out the full timeout,
-but budget the outer timeout as if it could happen).
+Prior revisions (2026-08-28 reliability pass: forced tool use,
+temperature=0, per-category status, retries, shared deadline, per-invocation
+semaphore, tenant-scoped logging; earlier: pgvector retrieval rework,
+image matching behind IMAGE_MATCHING_ENABLED, generate_with_filename) are
+unchanged in behavior. Their full changelog text is in git history.
 """
 
 import io
@@ -272,7 +107,8 @@ import logging
 import asyncio
 import re
 import time
-from typing import Optional
+from collections import defaultdict
+from typing import Callable, Optional
 
 import boto3
 import os
@@ -285,14 +121,13 @@ from app.services.bedrock_client import call_claude
 
 log = logging.getLogger(__name__)
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
 WORKING_PRINCIPLE = ("WP", "Working Principle")
 
-# Working Principle is placed first: it's the foundational "how this
-# equipment operates" narrative that the PM tasks below build on. It runs
-# through the same async gather as the PM types but uses its own prompt
-# (see build_working_principle_prompt) since it isn't a maintenance task
-# extraction -- there's no frequency, work_needed, or failure mode in the
-# same sense as PM1-PM9.
 PM_TYPES = [
     WORKING_PRINCIPLE,
     ("PM1", "Inspection"),
@@ -305,145 +140,115 @@ PM_TYPES = [
     ("PM8", "Safety Inspection"),
     ("PM9", "Software Back-up"),
 ]
+PM_NAME_BY_CODE = dict(PM_TYPES)
 
-# Short, type-specific queries used to retrieve the manual chunks most
-# relevant to each PM type (see fetch_relevant_manual_chunks). These are
-# deliberately written as a bag of concrete keywords/synonyms rather than
-# a natural-language question -- they're only ever used to produce an
-# embedding for similarity search, not read by a model, so density of
-# relevant vocabulary matters more than grammar.
+# Embedding-only queries (never read by a model) -- keyword density matters
+# more than grammar. Schedule/interval words were added to the maintenance
+# categories so the manual's schedule tables rank higher.
 PM_QUERY_TEXT = {
-    "WP":  "working principle theory of operation how the machine physically functions mechanism stages",
-    "PM1": "inspection checking visual physical condition leaks tightness fluid level wear",
-    "PM2": "lubrication greasing oil change lubricant grease coolant top up nipple",
-    "PM3": "calibration adjustment pressure regulator governor engine speed torque specification setting",
-    "PM4": "replacement scheduled part filter element belt fluid fastener consumable change interval",
-    "PM5": "overhaul rebuild teardown reconditioning major internal assembly bearings rotors gears",
-    "PM6": "condition monitoring measurement gauge sensor instrument threshold vibration temperature oil analysis",
-    "PM7": "cleaning removing dirt grease debris buildup housing cooler core exterior wipe",
-    "PM8": "safety inspection guard safety valve emergency stop decal label fastener panel",
-    "PM9": "software backup firmware configuration PLC controller electronic control module restore",
+    "WP":  "working principle theory of operation how the machine physically functions mechanism stages sequence of operation description",
+    "PM1": "inspection check visual condition leaks tightness fluid level wear daily weekly monthly schedule",
+    "PM2": "lubrication greasing oil change lubricant grease coolant top up nipple lube points chart grease type oil type quantity interval",
+    "PM3": "calibration adjustment setting pressure regulator speed torque gap clearance specification setup adjust to",
+    "PM4": "replacement scheduled change part filter element belt blade knife seal fluid consumable interval wear parts",
+    "PM5": "overhaul rebuild teardown reconditioning major internal assembly bearings rotors gears annual dismantle",
+    "PM6": "condition monitoring measurement gauge sensor instrument threshold vibration temperature noise current trend",
+    "PM7": "cleaning removing dirt grease glue debris buildup wash wipe scrape sanitation washdown",
+    "PM8": "safety inspection guard interlock emergency stop safety valve decal label lockout door switch",
+    "PM9": "software backup firmware configuration PLC controller HMI recipe parameters restore memory card",
 }
+SCHEDULE_QUERY_TEXT = (
+    "maintenance schedule table preventive maintenance chart interval daily weekly "
+    "monthly quarterly yearly hours every shift routine maintenance lube chart"
+)
+SETPOINTS_QUERY_TEXT = (
+    "setting specification pressure psi bar temperature degrees gap clearance torque "
+    "speed rpm tension oil type grease type quantity liters regulator setpoint adjust to"
+)
+RECOMMENDED_QUERY_TEXT = (
+    "safety device emergency stop interlock guard sensor photo eye proximity switch "
+    "wear parts adjustment troubleshooting failure malfunction"
+)
+REVIEW_QUERY_TEXT = (
+    "refer to manufacturer manual supplier documentation see separate manual consult "
+    "electrical drawings not included contact service department vendor"
+)
 
-# Model selection AND the Bedrock client's retry/timeout Config now live in
-# app.services.bedrock_client (call_claude()), shared with /chat,
-# ingest_document.py, and generate_job_aid.py, instead of being duplicated
-# here. See that module's 2026-08-28 changelog entry for why (short
-# version: this file used to build its own boto3 client with no Config at
-# all, which meant every other caller of the shared client had the same
-# undocumented-default-timeout exposure this incident was about, just
-# unfixed). BEDROCK_REGION is kept here only because presign_manual_image_url()
-# below needs a region for its own S3 client -- unrelated to Bedrock's region.
-BEDROCK_REGION  = os.environ.get("AWS_REGION", "ca-central-1")
+BEDROCK_REGION = os.environ.get("AWS_REGION", "ca-central-1")
+MAX_TOKENS = 8192
 
-# Raised from 4096. Categories that legitimately produce 20+ multi-step
-# tasks with numbered multi-line instructions (PM1, PM8 have both done this
-# in production) can plausibly need more headroom than the old cap gave
-# them. stop_reason is now logged per call inside call_claude() (see
-# app.services.bedrock_client) so a truncated response is visible going
-# forward instead of silently corrupting the parsed output.
-MAX_TOKENS      = 8192
-
-# Caps how many of THIS JOB's 10 category calls hit Bedrock at the same
-# instant, instead of firing all 10 simultaneously via asyncio.gather.
-# Lowered from 5 to 3: this Lambda has up to 15 minutes to work with and
-# generation isn't user-facing/latency-sensitive, so there's no reason to
-# maximize parallelism -- a smaller burst per job is strictly gentler on
-# the shared Bedrock quota (see the multi-tenant discussion below) for a
-# modest increase in this job's own wall-clock time, which is a trade this
-# workload can easily afford. This only smooths the burst a single job
-# creates by itself -- it does NOT coordinate across separate Lambda
-# invocations or tenants. Bedrock's on-demand quota is account+region+
-# model level, not per-tenant, so the real fix for one tenant's job
-# throttling another tenant's job is an infra-level concurrency gate
-# outside this file (a Lambda reserved-concurrency cap, or a shared token
-# bucket in DynamoDB/ElastiCache) plus Bedrock cross-region inference to
-# raise the effective ceiling. Treat this semaphore as a partial
-# mitigation, not the fix for cross-tenant throttling.
 BEDROCK_CALL_CONCURRENCY = int(os.environ.get("PM_BEDROCK_CALL_CONCURRENCY", 3))
-
-# NOTE: the actual asyncio.Semaphore is NOT created here anymore -- see
-# CHANGE LOG entry below (2026-08-28, "bound to a different event loop").
-# It used to be a module-level global (_bedrock_semaphore = asyncio.Semaphore(...)),
-# which broke in production: a Semaphore binds to whichever asyncio event
-# loop is running when it's first used, but this module stays imported
-# across warm Lambda invocations while each invocation can get its OWN
-# fresh event loop. A semaphore created (or first touched) under one
-# invocation's loop raises "bound to a different event loop" the moment a
-# later, separate invocation's loop tries to use that same cached object.
-# Cold starts always worked (fresh import, fresh loop, no mismatch yet);
-# it only surfaced on a warm container reusing a stale semaphore against a
-# new loop -- which matches exactly what was seen ("worked twice" then
-# broke). Fixed by creating the Semaphore fresh inside generate() on every
-# call instead, and passing it down as a parameter -- see generate(),
-# call_claude_for_pm_type(), and _attempt_bedrock_call() below. This is
-# also the semantically correct scope: this semaphore was only ever meant
-# to cap ONE job's own 10 concurrent category calls (see the comment
-# above), not to persist across the whole process lifetime.
-
-# How long, in seconds, generate() is willing to let its 10 category calls
-# (including their retries -- see PM_CATEGORY_MAX_ATTEMPTS below) keep
-# trying before giving up on whatever hasn't finished and returning a
-# partial-but-real result. Set well under the Lambda function's actual
-# timeout (per this deployment, up to 15 minutes = 900s) so a slow or
-# repeatedly-throttled category produces a clean, logged "error" status on
-# JUST that category instead of the WHOLE invocation being hard-killed by
-# Lambda at 900s -- which would lose every category's work, including the
-# ones that already succeeded. Defaults to 720s (12 min), leaving a
-# 3-minute buffer for retrieval, Excel building, and whatever the caller
-# does with the returned bytes afterward. Tune via env var if your actual
-# Lambda timeout differs from 15 minutes -- this should always be
-# comfortably below it, never equal to it.
 GENERATION_DEADLINE_SECONDS = int(os.environ.get("PM_GENERATION_DEADLINE_SECONDS", 720))
-
-# Application-level retries of a WHOLE category call (retrieval is NOT
-# repeated on retry -- see call_claude_for_pm_type). Layered ON TOP OF
-# call_claude()'s own botocore-level retries inside a single invoke_model
-# call (network errors, throttling -- see bedrock_client.py's
-# total_max_attempts). This is what actually uses the newly-available time
-# budget: previously a category that got a usable HTTP response but an
-# unusable one (e.g. no tool_use block) had zero retries and was
-# permanently lost. 3 attempts, with linear backoff between them
-# (PM_CATEGORY_RETRY_BACKOFF_SECONDS * attempt number, capped by whatever
-# time is actually left against GENERATION_DEADLINE_SECONDS).
 PM_CATEGORY_MAX_ATTEMPTS = int(os.environ.get("PM_CATEGORY_MAX_ATTEMPTS", 3))
 PM_CATEGORY_RETRY_BACKOFF_SECONDS = 15
-
-# How many of the most relevant chunks (by embedding similarity) to pull
-# per PM type. ~40 chunks at ~500 words/chunk is roughly 20k words --
-# generous headroom for a single maintenance category from most manuals,
-# while still bounding worst-case prompt size on very large documents.
-# For a manual with fewer than this many chunks total (true for every
-# manual tested so far, including the scanned ones going through
-# Textract), this simply returns everything -- no behavior change for
-# the currently-working case.
 RETRIEVAL_TOP_K = 40
 
-# ── Structured output tool definition ──────────────────────────────────────
-#
-# Every WP/PM extraction call is forced (via tool_choice) to call this one
-# tool instead of being asked to "return ONLY a valid JSON array" as free
-# text. Anthropic parses and validates the arguments against this schema
-# server-side; what comes back in the response is an ALREADY-PARSED object
-# at content[*]["input"], not a string that this code has to bracket-find
-# and json.loads() itself. This is what eliminates the WP "returned prose
-# instead of JSON" failures and the PM8 json.JSONDecodeError -- both were
-# symptoms of parsing model-generated text, and this removes that step
-# entirely. Works on every Claude model on Bedrock (not just newer ones),
-# so it's independent of whichever model app.services.bedrock_client is
-# configured to use.
-#
-# The field descriptions here intentionally stay short -- the detailed
-# per-field guidance (what counts as PM8 vs PM4, how to format the
-# instruction field's numbered steps, etc.) lives in the prompt text in
-# build_pm_prompt/build_working_principle_prompt, same as before. This
-# schema only constrains shape and types; the prompt still teaches content.
+# ── New stage switches and budgets (2026-09-21) ────────────────────────────
+EXTRA_SHEETS_ENABLED = _env_flag("PM_EXTRA_SHEETS_ENABLED", True)
+SETPOINTS_ENABLED = _env_flag("PM_SETPOINTS_ENABLED", True)
+PARTS_EXTRACTION_ENABLED = _env_flag("PM_PARTS_EXTRACTION_ENABLED", True)
+RECOMMENDED_TASKS_ENABLED = _env_flag("PM_RECOMMENDED_TASKS_ENABLED", True)
+REVIEW_NOTES_ENABLED = _env_flag("PM_REVIEW_NOTES_ENABLED", True)
+
+SCHEDULE_ANCHOR_TOP_K = 8
+SETPOINTS_TOP_K = 30
+PARTS_BATCH_CHUNKS = int(os.environ.get("PM_PARTS_BATCH_CHUNKS", 5))
+PARTS_MAX_BATCHES = int(os.environ.get("PM_PARTS_MAX_BATCHES", 40))
+PARTS_MAX_SPLIT_DEPTH = 3
+PARTS_CANDIDATE_MIN_SCORE = 8
+MAX_RECOMMENDED_TASKS = 25
+MAX_CONTEXT_TASK_LINES = 150
+MAX_CONTEXT_PART_LINES = 60
+
+# Held back from the PM/parts phase so the recommended + review passes
+# always get time before the shared deadline.
+FINAL_PHASE_RESERVE_SECONDS = int(os.environ.get("PM_FINAL_PHASE_RESERVE_SECONDS", 150))
+
+# Assumptions for converting frequencies to annual labor in "PM Summary".
+OPERATING_DAYS_PER_YEAR = int(os.environ.get("PM_OPERATING_DAYS_PER_YEAR", 250))
+SHIFTS_PER_DAY = int(os.environ.get("PM_SHIFTS_PER_DAY", 2))
+OPERATING_HOURS_PER_YEAR = int(os.environ.get("PM_OPERATING_HOURS_PER_YEAR", 6000))
+
+# When the same task leaks into two categories, keep it in the first one
+# listed here (most specific first).
+DEDUPE_PRIORITY = ["PM8", "PM3", "PM4", "PM2", "PM7", "PM6", "PM9", "PM1", "PM5"]
+
+CONCISE_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: a previous attempt exceeded the output limit. Keep every "
+    "instruction to at most 6 short numbered steps and keep other fields brief. "
+    "Do not drop tasks -- shorten them."
+)
+
+# ── Structured output tool definitions ─────────────────────────────────────
+
+_TASK_PROPERTIES = {
+    "operation": {"type": "string", "description": "Sequential step number, e.g. 'Operation_010'."},
+    "task_list_description": {"type": "string"},
+    "frequency": {"type": "string", "description": "Normalized code: Shift, 1D, 1W, 2W, 1M, 2M, 3M, 6M, 1Y, <n>H, Event, or blank."},
+    "hrs": {"type": ["number", "string"], "description": "Decimal technician hours for the task, or blank."},
+    "work_needed": {"type": "integer"},
+    "system_condition": {"type": "integer"},
+    "material_number": {"type": "string"},
+    "component": {"type": "string"},
+    "instruction": {"type": "string", "description": "Numbered steps, each on its own line, separated by a blank line."},
+    "failure_modes": {"type": "string"},
+    # Optional (2026-09-21). Not in "required" so older-shaped output still parses.
+    "acceptance_criteria": {"type": "string", "description": "Measurable pass/fail limit, or the no-limit phrase."},
+    "source": {"type": "string", "enum": ["OEM", "Recommended"]},
+    "source_ref": {"type": "string", "description": "Manual section/page/table the task comes from."},
+    "owner": {"type": "string", "enum": ["Operator", "Technician", "Electrician", "Specialist"]},
+}
+_TASK_REQUIRED = [
+    "operation", "task_list_description", "frequency", "hrs", "work_needed",
+    "system_condition", "material_number", "component", "instruction", "failure_modes",
+]
+
 EXTRACTION_TOOL = {
     "name": "record_extracted_steps",
     "description": (
-        "Record the list of steps/tasks extracted from the equipment "
-        "manual for this category. Call this even if no steps were found "
-        "-- pass an empty tasks list rather than omitting the call."
+        "Record the list of steps/tasks extracted from the equipment manual for "
+        "this category. Call this even if no steps were found -- pass an empty "
+        "tasks list rather than omitting the call."
     ),
     "input_schema": {
         "type": "object",
@@ -451,38 +256,109 @@ EXTRACTION_TOOL = {
             "tasks": {
                 "type": "array",
                 "description": "One entry per extracted step or task, in sequence order.",
+                "items": {"type": "object", "properties": _TASK_PROPERTIES, "required": _TASK_REQUIRED},
+            },
+        },
+        "required": ["tasks"],
+    },
+}
+
+RECOMMENDED_TOOL = {
+    "name": "record_recommended_tasks",
+    "description": "Record gap-filling PM tasks. Call with an empty list if none are justified.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "operation": {
-                            "type": "string",
-                            "description": "Sequential step number, e.g. 'Operation_010', 'Operation_020'.",
-                        },
-                        "task_list_description": {"type": "string"},
-                        "frequency": {"type": "string"},
-                        "hrs": {
-                            "type": ["number", "string"],
-                            "description": "Decimal hours, or blank string if not specified.",
-                        },
-                        "work_needed": {"type": "integer"},
-                        "system_condition": {"type": "integer"},
-                        "material_number": {"type": "string"},
-                        "component": {"type": "string"},
-                        "instruction": {
-                            "type": "string",
-                            "description": "Numbered steps, each on its own line, separated by a blank line.",
-                        },
-                        "failure_modes": {"type": "string"},
+                        **_TASK_PROPERTIES,
+                        "pm_code": {"type": "string", "enum": [c for c, _ in PM_TYPES if c != "WP"]},
+                        "rationale": {"type": "string", "description": "Which gap this closes (part, safety device, or setpoint)."},
                     },
-                    "required": [
-                        "operation", "task_list_description", "frequency", "hrs",
-                        "work_needed", "system_condition", "material_number",
-                        "component", "instruction", "failure_modes",
-                    ],
+                    "required": _TASK_REQUIRED + ["pm_code", "rationale"],
                 },
             },
         },
         "required": ["tasks"],
+    },
+}
+
+SETPOINTS_TOOL = {
+    "name": "record_setpoints",
+    "description": "Record operating settings/specifications printed in the manual. Empty list if none.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "setpoints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "parameter": {"type": "string"},
+                        "value": {"type": "string", "description": "Value with units exactly as printed, e.g. '80 psi', '1/8\" to 1/4\"'."},
+                        "component": {"type": "string"},
+                        "source_ref": {"type": "string"},
+                    },
+                    "required": ["parameter", "value"],
+                },
+            },
+        },
+        "required": ["setpoints"],
+    },
+}
+
+PARTS_TOOL = {
+    "name": "record_parts_list_rows",
+    "description": "Record every parts-list row found in the text. Empty list if the text has no parts list.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "parts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "assembly": {"type": "string", "description": "Assembly/parts-list name the row belongs to."},
+                        "parts_list_ref": {"type": "string", "description": "Parts list or drawing number of the assembly, if printed."},
+                        "item_no": {"type": "string"},
+                        "part_number": {"type": "string", "description": "Exactly as printed; blank if none."},
+                        "description": {"type": "string"},
+                        "qty": {"type": "string"},
+                        "wear_part_flag": {"type": "boolean", "description": "True only if the manual marks it as a wear part."},
+                        "spare_part_flag": {"type": "boolean", "description": "True only if the manual marks it as a recommended spare."},
+                    },
+                    "required": ["assembly", "item_no", "part_number", "description", "qty"],
+                },
+            },
+        },
+        "required": ["parts"],
+    },
+}
+
+REVIEW_TOOL = {
+    "name": "record_review_notes",
+    "description": "Record review notes for the reliability engineer. Empty list if none.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "notes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "note_type": {"type": "string", "enum": ["conflict", "missing_document", "missing_part_number", "gap", "clarification"]},
+                        "detail": {"type": "string"},
+                        "affected": {"type": "string"},
+                        "source_ref": {"type": "string"},
+                    },
+                    "required": ["note_type", "detail"],
+                },
+            },
+        },
+        "required": ["notes"],
     },
 }
 
@@ -505,31 +381,19 @@ HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
 SUBHEAD_FILL  = PatternFill("solid", start_color="D6E4F0", end_color="D6E4F0")
 SUBHEAD_FONT  = Font(bold=True, name="Arial", size=10)
 DATA_FONT     = Font(name="Arial", size=10)
+NOTE_FONT     = Font(name="Arial", size=9, italic=True, color="595959")
 WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top")
-
-# Row/fill used to flag a category that errored during generation (as
-# opposed to one that's legitimately empty because the manual doesn't
-# cover it) -- see build_excel. Previously both looked identical: a
-# header row followed by no data rows.
-#
-# CHANGE 2026-08-28: was bright red / bold white ("GENERATION ERROR",
-# C0392B) -- explicit direction was to keep this quiet rather than
-# alarming: still a distinct, visible row (never silently dropped --
-# a maintenance document silently missing a Safety Inspection or
-# Calibration category is a real gap, not a cosmetic one, and this job
-# already always returns a valid file for whatever categories DID
-# succeed -- generate()/generate_with_filename() never raise or fail
-# the whole job over a partial error, so there was never anything
-# here actually "faulting out" the job itself, just this loud styling),
-# but toned down to a neutral note instead of a red banner.
 INCOMPLETE_FILL = PatternFill("solid", start_color="F2F2F2", end_color="F2F2F2")
 INCOMPLETE_FONT = Font(italic=True, color="595959", name="Arial", size=10)
+TIER_FILLS = {
+    "A": PatternFill("solid", start_color="F4CCCC", end_color="F4CCCC"),
+    "B": PatternFill("solid", start_color="FFF2CC", end_color="FFF2CC"),
+    "C": PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA"),
+}
 
-# Approx characters that fit on one wrapped line within the instruction
-# column width (col width 60 -> roughly 60-65 chars/line at Arial 10).
 INSTRUCTION_COL_CHARS_PER_LINE = 60
 MIN_ROW_HEIGHT = 40
-LINE_HEIGHT = 14  # points per wrapped line, Arial 10
+LINE_HEIGHT = 14
 
 
 # ── Knowledge retrieval ───────────────────────────────────────────────────────
@@ -539,18 +403,9 @@ _KNOWN_PREFIX_KEYS = ("equipment_id:", "doc_id:", "bom_items:")
 
 def _strip_chunk_prefix(content: str) -> str:
     """
-    Strip the leading "key:value | key:value | ..." metadata segments
-    ingest_document.py writes into each chunk's content column, returning
-    just the chunk's own text. Handles all three prefix shapes that exist
-    across old and newly-ingested rows, oldest to newest:
-      1. "equipment_id:{id} | {text}"                                (2 segments)
-      2. "equipment_id:{id} | doc_id:{uuid} | {text}"                (3 segments)
-      3. "equipment_id:{id} | doc_id:{uuid} | bom_items:... | {text}" (4 segments, current)
-    Splitting on " | " with no maxsplit and consuming only the leading
-    segments that match a known "key:" prefix keeps this working against
-    whichever format a given chunk happens to be in, without needing to
-    touch previously-ingested rows. Rejoins the remainder with " | " in
-    case the chunk's own text legitimately contains that substring.
+    Strip the leading "key:value | ..." metadata segments ingest_document.py
+    writes into each chunk (2-, 3- and 4-segment formats), returning only
+    the chunk's own text.
     """
     parts = content.split(" | ")
     split_at = 0
@@ -560,16 +415,12 @@ def _strip_chunk_prefix(content: str) -> str:
         else:
             break
     if split_at == 0:
-        return content  # no recognized prefix at all
+        return content
     return " | ".join(parts[split_at:])
 
 
 def _has_any_manual_chunks(equipment_id: str, company_id: str) -> bool:
-    """
-    Cheap existence check used to fail fast with a clear error before
-    kicking off ten parallel embedding + retrieval + Bedrock calls for an
-    equipment node that has no ingested manual at all.
-    """
+    """Cheap existence check so a node with no manual fails fast and clearly."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -586,14 +437,11 @@ def _has_any_manual_chunks(equipment_id: str, company_id: str) -> bool:
         conn.close()
 
 
-def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
+def fetch_all_manual_chunk_list(equipment_id: str, company_id: str) -> list:
     """
-    Fetch ALL manual chunks for this equipment node and concatenate them
-    into a single text block. Kept for any direct/internal callers that
-    want true full recall (e.g. a debugging tool, or a future feature
-    that isn't per-PM-type) -- generate() itself no longer calls this;
-    see fetch_relevant_manual_chunks() for what it uses instead, and the
-    CHANGE LOG above for why.
+    Every manual chunk for this equipment node, prefix-stripped, in ingest
+    order. Used by the parts-list pass (which needs full recall because
+    parts tables are spread across many pages) and by fetch_all_manual_chunks.
     """
     conn = get_db_connection()
     try:
@@ -609,40 +457,28 @@ def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
             rows = cur.fetchall()
     finally:
         conn.close()
+    return [_strip_chunk_prefix(r["content"]) for r in rows]
 
-    if not rows:
+
+def fetch_all_manual_chunks(equipment_id: str, company_id: str) -> str:
+    """Full-recall text blob. Kept for direct/internal callers; generate() doesn't use it."""
+    chunks = fetch_all_manual_chunk_list(equipment_id, company_id)
+    if not chunks:
         raise ValueError(
             f"No manual chunks found for equipment {equipment_id}. "
             "Please upload and ingest a document for this node first."
         )
-
-    clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
-    full_text = "\n\n".join(clean_chunks)
-    log.info(f"[company={company_id}] Fetched {len(clean_chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
+    full_text = "\n\n".join(chunks)
+    log.info(f"[company={company_id}] Fetched {len(chunks)} chunks ({len(full_text.split())} words) for equipment {equipment_id}")
     return full_text
 
 
-def fetch_relevant_manual_chunks(equipment_id: str, company_id: str, query_text: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+def fetch_relevant_chunk_list(equipment_id: str, company_id: str, query_text: str, top_k: int = RETRIEVAL_TOP_K) -> list:
     """
-    Vector-similarity retrieval of the top_k manual chunks most relevant
-    to query_text, instead of dumping every chunk ever ingested for the
-    equipment node into the prompt unconditionally. Uses the SAME
-    embeddings already generated and stored per chunk at ingest time
-    (see save_chunks() in ingest_document.py) -- this was always their
-    intended purpose, just not previously queried here.
-
-    Uses pgvector's cosine-distance operator (<=>), the standard choice
-    for most text-embedding models. If the embeddings this deployment
-    generates are tuned for a different distance metric, swap the
-    operator below (<-> for Euclidean, <#> for inner product) to match.
-
-    Falls back to an empty string (not an error) if this equipment has
-    chunks but none happen to match well -- callers already handle an
-    empty manual_text gracefully (Claude just returns an empty step list
-    for that PM type, same as "the manual doesn't cover this category").
-    The one-time upfront existence check in generate() is what catches
-    "no manual ingested at all" -- this function assumes that's already
-    been verified.
+    pgvector cosine-distance retrieval of the top_k chunks most relevant to
+    query_text, returned as a list of prefix-stripped chunk texts. Uses the
+    embeddings stored at ingest time (save_chunks() in ingest_document.py).
+    Swap <=> for <-> or <#> if the embedding model is tuned for another metric.
     """
     query_embedding = get_embedding(query_text)
     emb_str = "[" + ",".join(map(str, query_embedding)) + "]"
@@ -663,40 +499,62 @@ def fetch_relevant_manual_chunks(equipment_id: str, company_id: str, query_text:
     finally:
         conn.close()
 
-    clean_chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
-    full_text = "\n\n".join(clean_chunks)
+    chunks = [_strip_chunk_prefix(r["content"]) for r in rows]
     log.info(
-        f"[company={company_id}] Retrieved {len(clean_chunks)}/{top_k} chunks ({len(full_text.split())} words) "
-        f"for equipment {equipment_id}, query={query_text[:60]!r}"
+        f"[company={company_id}] Retrieved {len(chunks)}/{top_k} chunks "
+        f"({sum(len(c.split()) for c in chunks)} words) for equipment {equipment_id}, query={query_text[:60]!r}"
     )
-    return full_text
+    return chunks
 
 
-# ── Claude call ───────────────────────────────────────────────────────────────
+def fetch_relevant_manual_chunks(equipment_id: str, company_id: str, query_text: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+    """Joined-text wrapper around fetch_relevant_chunk_list (unchanged public behavior)."""
+    return "\n\n".join(fetch_relevant_chunk_list(equipment_id, company_id, query_text, top_k))
+
+
+def _merge_chunks(primary: list, extra: Optional[list]) -> list:
+    """Primary chunks first, then any extra chunks not already present."""
+    if not extra:
+        return list(primary)
+    seen = set(primary)
+    merged = list(primary)
+    for c in extra:
+        if c not in seen:
+            merged.append(c)
+            seen.add(c)
+    return merged
+
+
+# ── Parts-table detection (for the parts-list pass) ──────────────────────────
+
+_PARTS_KEYWORDS_RE = re.compile(
+    r"part\s*no|part\s*number|parts\s*list|p/n|q'?ty|quantity|item\s*no|pos\.?\s*no|dwg|"
+    r"description|spare|wear\s*part|material\s*no",
+    re.IGNORECASE,
+)
+# Alphanumeric tokens containing a digit and a separator, e.g. 500-A-10253P1, 23120 CC-01, 0084-16050.
+_PART_TOKEN_RE = re.compile(r"\b[A-Z0-9]*\d[A-Z0-9]*[-/.][A-Z0-9][A-Z0-9\-/.]*\b")
+
+
+def _parts_chunk_score(text: str) -> int:
+    """
+    Cheap heuristic for "this chunk probably contains a parts table":
+    3 points per parts-list keyword + 1 per part-number-like token. Only
+    used to decide which chunks are worth an extraction call -- a false
+    positive costs one call that returns an empty list.
+    """
+    return 3 * len(_PARTS_KEYWORDS_RE.findall(text)) + len(_PART_TOKEN_RE.findall(text))
+
+
+# ── Prompts ──────────────────────────────────────────────────────────────────
 
 def build_working_principle_prompt(manual_text: str) -> str:
     """
-    Working Principle answers "how does this machine work?" -- the
-    engineering logic of how the equipment physically achieves its
-    function, NOT how an operator runs it and NOT maintenance tasks.
-
-    The example below is intentionally abstract/generic (no real
-    equipment domain, no specific component names) rather than a
-    concrete worked example (e.g. an air compressor). An earlier
-    version used a real compressor example, and the model latched
-    onto that specific vocabulary (screw airend, oil injection,
-    receiver-separator) and started projecting compressor terminology
-    onto completely unrelated equipment. The example here only
-    demonstrates the reasoning style expected -- every actual term must
-    come from the manual provided, never from this example.
-
-    NOTE: this used to end with a "Return ONLY a valid JSON array" +
-    literal JSON example block. That's no longer needed -- the caller
-    forces this response through the record_extracted_steps tool (see
-    EXTRACTION_TOOL), which constrains the shape server-side. The
-    field-by-field guidance below still matters (it's what teaches the
-    model what belongs in each field); only the now-redundant formatting
-    instructions were removed.
+    Working Principle: how THIS machine physically achieves its function --
+    not operator procedure, not maintenance. Deliberately uses no concrete
+    example (a compressor example once caused compressor vocabulary to be
+    projected onto unrelated equipment). Output shape is enforced by the
+    forced tool call.
     """
     return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
 
@@ -706,170 +564,221 @@ Do NOT extract:
 - Operator procedures: button presses, switch positions, start/stop sequences, towing/setup instructions.
 - Maintenance tasks: inspection, lubrication, replacement, cleaning, calibration.
 
-DO extract the underlying mechanism: how the machine's core function is physically carried out, stage by stage, as material/air/fluid/energy/signal moves through the system and components interact to produce the intended output. The specific stages, components, and terminology MUST come entirely from the manual below -- do not import terminology, component names, or mechanisms from any other type of equipment. If this machine is not a compressor, do not mention compression, airends, or oil separation; if it's not a pump, do not mention impellers; describe THIS machine using only what the manual actually says about it.
+DO extract the underlying mechanism: how the machine's core function is physically carried out, stage by stage, as material/air/fluid/energy/signal moves through the system and components interact to produce the intended output. The specific stages, components, and terminology MUST come entirely from the manual below -- do not import terminology, component names, or mechanisms from any other type of equipment.
 
-IMPORTANT: manuals rarely have a section explicitly titled "theory of operation" or "working principle." This kind of engineering explanation is usually scattered as incidental description INSIDE maintenance, general data, or specification sections -- not confined to a section literally called "Operation." Read the whole manual for sentences that explain WHY or HOW something physically happens, even if that sentence sits inside a section about draining or replacing a part. Extract the engineering logic from wherever it appears in THIS manual; do not limit yourself to a single section, and do not substitute reasoning from a different type of machine when this manual's explanation is thin -- if the manual genuinely doesn't explain a stage, leave it out rather than inventing it.
+IMPORTANT: manuals rarely have a section titled "theory of operation." This explanation is usually scattered inside maintenance, sequence-of-operation, general data, or specification sections. Read the whole excerpt for sentences that explain WHY or HOW something physically happens. If the manual genuinely doesn't explain a stage, leave it out rather than inventing it.
 
 For each functional stage, extract:
-- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10), in the order the function is physically carried out
-- task_list_description: the functional stage following the pattern "Function - Mechanism", using the manual's own terms for the function and the component that carries it out
-- frequency: leave blank (not applicable)
-- hrs: leave blank (not applicable)
-- work_needed: 0 (this describes function, not maintenance work)
-- system_condition: 1 (this describes the machine's normal running function)
-- material_number: leave blank
-- component: the specific component or subsystem named in the manual that carries out this function
-- instruction: a clear, detailed engineering explanation of what physically happens at this stage and why, using only terms and mechanisms the manual actually describes. Number each sub-point starting at 1. Put EACH numbered point on its own line, with a blank line between points -- use a literal "\\n\\n" (newline, newline) between point N and point N+1, never a space.
-- failure_modes: leave blank (not applicable)
+- operation: "Operation_010", "Operation_020", ... (increment by 10), in the order the function is physically carried out
+- task_list_description: "Function - Mechanism", using the manual's own terms
+- frequency: blank
+- hrs: blank
+- work_needed: 0
+- system_condition: 1
+- material_number: blank
+- component: the component or subsystem named in the manual that carries out this function
+- instruction: a clear engineering explanation of what physically happens at this stage and why, using only what the manual describes. Number each sub-point starting at 1, each on its own line with a blank line between points (a literal "\\n\\n" between point N and N+1).
+- failure_modes: blank
+- source: "OEM"
+- source_ref: the manual section/page this came from, if identifiable
 
-Call the record_extracted_steps tool with your findings. If the manual has no engineering description of how the machine functions anywhere, call it with an empty tasks list.
+Call the record_extracted_steps tool with your findings. If the manual has no engineering description of how the machine functions, call it with an empty tasks list.
 
 EQUIPMENT MANUAL:
 {manual_text}"""
 
 
 PM_TYPE_GUIDANCE = {
-    "PM1": "Inspection means a routine visual or physical CHECK with no scheduled part replacement -- e.g. checking for leaks, checking fastener tightness, checking fluid level, visually inspecting hoses or tires. If the task's end action is replacing a part, it does NOT belong here -- that's PM4.",
-    "PM2": "Lubrication means applying, topping up, or changing a lubricant, grease, or coolant itself (e.g. greasing a fitting, topping up engine oil, changing compressor oil). Do not include filter/element replacement here unless the task is specifically about the fluid, not the filter -- filter/element swaps belong in PM4.",
-    "PM3": "Calibration means adjusting a device or setting to a specified reference value. This includes pressure regulator adjustment, governor or engine speed adjustment, sensor calibration, torque specifications, and any 'adjust to X value' instruction in the manual -- even if the manual's section heading doesn't use the word 'calibration'. If the manual has any section on adjusting pressure, speed, torque, or regulator settings, it belongs here.",
-    "PM4": "Replacements means the routine, scheduled swap of a wearable part or consumable on a fixed interval (filters, elements, belts, fluids, fasteners). This is the ONLY category that should contain recurring element/filter/fluid replacement tasks -- do not also list the same task under PM2, PM5, or PM6.",
-    "PM5": "Overhaul means major teardown, rebuild, or reconditioning of an assembly (e.g. rebuilding the airend internals, engine rebuild, replacing internal bearings/rotors/gears as part of a rebuild). Do NOT include routine scheduled part replacement here (that's PM4) or routine fluid changes (that's PM2). If the manual explicitly states major overhauls are outside its scope or should be referred to an authorized service department, return an EMPTY array for this category -- do not invent overhaul tasks by relabeling routine maintenance content.",
-    "PM6": "Condition Monitoring means measuring or observing a parameter against a threshold using a gauge, sensor, or instrument, WITHOUT performing a replacement as part of the same task (e.g. monitoring discharge temperature, monitoring vibration, oil sampling/analysis, watching a diagnostic lamp). If a task's end action is replacing a part on a schedule, it belongs in PM4, not here.",
-    "PM7": "Cleaning means removing dirt, grease, debris, or buildup from a component that stays installed (e.g. cleaning a cooler core exterior, wiping down a housing interior). Do not include tasks whose primary action is replacing a part.",
-    "PM8": "Safety Inspection means checking safety-critical items specifically: guards, safety valves, safety decals/labels, emergency stops, and fasteners or panels tied to injury or noise-containment risk.",
-    "PM9": "Software Back-up means backing up or restoring configuration, firmware, or software on a PLC, controller, or electronic control module. If the manual describes no software, controller, or firmware, return an EMPTY array -- do not invent a software task.",
+    "PM1": "Inspection means a routine visual or physical CHECK with no scheduled part replacement -- e.g. checking for leaks, fastener tightness, fluid level, belt/chain condition, setup gaps. If the task's end action is replacing a part, it does NOT belong here -- that's PM4.",
+    "PM2": "Lubrication means applying, topping up, or changing a lubricant, grease, or coolant itself (greasing points on a lube chart, topping up oil, changing gear oil, filling an air-line lubricator). Filter/element swaps belong in PM4.",
+    "PM3": "Calibration means adjusting a device or setting to a specified reference value: regulator pressures, speeds, torques, gaps/clearances, sensor positions, temperatures, chain/belt tension to a spec -- even if the manual's heading doesn't say 'calibration'.",
+    "PM4": "Replacements means the routine, scheduled swap of a wearable part or consumable on a fixed interval (filters, elements, belts, blades, knives, seals, springs, fluids). This is the ONLY category for recurring replacement tasks -- do not also list them under PM2, PM5, or PM6.",
+    "PM5": "Overhaul means major teardown, rebuild, or reconditioning of an assembly. Not routine replacement (PM4) or routine fluid changes (PM2). If the manual says overhauls are outside its scope or must go to an authorized service department, return an EMPTY list.",
+    "PM6": "Condition Monitoring means measuring or observing a parameter against a threshold (temperature, pressure, vibration, noise, current, oil level trend, diagnostic/fault log review) WITHOUT a replacement in the same task.",
+    "PM7": "Cleaning means removing dirt, grease, glue, product, debris, or buildup from a component that stays installed. Not tasks whose primary action is replacing a part.",
+    "PM8": "Safety Inspection means checking safety-critical items specifically: guards, interlocks, emergency stops, safety valves, safety decals/labels, lockout devices, and fasteners or panels tied to injury risk.",
+    "PM9": "Software Back-up means backing up or restoring configuration, recipes, firmware, or software on a PLC, HMI, controller, or electronic module. If the manual describes none, return an EMPTY list.",
 }
 
+_FREQUENCY_GUIDANCE = (
+    'frequency: how often, as ONE normalized code: "Shift" (every shift / before each shift), '
+    '"1D" daily, "1W" weekly, "2W" every 2 weeks, "1M" monthly, "2M", "3M" quarterly, "6M", '
+    '"1Y" yearly, "<n>H" for operating-hour intervals (e.g. "3000H"), "Event" for after-repair/'
+    'startup/commissioning tasks. If the manual gives BOTH an hour and a calendar limit ("every '
+    '3,000 h, at least every 6 months"), use the hour code and mention the calendar limit in '
+    'source_ref. Leave blank if not specified.'
+)
 
-def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str) -> str:
-    """
-    NOTE: this used to end with a "Return ONLY a valid JSON array" +
-    literal JSON example block, same as build_working_principle_prompt
-    above. Removed for the same reason -- tool_choice now enforces the
-    output shape, so that instruction block was redundant (and one of
-    the sources of drift: the model would sometimes narrate instead of
-    strictly following it). The category guidance below is unchanged.
-    """
+_OWNER_GUIDANCE = (
+    'owner: "Operator" for simple checks, cleaning, draining, and top-ups done without tools at '
+    'start of shift or while running; "Technician" for lubrication, adjustment, replacement, '
+    'measurement; "Electrician" for electrical/controls work; "Specialist" for vendor or OEM work.'
+)
+
+
+def _setpoints_block(setpoints_text: str) -> str:
+    if not setpoints_text:
+        return ""
+    return (
+        "\n\nREFERENCE SETPOINTS (already extracted from this manual -- cite these "
+        "values in acceptance_criteria when a task checks or adjusts one of them):\n"
+        f"{setpoints_text}\n"
+    )
+
+
+def build_pm_prompt(pm_code: str, pm_name: str, manual_text: str, setpoints_text: str = "") -> str:
     category_guidance = PM_TYPE_GUIDANCE.get(pm_code, "")
-    return f"""You are a maintenance engineering expert. You have been given an equipment manual below.
+    return f"""You are a maintenance engineering expert. You have been given an equipment manual excerpt below.
 
 Your task is to extract ALL maintenance tasks that fall under the category: {pm_code} - {pm_name}
 
 CATEGORY DEFINITION FOR {pm_code} - {pm_name}: {category_guidance}
 
-If a task genuinely fits more than one category, extract it under the SINGLE most specific category above and skip it in the others -- do not extract the same task into multiple PM types.
+If a task genuinely fits more than one category, extract it under the SINGLE most specific category and skip it in the others.
 
-For each task you find, extract the following fields:
-- operation: sequential step number as "Operation_010", "Operation_020", "Operation_030" etc (increment by 10)
-- task_list_description: the step title following the component hierarchy pattern "Assembly - Subassembly - Component x[quantity]". Preserve quantities (x1, x2, x4 etc) as they indicate how many of that component exist.
-- frequency: how often this task should be done (e.g. "2W" for 2 weekly, "1M" for monthly, "1Y" for yearly). Leave blank if not specified.
-- hrs: estimated TECHNICIAN TIME to perform this specific task, as a decimal number of hours (e.g. 0.1, 0.5, 1.0). This is NOT the maintenance interval -- if the manual says "every 1000 hours," that 1000 belongs in frequency, never here. Leave blank if no time estimate is given.
-- work_needed: 1 if active work is required, 0 if observation only. Default to 1.
-- system_condition: 0 for machine stopped, 1 for machine running. Default to 0.
-- material_number: the manual's OWN part/component number for this item, if the manual provides one -- this includes a formal SAP material number, but just as importantly it includes any parts-list, drawing, or catalog number the manual itself prints next to this component (e.g. "341047", "992-03377", "8-110-626-107"). Copy it exactly as printed, including hyphens/periods. Leave blank only if the manual truly gives no such number for this component.
-- component: the specific component name only (without the assembly hierarchy), e.g. "Bearings x8"
-- instruction: step-by-step work instruction a technician can follow. Number each step starting at 1. Put EACH numbered step on its own line, with a blank line between steps -- use a literal "\\n\\n" (newline, newline) between step N and step N+1, never a space. Be specific.
-- failure_modes: comma-separated list of failure modes this task prevents. Leave blank if not specified.
+Tasks can come from a maintenance schedule table, a lube chart or drawing legend, a component description ("rollers should be scraped clean before each shift"), a troubleshooting note that states a routine check, or a setup section that gives a value to verify. Look in all of these.
 
-Call the record_extracted_steps tool with your findings. If no tasks of type {pm_name} are found in the manual, call it with an empty tasks list.
+For each task, extract:
+- operation: "Operation_010", "Operation_020", ... (increment by 10)
+- task_list_description: "Assembly - Subassembly - Component x[quantity]". Preserve quantities.
+- {_FREQUENCY_GUIDANCE}
+- hrs: technician time for the task as decimal hours (e.g. 0.1, 0.5, 1.0) -- NOT the interval. Leave blank if the manual gives no time.
+- work_needed: 1 if active work is required, 0 if observation only. Default 1.
+- system_condition: 0 machine stopped, 1 machine running. Default 0.
+- material_number: the manual's OWN part/drawing/catalog number for this item if printed (e.g. "341047", "992-03377", "SR29-T-2-9.5"), copied exactly. Blank only if none is given.
+- component: the component name only, e.g. "Bearings x8"
+- instruction: step-by-step work instruction a technician can follow. Number each step from 1, each on its own line with a blank line between steps (a literal "\\n\\n" between step N and N+1). Be specific; include the lubricant/grade, tool, or reference value when the manual gives one.
+- failure_modes: comma-separated failure modes this task prevents. Blank if not inferable from the manual.
+- acceptance_criteria: the measurable pass/fail limit the manual gives for this task (value and unit), or the matching value from REFERENCE SETPOINTS. If there is no limit anywhere in the manual, write exactly "No limit in manual -- record baseline at first PM". NEVER invent a number.
+- source: "OEM"
+- source_ref: where in the manual this task comes from (section, page, table, or drawing as printed). If the manual gives DIFFERENT intervals for the same task in two places, use the SHORTER interval in frequency and state both in source_ref (e.g. "Lube chart: weekly; Sched. Maint. p.29: monthly").
+- {_OWNER_GUIDANCE}
+
+Call the record_extracted_steps tool with your findings. If no {pm_name} tasks are found, call it with an empty tasks list.{_setpoints_block(setpoints_text)}
 
 EQUIPMENT MANUAL:
 {manual_text}"""
 
 
-# ── Component image lookup ───────────────────────────────────────────────────
-#
-# Images come ONLY from this equipment's own ingested manual
-# (equipment_manual_images table, populated at ingestion time by
-# ingest_document.py's PDF image extraction). No external image search
-# (Openverse or otherwise) -- if the manual has no relevant image, the
-# cell is left blank for the reviewer to fill, rather than substituting
-# a generic stock photo that isn't actually this equipment's part.
-#
-# Matching is now two-tier:
-#   1. Exact match on material_number (the manual's own part number, e.g.
-#      "341047") against a drawing page's extracted text. This is a much
-#      stronger, lower-false-positive signal than a keyword match, since
-#      part numbers are specific tokens rather than descriptive words that
-#      might appear on several unrelated pages ("bearing" turning up on
-#      six different drawings). It only fires when Claude actually
-#      populated material_number for that step AND that exact string
-#      appears on some page's extracted text -- otherwise it's a silent
-#      no-op and behavior falls through to tier 2, unchanged from before.
-#   2. Fallback: keyword-in-page-text match on the component description,
-#      same coarse approach as before.
-#
-# This is a fully local operation: the S3 key is already in the DB, and
-# generating a presigned URL is a local signing call, not a network
-# request. There's no timeout, retry, or concurrency-limiting logic
-# needed here because there's nothing that can hang or rate-limit.
-#
-# Image lookup happens INLINE inside call_claude_for_pm_type(), right
-# after each PM/WP type's steps come back from Claude. WP is included:
-# its "component" field names real physical parts (e.g. "Airend",
-# "Pressure Regulator"), same as PM1-PM9's.
-#
-# Known limitation, by design: match quality depends on the ingested
-# manual actually having a relevant image AND that image's page text
-# mentioning the component (by part number or by name). A manual with
-# no images, or a components section whose images sit on pages that
-# don't share the component's wording or number, will come back blank --
-# there's no fallback beyond tier 2.
+def build_setpoints_prompt(manual_text: str) -> str:
+    return f"""You are a maintenance engineering expert. From the equipment manual excerpt below, extract EVERY operating setting or specification value the manual prints, such as:
+- regulator and supply pressures, temperatures, speeds, torques
+- gaps, clearances, heights, positions and dimensions used for setup
+- belt/chain tension specs, fluid and grease grades, fill quantities
+- electrical ratings only if they are used as a check (e.g. motor full-load current)
 
-# Master switch for image matching, mirroring ingest_document.py's
-# IMAGE_EXTRACTION_ENABLED. Off for now because ingest no longer writes
-# to equipment_manual_images -- querying it here would just be a wasted
-# round-trip against a table that's always empty. This only gates the
-# fetch in generate() below; match_manual_image/resolve_component_image_url/
-# attach_images_to_steps are untouched and already degrade correctly to
-# all-blank image_urls when handed an empty manual_images list, so
-# there's nothing else to change when this flips back to True (besides
-# also re-enabling IMAGE_EXTRACTION_ENABLED in ingest_document.py so
-# there's actually something to fetch).
+Rules:
+- Copy each value exactly as printed, with units and ranges ("40-50 psi", "1/8\\" to 1/4\\"").
+- parameter: short name using the manual's terms (e.g. "R2 siderail centering pressure").
+- component: the component or assembly the value applies to.
+- source_ref: section/page/drawing it appears on.
+- Do NOT include maintenance intervals, part numbers, or values you infer.
+- If the same parameter appears with two different values, record BOTH as separate entries.
+
+Call record_setpoints. Empty list if the manual gives no settings.
+
+EQUIPMENT MANUAL:
+{manual_text}"""
+
+
+def build_parts_prompt(manual_text: str) -> str:
+    return f"""You are extracting an equipment parts list. The text below is from an equipment manual and may contain one or more parts-list tables (often OCR'd from scans, so columns may be run together).
+
+Record EVERY parts-list row you can identify:
+- assembly: the assembly / parts-list title the row belongs to (carry it forward to every row under that heading).
+- parts_list_ref: the parts list or drawing number of that assembly if printed (e.g. "400 A 22105PM").
+- item_no: the item/position number as printed ("" if none).
+- part_number: the part/drawing/catalog number EXACTLY as printed (keep spaces, hyphens, suffixes). "" if the row has none, e.g. "See electrical docs".
+- description: the part name/description as printed.
+- qty: quantity as printed ("1", "4 PCS", "A/R", "Not used", "1 set").
+- wear_part_flag / spare_part_flag: true ONLY if the manual itself marks the row (e.g. a W or S column). Otherwise false.
+
+Rules: do not invent rows, merge rows, or fill in missing part numbers. Skip blank template rows. Skip text that is not a parts table (troubleshooting, instructions).
+
+Call record_parts_list_rows. Empty list if there is no parts table in this text.
+
+MANUAL TEXT:
+{manual_text}"""
+
+
+def build_recommended_prompt(tasks_summary: str, gaps_summary: str, setpoints_text: str, manual_text: str) -> str:
+    return f"""You are a senior reliability engineer reviewing a PM plan that was extracted from an OEM manual. The OEM content is often thin: it lists a few lubrication and replacement tasks but misses condition checks, safety function tests, and setup verification. Your job is to propose ONLY the gap-filling tasks that are clearly justified by the items listed under GAPS, using the manual excerpt for component names and context.
+
+Propose a task only for:
+1. A Tier A/B wear or critical part in GAPS with no existing task: an inspection, measurement, or replacement-on-condition task for its likely failure mode.
+2. A safety device the manual mentions (emergency stop, interlock, guard door, safety limit sensor, safety valve) with no existing functional test: a periodic functional test (PM8).
+3. A setpoint in REFERENCE SETPOINTS that no existing task checks: a periodic verification (PM3 or PM1).
+4. The machine's primary output quality (e.g. seal, cut, weld, fill), if the manual describes it and nothing checks it: a quick per-shift check (PM6).
+
+Hard rules:
+- Do NOT duplicate or reword an EXISTING TASK.
+- Numeric limits ONLY from REFERENCE SETPOINTS or the manual excerpt. Otherwise acceptance_criteria must be "No limit in manual -- record baseline at first PM and trend".
+- Use the manual's component names and part numbers (material_number) where given.
+- source must be "Recommended". source_ref: the part number, setpoint, or manual section that justifies the task.
+- rationale: one sentence naming the gap.
+- pm_code: the single most specific category (PM1-PM9).
+- {_FREQUENCY_GUIDANCE}
+- {_OWNER_GUIDANCE}
+- instruction: numbered steps, each on its own line with a blank line between them.
+- At most {MAX_RECOMMENDED_TASKS} tasks; prioritize safety tests, then Tier A parts, then setpoints, then Tier B parts.
+
+Call record_recommended_tasks. Empty list if no gap is justified.
+
+EXISTING TASKS (pm_code | task | component | frequency):
+{tasks_summary or "(none)"}
+
+GAPS:
+{gaps_summary or "(none)"}
+{_setpoints_block(setpoints_text)}
+MANUAL EXCERPT:
+{manual_text}"""
+
+
+def build_review_prompt(tasks_summary: str, setpoints_text: str, manual_text: str) -> str:
+    return f"""You are a reliability engineer doing a final review of a PM plan generated from an equipment manual. List only concrete, verifiable issues a planner must resolve before using this plan:
+
+- conflict: the manual gives two different intervals, values, or instructions for the same item (cite both locations).
+- missing_document: the manual refers to a separate manual, supplier document, or drawing that tasks depend on (e.g. "see motor manual", "see electrical documentation") -- name the document and which tasks need it.
+- missing_part_number: an item the plan relies on that the manual lists without a part number.
+- gap: a safety-critical or wear item the manual clearly describes that has no task in the plan.
+- clarification: labels, units, or references in the manual that are inconsistent or ambiguous and could cause a wrong setting (e.g. two different names for the same valve).
+
+Do not restate general advice. Do not list issues you cannot tie to the manual excerpt, the tasks, or the setpoints below.
+
+Call record_review_notes. Empty list if nothing qualifies.
+
+PLAN TASKS (pm_code | task | component | frequency | source_ref):
+{tasks_summary or "(none)"}
+{_setpoints_block(setpoints_text)}
+MANUAL EXCERPT:
+{manual_text}"""
+
+
+# ── Component image lookup (UNCHANGED; disabled via IMAGE_MATCHING_ENABLED) ──
+#
+# Two-tier match against this equipment's own ingested manual images:
+# exact material_number on the page text first, then component keyword.
+# Local only (DB rows fetched once + local S3 presign), nothing can hang.
+
 IMAGE_MATCHING_ENABLED = False
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "squaremethods")
-MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max; images stay private, not permanently public
+MANUAL_IMAGE_URL_EXPIRY_SECONDS = 604800  # 7 days -- the SigV4 max
 
 _QUANTITY_SUFFIX_RE = re.compile(r"\s*[xX]\d+\s*$")
-
-# Guard against spurious substring matches on short/generic material
-# numbers (e.g. a stray "24" matching all over a page of tables). Real
-# manual part numbers in the manuals we've seen are consistently longer
-# than this, so it's a cheap, conservative filter rather than a tuned one.
 MIN_PART_NUMBER_MATCH_LENGTH = 4
 
 
 def normalize_component_for_image_search(component: str) -> Optional[str]:
-    """
-    Turn a Component field value into a bare search keyword.
-    "Main Drive assembly - Bearings x4"  -> "bearings"
-    "Compressor Oil Filter Element"      -> "compressor oil filter element"
-    "Bearings x8"                       -> "bearings"
-    Returns None for empty/unusable input so callers can skip the lookup.
-    """
     if not component:
         return None
-
-    # Strip assembly/subassembly hierarchy -- keep only the last segment
-    # after " - ", since that's the actual component, not its location.
     term = component.split(" - ")[-1]
-
-    # Strip trailing quantity markers like "x4", "X12"
     term = _QUANTITY_SUFFIX_RE.sub("", term)
-
     term = term.strip()
     return term.lower() if term else None
 
 
 def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> list:
-    """
-    Pulls every extracted manual image row for this equipment ONCE, up
-    front, so matching against many components doesn't mean many DB
-    round-trips. Returns a list of {s3_key, context_text, page_number}
-    dicts. Empty list if the equipment has no ingested images (e.g. a
-    DOCX manual, or a PDF with no images that cleared the size filter).
-    """
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -891,13 +800,6 @@ def fetch_manual_images_for_equipment(equipment_id: str, company_id: str) -> lis
 
 
 def match_manual_image(component_keyword: str, material_number: str, manual_images: list) -> tuple:
-    """
-    Two-tier match against this equipment's own ingested manual images.
-    Returns (s3_key, match_method) where match_method is "part_number",
-    "keyword", or None if nothing matched. Returning the method alongside
-    the key is just for the summary logging in call_claude_for_pm_type --
-    callers that don't care can ignore it.
-    """
     if not manual_images:
         return None, None
 
@@ -916,12 +818,6 @@ def match_manual_image(component_keyword: str, material_number: str, manual_imag
 
 
 def presign_manual_image_url(s3_key: str) -> Optional[str]:
-    """
-    Generate a presigned GET URL for a manual image. Images are stored
-    privately (see ingest_document.py) since manuals may be confidential
-    OEM documents -- this is a local signing operation, not a network
-    call, so it can't hang or fail on connectivity.
-    """
     try:
         s3 = boto3.client("s3", region_name=BEDROCK_REGION)
         return s3.generate_presigned_url(
@@ -935,12 +831,6 @@ def presign_manual_image_url(s3_key: str) -> Optional[str]:
 
 
 def resolve_component_image_url(component_keyword: str, material_number: str, manual_images: list) -> tuple:
-    """
-    Fully synchronous and local -- no network call, so nothing here can
-    hang or need a timeout. Returns (url, match_method); url is "" if
-    the equipment's manual has no matching image, in which case the
-    Excel cell is simply left blank.
-    """
     manual_key, method = match_manual_image(component_keyword, material_number, manual_images)
     if not manual_key:
         return "", None
@@ -948,14 +838,6 @@ def resolve_component_image_url(component_keyword: str, material_number: str, ma
 
 
 def attach_images_to_steps(steps: list, manual_images: list) -> dict:
-    """
-    Mutates each step dict in place with an "image_url" key, matched
-    against this equipment's own ingested manual images. Purely
-    synchronous -- no async/await needed since there's no network call
-    involved anywhere in this path.
-
-    Returns a small {"part_number": n, "keyword": n} tally for logging.
-    """
     tally = {"part_number": 0, "keyword": 0}
     for step in steps:
         keyword = normalize_component_for_image_search(step.get("component", ""))
@@ -967,82 +849,130 @@ def attach_images_to_steps(steps: list, manual_images: list) -> dict:
     return tally
 
 
-async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str, bedrock_semaphore: asyncio.Semaphore) -> tuple[Optional[list], Optional[str], dict]:
-    """
-    One attempt at the Bedrock call + response parsing for a single
-    category. Split out of call_claude_for_pm_type so the retry loop
-    below can call this repeatedly without re-running retrieval (which
-    is deterministic and not worth repeating) each time.
+# ── Bedrock call layer ───────────────────────────────────────────────────────
 
-    bedrock_semaphore: created fresh per-invocation by generate() and
-    threaded down through call_claude_for_pm_type -- NOT a module-level
-    global. See the CHANGE LOG note above BEDROCK_CALL_CONCURRENCY for
-    why a module-level asyncio.Semaphore broke across warm Lambda
-    invocations ("bound to a different event loop").
+TRUNCATED_PREFIX = "truncated"
 
-    Returns (steps_or_None, error_reason_or_None, raw_response_dict).
-    steps is None (not []) specifically when this attempt failed --
-    an empty list is a legitimate "Claude found nothing" result and
-    should NOT be retried, only a None/error result should be.
+
+async def _attempt_tool_call(
+    prompt: str,
+    tool: dict,
+    result_key: str,
+    company_id: str,
+    label: str,
+    bedrock_semaphore: asyncio.Semaphore,
+    max_tokens: int = MAX_TOKENS,
+) -> tuple:
     """
-    loop = asyncio.get_event_loop()
+    One forced-tool-use call. Returns (items_or_None, error_reason_or_None, raw).
+    items is None only on failure; [] is a legitimate "nothing found".
+
+    A response with stop_reason == "max_tokens" is treated as a FAILURE
+    (reason starts with TRUNCATED_PREFIX) even if a tool_use block is
+    present: a truncated tool call can carry a partial list that looks
+    valid but silently drops everything after the cut-off.
+
+    bedrock_semaphore is created per generate() call (never module-level:
+    a module-level asyncio.Semaphore breaks across warm Lambda invocations
+    with "bound to a different event loop").
+    """
+    loop = asyncio.get_running_loop()
     try:
-        # Capped so this job's category calls don't all fire in the same
-        # instant -- see BEDROCK_CALL_CONCURRENCY for what this does and
-        # does not solve. call_claude() (app.services.bedrock_client) owns
-        # the actual boto3 client, its retry/timeout Config, and the
-        # raw-body/stop_reason/usage logging -- /chat and ingest_document.py
-        # get the same hardening through that same shared call.
         async with bedrock_semaphore:
             raw = await loop.run_in_executor(
                 None,
                 lambda: call_claude(
                     messages=[{"role": "user", "content": prompt}],
-                    tools=[EXTRACTION_TOOL],
-                    tool_choice={"type": "tool", "name": EXTRACTION_TOOL["name"]},
-                    max_tokens=MAX_TOKENS,
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": tool["name"]},
+                    max_tokens=max_tokens,
                     temperature=0,
-                    log_context=f"[company={company_id}] {pm_code}",
+                    log_context=f"[company={company_id}] {label}",
                 ),
             )
     except Exception as invoke_err:
-        log.error(f"[company={company_id}] {pm_code} CALL_CLAUDE FAILED: {type(invoke_err).__name__}: {invoke_err}")
+        log.error(f"[company={company_id}] {label} CALL_CLAUDE FAILED: {type(invoke_err).__name__}: {invoke_err}")
         return None, f"{type(invoke_err).__name__}: {invoke_err}", {}
 
-    # call_claude() already logged raw body length, stop_reason, and token
-    # usage (with the log_context prefix above).
     stop_reason = raw.get("stop_reason")
+    if stop_reason == "max_tokens":
+        reason = f"{TRUNCATED_PREFIX}: stop_reason=max_tokens at {max_tokens} tokens"
+        log.warning(f"[company={company_id}] {label} {reason}")
+        return None, reason, raw
 
-    # Structured output via forced tool use: the model's arguments come
-    # back as an ALREADY-PARSED object in a "tool_use" content block's
-    # "input" field, not as text this code has to bracket-find and
-    # json.loads() itself. This is what removes the whole class of bug
-    # that hit WP (returned prose instead of JSON) and PM8 (malformed
-    # JSON from an escaping mistake) -- there's no free-text parsing step
-    # left for either failure mode to occur in.
-    steps = None
+    items = None
     for block in raw.get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == EXTRACTION_TOOL["name"]:
-            steps = block.get("input", {}).get("tasks")
+        if block.get("type") == "tool_use" and block.get("name") == tool["name"]:
+            items = block.get("input", {}).get(result_key)
             break
 
-    if steps is None:
-        # tool_choice forces this tool, so its absence is a real anomaly
-        # worth retrying rather than a quiet "empty" -- most likely a
-        # response that got cut off (check stop_reason) before the tool
-        # call was emitted.
+    if items is None:
         reason = f"no tool_use block in response, stop_reason={stop_reason!r}"
-        log.error(
-            f"[company={company_id}] {pm_code} {reason}. "
-            f"Raw content preview: {str(raw.get('content'))[:300]}"
-        )
+        log.error(f"[company={company_id}] {label} {reason}. Raw content preview: {str(raw.get('content'))[:300]}")
         return None, reason, raw
-    if not isinstance(steps, list):
-        reason = f"tool_use input.tasks was not a list: {type(steps).__name__}"
-        log.error(f"[company={company_id}] {pm_code} {reason}")
+    if not isinstance(items, list):
+        reason = f"tool_use input.{result_key} was not a list: {type(items).__name__}"
+        log.error(f"[company={company_id}] {label} {reason}")
         return None, reason, raw
 
-    return steps, None, raw
+    return items, None, raw
+
+
+async def _attempt_bedrock_call(prompt: str, company_id: str, pm_code: str, bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """Backward-compatible wrapper: one EXTRACTION_TOOL attempt for a PM category."""
+    return await _attempt_tool_call(prompt, EXTRACTION_TOOL, "tasks", company_id, pm_code, bedrock_semaphore)
+
+
+async def _call_with_retries(
+    build_prompt: Callable[[bool], str],
+    tool: dict,
+    result_key: str,
+    company_id: str,
+    label: str,
+    deadline: float,
+    bedrock_semaphore: asyncio.Semaphore,
+    retry_on_truncation: bool = True,
+    max_attempts: int = PM_CATEGORY_MAX_ATTEMPTS,
+) -> tuple:
+    """
+    Application-level retry loop (on top of call_claude()'s botocore
+    retries). build_prompt(concise) returns the prompt; concise=True after
+    a truncated attempt so the retry asks for shorter output.
+
+    Returns (items, status, last_reason) with status "ok" / "empty" /
+    "error". An empty list is a valid result and is never retried. With
+    retry_on_truncation=False a truncated attempt returns immediately so
+    the caller can split the input instead (parts batches).
+    """
+    last_reason = "not attempted"
+    concise = False
+    for attempt in range(1, max_attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.error(f"[company={company_id}] {label} out of time budget before attempt {attempt}/{max_attempts} (last failure: {last_reason})")
+            break
+        if attempt > 1:
+            log.warning(f"[company={company_id}] {label} attempt {attempt}/{max_attempts} (previous attempt failed: {last_reason})")
+
+        items, error_reason, _raw = await _attempt_tool_call(
+            build_prompt(concise), tool, result_key, company_id, label, bedrock_semaphore
+        )
+        if error_reason is None:
+            return items, ("ok" if items else "empty"), None
+
+        last_reason = error_reason
+        if error_reason.startswith(TRUNCATED_PREFIX):
+            if not retry_on_truncation:
+                return [], "error", last_reason
+            concise = True
+
+        if attempt < max_attempts:
+            backoff = min(PM_CATEGORY_RETRY_BACKOFF_SECONDS * attempt, max(remaining - 5, 0))
+            if backoff > 0:
+                await asyncio.sleep(backoff)
+
+    log.error(f"[company={company_id}] {label} exhausted all attempts, last failure: {last_reason}")
+    return [], "error", last_reason
 
 
 async def call_claude_for_pm_type(
@@ -1053,174 +983,694 @@ async def call_claude_for_pm_type(
     manual_images: list,
     deadline: float,
     bedrock_semaphore: asyncio.Semaphore,
-) -> tuple[str, str, list, str]:
+    setpoints_text: str = "",
+    anchor_chunks: Optional[list] = None,
+) -> tuple:
     """
-    Returns (pm_code, pm_name, steps, status) where status is one of:
-      "ok"    -- steps were extracted normally
-      "empty" -- Claude legitimately found nothing for this category
-                 (a valid, expected outcome, not a failure) -- NOT retried
-      "error" -- every attempt failed (retrieval, invoke_model, or a
-                 response that never produced a usable tool_use block) --
-                 previously indistinguishable from "empty" in the output,
-                 and previously never retried at all.
-    See build_excel for how "error" is surfaced in the spreadsheet.
+    Returns (pm_code, pm_name, steps, status), status in "ok"/"empty"/"error".
 
-    deadline: a time.monotonic() cutoff shared across all 10 categories
-    in this job (see GENERATION_DEADLINE_SECONDS / generate()). Checked
-    before every attempt, including the first, so that if this job is
-    already running long by the time this particular category's task
-    gets scheduled, it fails fast and gracefully into "error" rather than
-    starting an attempt it has no realistic time budget to retry. This is
-    what keeps one slow/throttled category from eating the time every
-    other category needed too, and stops the whole Lambda invocation from
-    being hard-killed at its timeout with nothing to show for it --
-    see the module changelog for why this matters more now that
-    individual attempts are allowed to take their time rather than fail
-    fast.
-
-    bedrock_semaphore: created fresh by generate() on every call and
-    passed down here and into _attempt_bedrock_call -- see the CHANGE LOG
-    note above BEDROCK_CALL_CONCURRENCY for why this can't be a
-    module-level global in a Lambda that reuses warm containers across
-    invocations with different event loops.
+    New optional args (2026-09-21, defaults keep old behavior):
+      setpoints_text -- REFERENCE SETPOINTS block for acceptance criteria.
+      anchor_chunks  -- maintenance-schedule chunks appended to this
+                        category's retrieved context (deduplicated).
+    Retrieval runs once; only the Bedrock call is retried.
     """
-    log.debug(f"[company={company_id}] {pm_code} ENTERED call_claude_for_pm_type, retrieval starting now")
-    loop = asyncio.get_event_loop()
-
-    # Retrieval runs per-PM-type and concurrently with the other nine
-    # (via run_in_executor, since get_embedding()/psycopg2 are blocking
-    # calls) rather than once upfront for the whole document -- see the
-    # CHANGE LOG at the top of this file for why full-recall was replaced
-    # with per-type similarity search. Done ONCE here, not repeated across
-    # retries below -- it's deterministic (same query, same embeddings,
-    # same top-K), so re-running it would only burn time budget for no
-    # benefit.
+    loop = asyncio.get_running_loop()
     query_text = PM_QUERY_TEXT.get(pm_code, pm_name)
     try:
-        manual_text = await loop.run_in_executor(
-            None, fetch_relevant_manual_chunks, equipment_id, company_id, query_text
+        chunks = await loop.run_in_executor(
+            None, fetch_relevant_chunk_list, equipment_id, company_id, query_text, RETRIEVAL_TOP_K
         )
     except Exception as retrieval_err:
         log.error(f"[company={company_id}] {pm_code} RETRIEVAL FAILED: {type(retrieval_err).__name__}: {retrieval_err}")
         return pm_code, pm_name, [], "error"
 
-    if pm_code == "WP":
-        prompt = build_working_principle_prompt(manual_text)
-    else:
-        prompt = build_pm_prompt(pm_code, pm_name, manual_text)
-    log.debug(f"[company={company_id}] {pm_code} PROMPT BUILT, length={len(prompt)}")
-    log.info(f"[company={company_id}] {pm_code} PROMPT LENGTH (chars): {len(prompt)}")
+    manual_text = "\n\n".join(_merge_chunks(chunks, anchor_chunks))
 
-    # Application-level retry loop, layered ON TOP OF call_claude()'s own
-    # botocore-level retries (network errors, throttling within a single
-    # invoke_model call -- see bedrock_client.py). This loop instead
-    # catches "the call succeeded at the network level but the response
-    # wasn't usable" -- a fresh sample from the model on the next attempt
-    # often just avoids whatever made the first one unusable. Previously
-    # there was no retry here at all: one bad response permanently lost
-    # that category. Now that speed isn't the priority (up to 15 minutes
-    # available in Lambda per the infra this runs on), this trades time
-    # budget for a real second and third chance instead of giving up
-    # after one shot.
-    steps: list = []
-    status = "error"
-    last_reason = "not attempted"
-    for attempt in range(1, PM_CATEGORY_MAX_ATTEMPTS + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            log.error(
-                f"[company={company_id}] {pm_code} out of time budget before attempt {attempt}/"
-                f"{PM_CATEGORY_MAX_ATTEMPTS} (last failure: {last_reason}) -- giving up on this category"
-            )
-            break
+    def build_prompt(concise: bool) -> str:
+        if pm_code == "WP":
+            p = build_working_principle_prompt(manual_text)
+        else:
+            p = build_pm_prompt(pm_code, pm_name, manual_text, setpoints_text)
+        return p + (CONCISE_RETRY_SUFFIX if concise else "")
 
-        if attempt > 1:
-            log.warning(
-                f"[company={company_id}] {pm_code} attempt {attempt}/{PM_CATEGORY_MAX_ATTEMPTS} "
-                f"(previous attempt failed: {last_reason})"
-            )
+    log.info(f"[company={company_id}] {pm_code} PROMPT LENGTH (chars): {len(build_prompt(False))}")
 
-        result_steps, error_reason, _raw = await _attempt_bedrock_call(prompt, company_id, pm_code, bedrock_semaphore)
-
-        if error_reason is None:
-            # result_steps is a real list here, possibly empty -- an
-            # empty list is Claude legitimately finding nothing, which is
-            # a valid outcome and NOT retried.
-            steps = result_steps
-            status = "ok" if steps else "empty"
-            break
-
-        last_reason = error_reason
-        if attempt < PM_CATEGORY_MAX_ATTEMPTS:
-            # Linear backoff between application-level retries (separate
-            # from, and on top of, botocore's own backoff inside a single
-            # call_claude() invocation). Capped against whatever time
-            # budget is actually left so this never itself becomes the
-            # reason the shared deadline gets blown.
-            backoff = min(PM_CATEGORY_RETRY_BACKOFF_SECONDS * attempt, max(remaining - 5, 0))
-            if backoff > 0:
-                await asyncio.sleep(backoff)
-
-    if status == "error":
-        log.error(
-            f"[company={company_id}] {pm_code} exhausted all attempts, last failure: {last_reason}"
-        )
+    steps, status, _reason = await _call_with_retries(
+        build_prompt, EXTRACTION_TOOL, "tasks", company_id, pm_code, deadline, bedrock_semaphore
+    )
+    for s in steps:
+        s.setdefault("source", "OEM")
 
     log.info(f"[company={company_id}] {pm_code} ({pm_name}): {len(steps)} steps extracted, status={status}")
 
-    # Resolve manual images for this type's steps now. Purely local (DB
-    # already fetched, presigning is local signing) -- no network call, so
-    # this can't hang. Runs for WP too -- its components (e.g. "Airend",
-    # "Pressure Regulator") are genuine physical parts, same as PM1-PM9's.
     tally = attach_images_to_steps(steps, manual_images)
-    matched = tally["part_number"] + tally["keyword"]
     if steps:
         log.info(
-            f"[company={company_id}] {pm_code} images: {matched}/{len(steps)} steps matched "
+            f"[company={company_id}] {pm_code} images: {tally['part_number'] + tally['keyword']}/{len(steps)} steps matched "
             f"({tally['part_number']} by part number, {tally['keyword']} by keyword)"
         )
-
     return pm_code, pm_name, steps, status
+
+
+# ── Setpoints pass ───────────────────────────────────────────────────────────
+
+def format_setpoints_text(setpoints: list) -> str:
+    lines = []
+    for sp in setpoints:
+        comp = f" [{sp.get('component')}]" if sp.get("component") else ""
+        ref = f" (src: {sp.get('source_ref')})" if sp.get("source_ref") else ""
+        lines.append(f"- {sp.get('parameter', '')}{comp}: {sp.get('value', '')}{ref}")
+    return "\n".join(lines)
+
+
+async def extract_setpoints(equipment_id: str, company_id: str, deadline: float, bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """Returns (setpoints, status)."""
+    loop = asyncio.get_running_loop()
+    try:
+        chunks = await loop.run_in_executor(
+            None, fetch_relevant_chunk_list, equipment_id, company_id, SETPOINTS_QUERY_TEXT, SETPOINTS_TOP_K
+        )
+    except Exception as e:
+        log.error(f"[company={company_id}] SETPOINTS RETRIEVAL FAILED: {type(e).__name__}: {e}")
+        return [], "error"
+    text = "\n\n".join(chunks)
+    items, status, _ = await _call_with_retries(
+        lambda concise: build_setpoints_prompt(text) + (CONCISE_RETRY_SUFFIX if concise else ""),
+        SETPOINTS_TOOL, "setpoints", company_id, "SETPOINTS", deadline, bedrock_semaphore,
+    )
+    items = [s for s in items if (s.get("parameter") or "").strip() and (s.get("value") or "").strip()]
+    log.info(f"[company={company_id}] SETPOINTS: {len(items)} extracted, status={status}")
+    return items, status
+
+
+# ── Parts list pass ──────────────────────────────────────────────────────────
+
+async def _extract_parts_batch(chunks: list, company_id: str, label: str, deadline: float,
+                               bedrock_semaphore: asyncio.Semaphore, depth: int = 0) -> tuple:
+    """
+    Extract parts rows from a batch of chunks. On truncation, split the
+    batch in half and recurse (up to PARTS_MAX_SPLIT_DEPTH). Returns
+    (rows, ok: bool).
+    """
+    text = "\n\n".join(chunks)
+    rows, status, reason = await _call_with_retries(
+        lambda concise: build_parts_prompt(text),
+        PARTS_TOOL, "parts", company_id, label, deadline, bedrock_semaphore,
+        retry_on_truncation=False,
+    )
+    if status != "error":
+        return rows, True
+    if reason and reason.startswith(TRUNCATED_PREFIX) and len(chunks) > 1 and depth < PARTS_MAX_SPLIT_DEPTH:
+        mid = len(chunks) // 2
+        log.info(f"[company={company_id}] {label} truncated; splitting {len(chunks)} chunks into {mid}+{len(chunks) - mid}")
+        (a_rows, a_ok), (b_rows, b_ok) = await asyncio.gather(
+            _extract_parts_batch(chunks[:mid], company_id, f"{label}a", deadline, bedrock_semaphore, depth + 1),
+            _extract_parts_batch(chunks[mid:], company_id, f"{label}b", deadline, bedrock_semaphore, depth + 1),
+        )
+        return a_rows + b_rows, (a_ok and b_ok)
+    return [], False
+
+
+def _dedupe_parts(rows: list) -> list:
+    """Chunk overlap can emit the same row twice; keep the first."""
+    seen, out = set(), []
+    for r in rows:
+        key = (
+            (r.get("assembly") or "").strip().lower(),
+            (r.get("item_no") or "").strip().lower(),
+            (r.get("part_number") or "").strip().lower(),
+            (r.get("description") or "").strip().lower(),
+        )
+        if key in seen or not (r.get("description") or r.get("part_number")):
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+async def extract_parts_list(equipment_id: str, company_id: str, deadline: float,
+                             bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """
+    Returns (parts, status, notes). status: "ok", "partial", "empty", "error".
+    Full recall over ALL chunks (not top-K): parts tables are spread across
+    many pages and rank poorly against any single query.
+    """
+    loop = asyncio.get_running_loop()
+    notes = []
+    try:
+        all_chunks = await loop.run_in_executor(None, fetch_all_manual_chunk_list, equipment_id, company_id)
+    except Exception as e:
+        log.error(f"[company={company_id}] PARTS FETCH FAILED: {type(e).__name__}: {e}")
+        return [], "error", notes
+
+    scored = [(i, c, _parts_chunk_score(c)) for i, c in enumerate(all_chunks)]
+    candidates = [(i, c, s) for i, c, s in scored if s >= PARTS_CANDIDATE_MIN_SCORE]
+    cap = PARTS_BATCH_CHUNKS * PARTS_MAX_BATCHES
+    if len(candidates) > cap:
+        notes.append({
+            "note_type": "gap",
+            "detail": f"Parts extraction capped at {cap} of {len(candidates)} candidate chunks; lowest-scoring chunks skipped. Raise PM_PARTS_MAX_BATCHES to cover the full parts list.",
+            "affected": "Parts List, Critical Spares", "source_ref": "system",
+        })
+        keep = {i for i, _, _ in sorted(candidates, key=lambda t: -t[2])[:cap]}
+        candidates = [t for t in candidates if t[0] in keep]
+    candidate_texts = [c for _, c, _ in candidates]  # ingest order preserved
+    log.info(f"[company={company_id}] PARTS: {len(candidate_texts)}/{len(all_chunks)} chunks look like parts tables")
+    if not candidate_texts:
+        return [], "empty", notes
+
+    batches = [candidate_texts[i:i + PARTS_BATCH_CHUNKS] for i in range(0, len(candidate_texts), PARTS_BATCH_CHUNKS)]
+    results = await asyncio.gather(*[
+        _extract_parts_batch(b, company_id, f"PARTS#{n + 1}", deadline, bedrock_semaphore)
+        for n, b in enumerate(batches)
+    ])
+    rows = [r for batch_rows, _ok in results for r in batch_rows]
+    failed = sum(1 for _rows, ok in results if not ok)
+    parts = _dedupe_parts(rows)
+
+    if failed:
+        notes.append({
+            "note_type": "gap",
+            "detail": f"{failed} of {len(batches)} parts-list batches failed or timed out; the parts list and spares list may be incomplete. Regenerate before relying on them.",
+            "affected": "Parts List, Critical Spares", "source_ref": "system",
+        })
+    status = "error" if failed == len(batches) else ("partial" if failed else ("ok" if parts else "empty"))
+    log.info(f"[company={company_id}] PARTS: {len(parts)} unique rows from {len(batches)} batches, status={status}")
+    return parts, status, notes
+
+
+# ── Critical spares (deterministic) ─────────────────────────────────────────
+#
+# Keyword rules, evaluated in order: tier-A wear/critical terms first, then
+# structural/fastener exclusions, then tier B, then tier C. First match wins.
+# Deterministic on purpose -- same parts list, same spares list, every run.
+# These are STARTING tiers; the sheet says so and planners re-rank with
+# failure history.
+
+_A_RULES = [
+    (r"\bknife|\bblade|\bcutter\b", "Cutting", "Edge wear or chipping; poor cut"),
+    (r"(?<!for )mechanical (shaft )?seal|seal kit|\bsealer\b|seal ring", "Sealing", "Seal wear or leakage"),
+    (r"heater|heating element", "Heating", "Element burnout; temperature not reached"),
+    (r"nozzle", "Dispensing", "Clogging; uneven or missing pattern"),
+    (r"heated hose|automatic hose|hose, heated", "Dispensing", "Hose heater failure"),
+    (r"\bbelt\b|timing belt|round belt|conveyor belt|conveyer belt", "Belts", "Wear, cracking, stretch, slip"),
+    (r"lamella|\bvane\b|impeller|\brotor\b|\blining\b|wear plate|wear strip|wear ring|rubber base", "Wear parts", "Wear; loss of capacity or function"),
+    (r"rubber bushing|coupling insert|\bspider\b|coupling element", "Couplings", "Elastomer wear or cracking"),
+    (r"sensor|proximity|\bprox\b|photo ?(eye|cell|electric)|hall effect|encoder|\bswitch\b", "Sensors", "Sensor failure or misalignment stops the cycle"),
+    (r"solenoid|valve unit", "Pneumatic valves", "Coil or spool failure"),
+    (r"servo", "Drives", "Motor/encoder failure; long lead time"),
+    (r"filter element|element, filter", "Filtration", "Element loading"),
+]
+_B_RULES = [
+    (r"\bchain\b|chain link|connecting link", "Chains", "Elongation or stiff links; tension loss"),
+    (r"cylinder", "Pneumatics", "Seal leakage; slow or weak actuation"),
+    (r"ball bushing|linear bush|linear bearing|slide bush|oilite|drymet|\bbushing\b|\bbush\b", "Bushings", "Wear or play; binding"),
+    (r"oil seal|dust seal|radial seal|o-ring|\bgasket\b|packing|wiper|\bfelt\b", "Seals", "Leakage or dry running"),
+    (r"spring", "Springs", "Fatigue or breakage; force loss"),
+    (r"rubber rol|compression roller|roller, compression|squeezer|pinch roll", "Rollers", "Wear, flat spots, buildup"),
+    (r"clutch|coupling|rod end", "Power transmission", "Slip, wear or play"),
+    (r"\bmotor\b|reducer|gearbox|\bi=\s?\d|\b\d+(\.\d+)?:1\b|gear unit|gear box|\bpump\b|melter|drive unit|\bgun\b|smooth start|shuttle valve|lock-out valve", "Strategic", "Failure stops the line; long lead time"),
+]
+_C_RULES = [
+    (r"bearing|pillow|flange unit", "Bearings", "Noise, heat, seizure"),
+    (r"sprocket|sproket|pulley|\bgear\b|gear-|spur|bevel", "Power transmission", "Tooth wear"),
+    (r"roller|rollar", "Rollers", "Seized or worn roller"),
+    (r"regulator|regulater|gauge|gage|flow control|speed control|quick exhaust", "Pneumatic controls", "Drift or damage"),
+    (r"\bfan\b", "Cooling", "Broken fan; overheating"),
+]
+_A_RULES_C = [(re.compile(p, re.I), c, f) for p, c, f in _A_RULES]
+_B_RULES_C = [(re.compile(p, re.I), c, f) for p, c, f in _B_RULES]
+_C_RULES_C = [(re.compile(p, re.I), c, f) for p, c, f in _C_RULES]
+
+# Head nouns of parts that don't belong on a spares list (structure,
+# fasteners, brackets...). Checked against the HEAD noun only (last word
+# of the part name before any comma, "for", or parenthesis), so "Sensor
+# bracket" and "Bolt for wear plate" are excluded while "Chain link" and
+# "O-ring" are not.
+_EXCLUDED_HEAD_NOUNS = set("""
+bolt bolts screw screws nut nuts washer washers rivet stud spacer shim bracket brkt brkt. brackt blacket plate plates
+cover frame panel label sign decal post channel standoff stand weldment housing house base leg bar extrusion guard
+handle knob pull clip cotter keystock key kye support stay block box stopper hinge catch grommet arrow duct liner
+tube pipe elbow nipple union tee plug cap collar pin shaft rod rail track flange strut hook holder sleeve boss joint
+dog flag lug nose mount sub-base fitting ring glass
+""".split())
+# Head phrases that ARE wear parts even though their head noun is excluded.
+_HEAD_OVERRIDE_RE = re.compile(r"wear plate|wear strip|wear ring|rubber base|seal ring", re.I)
+
+
+def _head_phrase(description: str) -> str:
+    d = re.sub(r"\(.*?\)", " ", (description or "").lower())
+    d = d.split(",")[0]
+    d = re.split(r"\s+for\s+", d)[0]
+    return re.sub(r"\s+", " ", d).strip()
+
+
+def classify_part(description: str, wear_flag: bool = False, spare_flag: bool = False) -> Optional[tuple]:
+    """
+    Returns (tier, category, likely_failure_mode) or None for parts that
+    don't belong on a spares list. The manual's own W/S flags override:
+    W+S -> A, W or S alone -> at least B.
+    """
+    full = (description or "").lower()
+    head = _head_phrase(full)
+    head_noun = head.split()[-1] if head.split() else ""
+    excluded = head_noun.rstrip(".") in _EXCLUDED_HEAD_NOUNS and not _HEAD_OVERRIDE_RE.search(head)
+
+    result = None
+    if not excluded:
+        for tier, rules, texts in (("A", _A_RULES_C, (head, full)), ("B", _B_RULES_C, (head, full)), ("C", _C_RULES_C, (head,))):
+            for text in texts:
+                for rx, cat, fm in rules:
+                    if rx.search(text):
+                        result = (tier, cat, fm)
+                        break
+                if result:
+                    break
+            if result:
+                break
+
+    if wear_flag and spare_flag:
+        return ("A", result[1] if result else "Manual wear part", result[2] if result else "Wear (flagged by manual)")
+    if wear_flag or spare_flag:
+        if result is None:
+            return ("B", "Manual-flagged part", "Flagged as wear/spare part by manual")
+        if result[0] == "C":
+            return ("B", result[1], result[2])
+    return result
+
+
+def _is_missing_part_number(pn: str) -> bool:
+    p = (pn or "").strip().lower()
+    return (not p) or p.startswith("see ") or "not listed" in p or p in ("n/a", "-", "ref")
+
+
+def build_critical_spares(parts: list) -> list:
+    """One row per assembly+part number, with machine-wide quantity per part number."""
+    qty_total = defaultdict(float)
+    for p in parts:
+        pn = (p.get("part_number") or "").strip()
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\b", p.get("qty") or "")
+        if pn and m and not _is_missing_part_number(pn):
+            qty_total[pn.lower()] += float(m.group(1))
+
+    spares, seen = [], set()
+    for p in parts:
+        cls = classify_part(p.get("description", ""), bool(p.get("wear_part_flag")), bool(p.get("spare_part_flag")))
+        if not cls:
+            continue
+        pn = (p.get("part_number") or "").strip()
+        key = ((p.get("assembly") or "").lower(), pn.lower(), (p.get("description") or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        tier, cat, fm = cls
+        total = qty_total.get(pn.lower())
+        spares.append({
+            "tier": tier, "category": cat, "failure_mode": fm,
+            "assembly": p.get("assembly", ""), "item_no": p.get("item_no", ""),
+            "description": p.get("description", ""), "part_number": pn,
+            "qty": p.get("qty", ""),
+            "total_qty": (int(total) if total and float(total).is_integer() else total) or "",
+            "manual_flags": "".join(f for f, on in (("W", p.get("wear_part_flag")), ("S", p.get("spare_part_flag"))) if on),
+        })
+    spares.sort(key=lambda s: (s["tier"], s["assembly"], s["description"]))
+    return spares
+
+
+# ── Post-processing: dedupe, renumber, coverage ─────────────────────────────
+
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    s = _QUANTITY_SUFFIX_RE.sub("", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def dedupe_across_categories(pm_results: list) -> tuple:
+    """
+    Collapse exact duplicates (same normalized task description + component)
+    across PM categories into the most specific one (DEDUPE_PRIORITY).
+    WP is never touched. Returns (new_pm_results, removed_count).
+    """
+    rank = {code: i for i, code in enumerate(DEDUPE_PRIORITY)}
+    owner = {}
+    for code, _name, steps, _status in pm_results:
+        if code == "WP":
+            continue
+        for s in steps:
+            key = (_norm(s.get("task_list_description")), _norm(s.get("component")))
+            if key == ("", ""):
+                continue
+            if key not in owner or rank.get(code, 99) < rank.get(owner[key], 99):
+                owner[key] = code
+
+    removed, out, kept_keys = 0, [], set()
+    for code, name, steps, status in pm_results:
+        if code == "WP":
+            out.append((code, name, steps, status))
+            continue
+        new_steps = []
+        for s in steps:
+            key = (_norm(s.get("task_list_description")), _norm(s.get("component")))
+            if key != ("", "") and (owner.get(key) != code or (code, key) in kept_keys):
+                removed += 1
+                continue
+            kept_keys.add((code, key))
+            new_steps.append(s)
+        out.append((code, name, new_steps, status))
+    return out, removed
+
+
+def renumber_operations(steps: list) -> None:
+    for i, s in enumerate(steps, 1):
+        s["operation"] = f"Operation_{i * 10:03d}"
+
+
+def _task_covers_part(step: dict, spare: dict) -> bool:
+    pn = (spare.get("part_number") or "").strip().lower()
+    mat = (step.get("material_number") or "").lower()
+    if len(pn) >= MIN_PART_NUMBER_MATCH_LENGTH and pn in mat:
+        return True
+    words = [w for w in _norm(spare.get("description")).split() if len(w) > 3]
+    hay = _norm(f"{step.get('component', '')} {step.get('task_list_description', '')}")
+    return bool(words) and all(w in hay for w in words[:2])
+
+
+def find_uncovered_spares(pm_results: list, spares: list) -> list:
+    all_steps = [s for code, _n, steps, _st in pm_results if code != "WP" for s in steps]
+    return [sp for sp in spares if sp["tier"] in ("A", "B") and not any(_task_covers_part(s, sp) for s in all_steps)]
+
+
+def summarize_tasks_for_prompt(pm_results: list, with_ref: bool = False) -> str:
+    lines = []
+    for code, _n, steps, _st in pm_results:
+        if code == "WP":
+            continue
+        for s in steps:
+            parts = [code, s.get("task_list_description", ""), s.get("component", ""), s.get("frequency", "")]
+            if with_ref:
+                parts.append(s.get("source_ref", ""))
+            lines.append(" | ".join(str(p) for p in parts))
+    return "\n".join(lines[:MAX_CONTEXT_TASK_LINES])
+
+
+async def generate_recommended_tasks(pm_results: list, uncovered: list, setpoints_text: str,
+                                     equipment_id: str, company_id: str, deadline: float,
+                                     bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    """Returns (tasks_with_pm_code, status)."""
+    loop = asyncio.get_running_loop()
+    try:
+        chunks = await loop.run_in_executor(
+            None, fetch_relevant_chunk_list, equipment_id, company_id, RECOMMENDED_QUERY_TEXT, 25
+        )
+    except Exception as e:
+        log.error(f"[company={company_id}] RECOMMENDED RETRIEVAL FAILED: {type(e).__name__}: {e}")
+        return [], "error"
+
+    gaps_lines = [
+        f"- Tier {sp['tier']} part: {sp['description']} (P/N {sp['part_number'] or 'n/a'}, {sp['assembly']}); likely failure: {sp['failure_mode']}"
+        for sp in uncovered[:MAX_CONTEXT_PART_LINES]
+    ]
+    gaps_lines.append("- Check the manual excerpt for safety devices and the setpoints list for values with no existing check.")
+    tasks_summary = summarize_tasks_for_prompt(pm_results)
+    text = "\n\n".join(chunks)
+
+    items, status, _ = await _call_with_retries(
+        lambda concise: build_recommended_prompt(tasks_summary, "\n".join(gaps_lines), setpoints_text, text)
+        + (CONCISE_RETRY_SUFFIX if concise else ""),
+        RECOMMENDED_TOOL, "tasks", company_id, "RECOMMENDED", deadline, bedrock_semaphore,
+    )
+    existing = {(_norm(s.get("task_list_description")), _norm(s.get("component")))
+                for _c, _n, steps, _s in pm_results for s in steps}
+    out = []
+    for t in items[:MAX_RECOMMENDED_TASKS]:
+        if t.get("pm_code") not in PM_NAME_BY_CODE or t.get("pm_code") == "WP":
+            continue
+        if (_norm(t.get("task_list_description")), _norm(t.get("component"))) in existing:
+            continue
+        t["source"] = "Recommended"
+        out.append(t)
+    log.info(f"[company={company_id}] RECOMMENDED: {len(out)} tasks kept of {len(items)} proposed, status={status}")
+    return out, status
+
+
+async def generate_review_notes(pm_results: list, setpoints_text: str, equipment_id: str, company_id: str,
+                                deadline: float, bedrock_semaphore: asyncio.Semaphore) -> tuple:
+    loop = asyncio.get_running_loop()
+    try:
+        chunks = await loop.run_in_executor(
+            None, fetch_relevant_chunk_list, equipment_id, company_id, REVIEW_QUERY_TEXT, 20
+        )
+    except Exception as e:
+        log.error(f"[company={company_id}] REVIEW RETRIEVAL FAILED: {type(e).__name__}: {e}")
+        return [], "error"
+    text = "\n\n".join(chunks)
+    tasks_summary = summarize_tasks_for_prompt(pm_results, with_ref=True)
+    items, status, _ = await _call_with_retries(
+        lambda concise: build_review_prompt(tasks_summary, setpoints_text, text) + (CONCISE_RETRY_SUFFIX if concise else ""),
+        REVIEW_TOOL, "notes", company_id, "REVIEW", deadline, bedrock_semaphore,
+    )
+    log.info(f"[company={company_id}] REVIEW: {len(items)} notes, status={status}")
+    return items, status
+
+
+def deterministic_review_notes(pm_results: list, setpoints: list, parts: list, duplicates_removed: int,
+                               stage_status: dict) -> list:
+    notes = []
+    for code, name, _steps, status in pm_results:
+        if status == "error":
+            notes.append({"note_type": "gap", "detail": f"{code} - {name} was not generated this run. Regenerate before using the plan.",
+                          "affected": code, "source_ref": "system"})
+    for stage, st in stage_status.items():
+        if st == "error":
+            notes.append({"note_type": "gap", "detail": f"The {stage} stage failed this run; its sheet may be empty. Regenerate.",
+                          "affected": stage, "source_ref": "system"})
+
+    missing = [p for p in parts if _is_missing_part_number(p.get("part_number"))
+               and classify_part(p.get("description", ""), bool(p.get("wear_part_flag")), bool(p.get("spare_part_flag")))]
+    if missing:
+        sample = "; ".join(f"{p.get('description')} ({p.get('assembly')})" for p in missing[:8])
+        notes.append({"note_type": "missing_part_number",
+                      "detail": f"{len(missing)} spares-relevant parts have no part number in the manual (e.g. {sample}). Get them from electrical drawings or the OEM.",
+                      "affected": "Critical Spares", "source_ref": "Parts List"})
+
+    by_param, label = defaultdict(set), {}
+    for sp in setpoints:
+        key = _norm(sp.get("parameter"))
+        by_param[key].add((sp.get("value") or "").strip())
+        label.setdefault(key, (sp.get("parameter") or "").strip())
+    for param, values in by_param.items():
+        if param and len(values) > 1:
+            notes.append({"note_type": "conflict", "detail": f"Setpoint '{label[param]}' appears with different values: {', '.join(sorted(values))}. Confirm the correct one.",
+                          "affected": "Setpoints", "source_ref": "Setpoints"})
+
+    if duplicates_removed:
+        notes.append({"note_type": "clarification",
+                      "detail": f"{duplicates_removed} duplicate task(s) found in more than one PM category were kept only in the most specific category.",
+                      "affected": "PM Strategy", "source_ref": "system"})
+    return notes
+
+
+# ── Frequency → annual labor ─────────────────────────────────────────────────
+
+_FREQ_WORDS = {
+    "SHIFT": None, "EVERYSHIFT": None, "PERSHIFT": None,
+    "DAILY": ("D", 1), "WEEKLY": ("W", 1), "BIWEEKLY": ("W", 2), "MONTHLY": ("M", 1),
+    "BIMONTHLY": ("M", 2), "QUARTERLY": ("M", 3), "SEMIANNUAL": ("M", 6), "SEMIANNUALLY": ("M", 6),
+    "ANNUAL": ("Y", 1), "ANNUALLY": ("Y", 1), "YEARLY": ("Y", 1),
+}
+
+
+def occurrences_per_year(freq: str) -> Optional[float]:
+    """
+    Normalized frequency code -> occurrences per year, using the
+    OPERATING_* assumptions. None for blank/Event/unparseable, so the
+    summary shows a blank rather than a wrong number.
+    """
+    f = re.sub(r"[\s\-_]", "", (freq or "").upper())
+    if not f or f.startswith("EVENT"):
+        return None
+    if f in ("SHIFT", "S", "1S", "EVERYSHIFT", "PERSHIFT"):
+        return float(OPERATING_DAYS_PER_YEAR * SHIFTS_PER_DAY)
+    if f in _FREQ_WORDS and _FREQ_WORDS[f]:
+        unit, n = _FREQ_WORDS[f]
+        f = f"{n}{unit}"
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(D|W|M|Y|H|HR|HRS|HOURS)", f)
+    if not m:
+        return None
+    n, unit = float(m.group(1)), m.group(2)
+    if n <= 0:
+        return None
+    if unit == "D":
+        return OPERATING_DAYS_PER_YEAR / n
+    if unit == "W":
+        return 52 / n
+    if unit == "M":
+        return 12 / n
+    if unit == "Y":
+        return 1 / n
+    return OPERATING_HOURS_PER_YEAR / n
+
+
+def _hours(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 
+def compose_instruction(step: dict) -> str:
+    """
+    Long Text (Instruction) cell content: the instruction plus Acceptance,
+    Owner and Source lines when present. Keeps the import format's column
+    set unchanged while still carrying the new fields.
+    """
+    parts = [(step.get("instruction") or "").strip()]
+    acc = (step.get("acceptance_criteria") or "").strip()
+    if acc:
+        parts.append(f"Acceptance: {acc}")
+    owner = (step.get("owner") or "").strip()
+    if owner:
+        parts.append(f"Owner: {owner}")
+    source = (step.get("source") or "").strip()
+    ref = (step.get("source_ref") or "").strip()
+    if source == "Recommended":
+        basis = "; ".join(b for b in (ref, (step.get("rationale") or "").strip()) if b)
+        parts.append("Source: Recommended (not in OEM manual) -- validate before use" + (f". Basis: {basis}" if basis else ""))
+    elif ref:
+        parts.append(f"Source: OEM manual -- {ref}")
+    return "\n\n".join(p for p in parts if p)
+
+
 def _estimate_row_height(instruction: str) -> int:
-    """
-    Instruction text contains numbered steps separated by blank lines
-    (\\n\\n). Estimate wrapped line count so multi-step instructions
-    don't get visually clipped at a fixed row height.
-    """
     if not instruction:
         return MIN_ROW_HEIGHT
-
     line_count = 0
     for segment in instruction.split("\n"):
         if segment == "":
-            line_count += 1  # blank line between steps
+            line_count += 1
         else:
-            # account for wrapping within a single step line
             line_count += max(1, -(-len(segment) // INSTRUCTION_COL_CHARS_PER_LINE))
-
     return max(MIN_ROW_HEIGHT, line_count * LINE_HEIGHT)
 
 
-def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
-    """
-    Build the PM strategy Excel file from Claude's structured output.
-    Format matches PM_strategy.xlsx exactly.
+def _write_table(ws, start_row: int, headers: list, rows: list, widths: list, wrap_cols=None, tier_col=None) -> int:
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=start_row, column=c, value=h)
+        cell.font, cell.fill = HEADER_FONT, HEADER_FILL
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    r = start_row + 1
+    for row in rows:
+        for c, v in enumerate(row, 1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.font = DATA_FONT
+            cell.alignment = WRAP_ALIGN
+            if tier_col and c == tier_col and v in TIER_FILLS:
+                cell.fill = TIER_FILLS[v]
+                cell.alignment = Alignment(horizontal="center", vertical="top")
+        r += 1
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=1)
+    if rows:
+        ws.auto_filter.ref = f"A{start_row}:{ws.cell(row=r - 1, column=len(headers)).coordinate}"
+    return r
 
-    pm_results: list of (pm_code, pm_name, steps_list, status) tuples in
-    PM1-PM9 order. status is "ok" / "empty" / "error" (see
-    call_claude_for_pm_type). All PM types are written -- empty ones show
-    the header and column row with no data rows, ready for the reviewer
-    to fill in manually. A category with status "error" gets a visibly
-    flagged row instead of looking identical to a legitimately empty one
-    -- previously there was no way to tell the two apart just by looking
-    at the file.
+
+def _title(ws, title: str, note: str) -> None:
+    ws.cell(row=1, column=1, value=title).font = Font(bold=True, name="Arial", size=12)
+    ws.cell(row=2, column=1, value=note).font = NOTE_FONT
+
+
+def _add_summary_sheet(wb, pm_results: list) -> None:
+    ws = wb.create_sheet("PM Summary")
+    _title(ws, "PM Summary (one row per task)",
+           f"Annual hours assume {OPERATING_DAYS_PER_YEAR} operating days/yr, {SHIFTS_PER_DAY} shifts/day, "
+           f"{OPERATING_HOURS_PER_YEAR} operating hours/yr (env PM_OPERATING_*). Blank = interval or task time not given.")
+    rows = []
+    totals = defaultdict(float)
+    for code, name, steps, _status in pm_results:
+        if code == "WP":
+            continue
+        for s in steps:
+            occ = occurrences_per_year(s.get("frequency", ""))
+            hrs = _hours(s.get("hrs"))
+            annual = round(occ * hrs, 1) if (occ is not None and hrs is not None) else None
+            owner = s.get("owner") or ""
+            if annual:
+                totals[owner or "Unassigned"] += annual
+            rows.append([
+                f"{code}-{s.get('operation', '')}", f"{code} - {name}", s.get("task_list_description", ""),
+                s.get("component", ""), s.get("frequency", ""), round(occ, 1) if occ is not None else None,
+                hrs, annual, owner, "Running" if str(s.get("system_condition")) == "1" else "Stopped",
+                s.get("source") or "OEM", s.get("source_ref", ""), s.get("acceptance_criteria", ""),
+            ])
+    r = _write_table(ws, 4, ["Task ID", "PM Type", "Task", "Component", "Frequency", "Occurrences / Year",
+                             "Est. Hrs", "Annual Hrs", "Owner", "Machine State", "Source", "Source Ref", "Acceptance Criteria"],
+                     rows, [18, 22, 40, 24, 10, 11, 8, 9, 12, 11, 12, 30, 40])
+    r += 1
+    ws.cell(row=r, column=1, value="Annual hours by owner").font = SUBHEAD_FONT
+    for owner, hrs in sorted(totals.items()):
+        r += 1
+        ws.cell(row=r, column=1, value=owner).font = DATA_FONT
+        ws.cell(row=r, column=2, value=round(hrs, 1)).font = DATA_FONT
+    oem = sum(1 for row in rows if row[10] == "OEM")
+    r += 2
+    ws.cell(row=r, column=1, value=f"Tasks: {len(rows)} ({oem} OEM, {len(rows) - oem} Recommended)").font = DATA_FONT
+
+
+def _add_extra_sheets(wb, pm_results: list, extras: dict) -> None:
+    _add_summary_sheet(wb, pm_results)
+
+    ws = wb.create_sheet("Setpoints")
+    _title(ws, "Setpoints (as printed in the manual)",
+           "Referenced by PM acceptance criteria. Enter plant-approved values in 'Plant Standard' where they differ.")
+    _write_table(ws, 4, ["Parameter", "Value", "Component", "Source Ref", "Plant Standard"],
+                 [[s.get("parameter", ""), s.get("value", ""), s.get("component", ""), s.get("source_ref", ""), None]
+                  for s in extras.get("setpoints", [])], [40, 28, 26, 26, 18])
+
+    ws = wb.create_sheet("Critical Spares")
+    _title(ws, "Critical Spares (starting tiers -- re-rank with failure history)",
+           "Tier A: stock on site. Tier B: stock or confirm lead time. Tier C: buy on condition. "
+           "Rule-based from part descriptions plus the manual's own W/S flags.")
+    _write_table(ws, 4, ["Tier", "Category", "Assembly", "Item No.", "Description", "Part No.", "Qty",
+                         "Total Qty (same P/N)", "Manual Flags", "Likely Failure Mode", "Min On-Hand", "Lead Time"],
+                 [[s["tier"], s["category"], s["assembly"], s["item_no"], s["description"], s["part_number"], s["qty"],
+                   s["total_qty"], s["manual_flags"], s["failure_mode"], None, None] for s in extras.get("spares", [])],
+                 [6, 18, 26, 7, 34, 22, 8, 10, 8, 36, 11, 11], tier_col=1)
+
+    ws = wb.create_sheet("Parts List")
+    _title(ws, "Parts List (as printed in the manual)", "Verify against the manual before ordering.")
+    _write_table(ws, 4, ["Assembly", "Parts List Ref", "Item No.", "Part No.", "Description", "Qty", "Wear (W)", "Spare (S)"],
+                 [[p.get("assembly", ""), p.get("parts_list_ref", ""), p.get("item_no", ""), p.get("part_number", ""),
+                   p.get("description", ""), p.get("qty", ""), "W" if p.get("wear_part_flag") else "",
+                   "S" if p.get("spare_part_flag") else ""] for p in extras.get("parts", [])],
+                 [30, 20, 8, 24, 44, 9, 8, 8])
+
+    ws = wb.create_sheet("Review Notes")
+    _title(ws, "Review Notes (resolve before using the plan)",
+           "Conflicts, missing documents, missing part numbers, and gaps found during generation.")
+    order = {"conflict": 0, "missing_document": 1, "gap": 2, "missing_part_number": 3, "clarification": 4}
+    notes = sorted(extras.get("review_notes", []), key=lambda n: order.get(n.get("note_type"), 9))
+    _write_table(ws, 4, ["Type", "Detail", "Affected", "Source Ref"],
+                 [[n.get("note_type", ""), n.get("detail", ""), n.get("affected", ""), n.get("source_ref", "")] for n in notes],
+                 [18, 80, 24, 24])
+
+
+def build_excel(equipment_id: str, pm_results: list, extras: Optional[dict] = None) -> bytes:
     """
-    wb   = Workbook()
-    ws   = wb.active
+    Sheet 1 "PM Strategy" matches PM_strategy.xlsx exactly (same columns,
+    same block layout). pm_results: (pm_code, pm_name, steps, status)
+    tuples. status "error" gets a quiet but visible "not generated" row.
+
+    extras (optional, 2026-09-21): {"setpoints", "parts", "spares",
+    "review_notes"} -> extra sheets after "PM Strategy" when
+    EXTRA_SHEETS_ENABLED. Omit to get the old single-sheet output.
+    """
+    wb = Workbook()
+    ws = wb.active
     ws.title = "PM Strategy"
 
     col_widths = [15, 55, 12, 8, 13, 17, 16, 35, 60, 35, 40]
@@ -1228,39 +1678,24 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
 
     current_row = 1
-
     for pm_code, pm_name, steps, status in pm_results:
-
-        # PM type header row (e.g. "PM2 - Lubrication")
         header_cell = ws.cell(row=current_row, column=1, value=f"{pm_code} - {pm_name}")
         header_cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
         header_cell.fill = HEADER_FILL
         header_cell.alignment = Alignment(vertical="center")
         ws.row_dimensions[current_row].height = 20
-        ws.merge_cells(
-            start_row=current_row, start_column=1,
-            end_row=current_row, end_column=len(COLUMNS)
-        )
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(COLUMNS))
         current_row += 1
 
-        # Column headers
         for col_idx, col_name in enumerate(COLUMNS, 1):
-            cell           = ws.cell(row=current_row, column=col_idx, value=col_name)
-            cell.font      = SUBHEAD_FONT
-            cell.fill      = SUBHEAD_FILL
+            cell = ws.cell(row=current_row, column=col_idx, value=col_name)
+            cell.font = SUBHEAD_FONT
+            cell.fill = SUBHEAD_FILL
             cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
         ws.row_dimensions[current_row].height = 30
         current_row += 1
 
         if status == "error":
-            # Flagged distinctly from a legitimately empty category so the
-            # reviewer (or the salesperson sending this to a customer)
-            # doesn't mistake "generation failed for this category" for
-            # "the manual just doesn't cover this" -- kept quiet rather
-            # than alarming (see INCOMPLETE_FILL/INCOMPLETE_FONT comment
-            # above) but deliberately still visible, never silently
-            # dropped, so a reviewer always has a way to notice this
-            # category needs a retry before the document goes out.
             error_cell = ws.cell(
                 row=current_row, column=1,
                 value=f"{pm_code} not generated this run -- recommend regenerating this category before sending.",
@@ -1269,15 +1704,11 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
             error_cell.fill = INCOMPLETE_FILL
             error_cell.alignment = Alignment(vertical="center")
             ws.row_dimensions[current_row].height = 20
-            ws.merge_cells(
-                start_row=current_row, start_column=1,
-                end_row=current_row, end_column=len(COLUMNS)
-            )
+            ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=len(COLUMNS))
             current_row += 1
 
-        # Data rows -- skipped naturally if steps is empty
         for step in steps:
-            instruction = step.get("instruction", "")
+            instruction = compose_instruction(step)
             image_url = step.get("image_url", "")
             row_values = [
                 step.get("operation", ""),
@@ -1290,11 +1721,11 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
                 step.get("component", ""),
                 instruction,
                 step.get("failure_modes", ""),
-                image_url,  # manual reference URL if matched, blank otherwise -- reviewer edits/replaces as needed
+                image_url,
             ]
             for col_idx, value in enumerate(row_values, 1):
-                cell           = ws.cell(row=current_row, column=col_idx, value=value)
-                cell.font      = DATA_FONT
+                cell = ws.cell(row=current_row, column=col_idx, value=value)
+                cell.font = DATA_FONT
                 cell.alignment = WRAP_ALIGN
                 if col_idx == len(COLUMNS) and image_url:
                     cell.hyperlink = image_url
@@ -1302,11 +1733,12 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
             ws.row_dimensions[current_row].height = _estimate_row_height(instruction)
             current_row += 1
 
-        # Spacer row between PM type blocks
         current_row += 1
 
-    # Freeze the top row of the first block
     ws.freeze_panes = "A3"
+
+    if extras is not None and EXTRA_SHEETS_ENABLED:
+        _add_extra_sheets(wb, pm_results, extras)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1315,15 +1747,7 @@ def build_excel(equipment_id: str, pm_results: list[tuple]) -> bytes:
 
 
 def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
-    """
-    Pull the equipment's display name and reference code for use in the
-    output filename. Matches the `equipment` table schema: `name` is the
-    human-readable label, `reference_code` is the unique per-company
-    identifier -- both go in the filename so two units with the same
-    name (different reference_code) don't produce identical filenames.
-    Respects the soft-delete pattern (deleted_at IS NULL) used elsewhere
-    in the equipment import system.
-    """
+    """Equipment name + reference_code for the filename (soft-delete aware)."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -1341,28 +1765,16 @@ def fetch_equipment_info(equipment_id: str, company_id: str) -> dict:
     if not row:
         log.warning(f"[company={company_id}] No equipment record found for {equipment_id}, falling back to equipment_id in filename")
         return {"name": "", "reference_code": ""}
-
     return {"name": row.get("name") or "", "reference_code": row.get("reference_code") or ""}
 
 
 def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
-    """
-    Build a human-readable filename like:
-      PM_Strategy_P185WJD_Compressor_1_A102_2026-07-26.xlsx
-    (name + reference_code). Falls back to the equipment_id if no
-    record is found, so the file is still uniquely identifiable rather
-    than failing.
-    """
     from datetime import date
 
     label = " ".join(part for part in [equipment_info.get("name"), equipment_info.get("reference_code")] if part).strip()
     if not label:
         label = equipment_id
-
-    # slugify: keep letters/numbers, collapse everything else to a single underscore
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
-    slug = slug[:80]  # keep filenames reasonable on Windows/shared drives
-
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")[:80]
     return f"PM_Strategy_{slug}_{date.today().isoformat()}.xlsx"
 
 
@@ -1370,32 +1782,18 @@ def build_output_filename(equipment_id: str, equipment_info: dict) -> str:
 
 async def generate(equipment_id: str, company_id: str) -> bytes:
     """
-    Full pipeline called from the FastAPI endpoint.
-    1. Fail fast if this equipment has no ingested manual at all
-    2. Run ten parallel Claude calls (Working Principle + nine PM types),
-       each retrieving its own most-relevant manual chunks (see
-       fetch_relevant_manual_chunks) and resolving its own stock
-       component images inline. Concurrency to Bedrock is capped at
-       BEDROCK_CALL_CONCURRENCY (see that constant's comment for what
-       this does and does not solve).
-    3. Build and return the Excel file as bytes
-       -- always returns a valid file even if all PM types are empty;
-       any category that errored (as opposed to legitimately empty) is
-       flagged visibly in the file rather than looking identical to an
-       empty one -- see build_excel.
+    Full pipeline (return type unchanged: bytes).
 
-    Return type is unchanged (bytes only) so nothing already calling
-    generate() directly breaks. For a real filename bundled with the
-    bytes instead of a generic "download.xlsx", call
-    generate_with_filename() instead -- see that function below.
+    Phase 1  setpoints pass + schedule anchor retrieval (concurrent)
+    Phase 2  WP + PM1-PM9 extraction and the parts-list pass (concurrent,
+             all sharing one per-invocation semaphore), bounded by
+             deadline - FINAL_PHASE_RESERVE_SECONDS
+    Post     cross-category dedupe, critical spares, coverage check
+    Phase 3  recommended-tasks pass + review-notes pass (concurrent),
+             bounded by the full deadline
+    Build    Excel: "PM Strategy" (import format) + extra sheets
 
-    Example endpoint usage (preferred -- real filename included):
-        excel_bytes, filename = await generate_with_filename(equipment_id, company_id)
-        return Response(
-            content=excel_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
+    Every stage degrades independently; a real file is always returned.
     """
     if not _has_any_manual_chunks(equipment_id, company_id):
         raise ValueError(
@@ -1403,75 +1801,121 @@ async def generate(equipment_id: str, company_id: str) -> bytes:
             "Please upload and ingest a document for this node first."
         )
 
-    # Fetched once, up front -- this equipment's own manual images are
-    # matched in-memory against every step's component keyword, rather
-    # than one DB round-trip per keyword. No network client needed for
-    # image lookup anymore: it's a local list match + local S3 presign.
-    #
-    # Skipped entirely while IMAGE_MATCHING_ENABLED is False: ingest no
-    # longer writes to equipment_manual_images, so this table is always
-    # empty right now and querying it would just be wasted latency. The
-    # downstream matching code already handles an empty list correctly
-    # (every step's image_url comes back ""), so this is the only line
-    # that needs to change to turn image matching off end-to-end.
     manual_images = fetch_manual_images_for_equipment(equipment_id, company_id) if IMAGE_MATCHING_ENABLED else []
 
-    # Shared across every category's retry loop -- see GENERATION_DEADLINE_SECONDS
-    # and call_claude_for_pm_type's docstring for why this needs to be one
-    # deadline all 10 tasks check against, not 10 independent budgets.
-    deadline = time.monotonic() + GENERATION_DEADLINE_SECONDS
+    start = time.monotonic()
+    deadline = start + GENERATION_DEADLINE_SECONDS
+    final_phase_on = RECOMMENDED_TASKS_ENABLED or REVIEW_NOTES_ENABLED
+    main_deadline = deadline - (FINAL_PHASE_RESERVE_SECONDS if final_phase_on else 0)
 
-    # Created fresh on every call to generate(), inside whatever event
-    # loop is actually running THIS invocation -- deliberately NOT a
-    # module-level global. See the CHANGE LOG note above
-    # BEDROCK_CALL_CONCURRENCY: a semaphore created once at import time
-    # stays bound to the first event loop that used it, but this module
-    # stays imported across warm Lambda invocations that can each get
-    # their own fresh loop, which produced "bound to a different event
-    # loop" RuntimeErrors on every category call once a warm container
-    # reused a stale semaphore against a new loop.
+    # Per-invocation semaphore -- never module-level (warm-container event-loop bug).
     bedrock_semaphore = asyncio.Semaphore(BEDROCK_CALL_CONCURRENCY)
+    loop = asyncio.get_running_loop()
+    stage_status = {}
 
-    tasks = [
-        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, deadline, bedrock_semaphore)
+    # ── Phase 1 ──
+    async def _anchor():
+        try:
+            return await loop.run_in_executor(
+                None, fetch_relevant_chunk_list, equipment_id, company_id, SCHEDULE_QUERY_TEXT, SCHEDULE_ANCHOR_TOP_K
+            )
+        except Exception as e:
+            log.error(f"[company={company_id}] SCHEDULE ANCHOR RETRIEVAL FAILED: {type(e).__name__}: {e}")
+            return []
+
+    async def _setpoints():
+        if not SETPOINTS_ENABLED:
+            return [], "disabled"
+        return await extract_setpoints(equipment_id, company_id, main_deadline, bedrock_semaphore)
+
+    anchor_chunks, (setpoints, sp_status) = await asyncio.gather(_anchor(), _setpoints())
+    stage_status["Setpoints"] = sp_status
+    setpoints_text = format_setpoints_text(setpoints)
+
+    # ── Phase 2 ── PM categories and parts batches share one semaphore, so
+    # total concurrent Bedrock calls for this job stay at BEDROCK_CALL_CONCURRENCY.
+    pm_coros = [
+        call_claude_for_pm_type(pm_code, pm_name, equipment_id, company_id, manual_images, main_deadline,
+                                bedrock_semaphore, setpoints_text=setpoints_text, anchor_chunks=anchor_chunks)
         for pm_code, pm_name in PM_TYPES
     ]
-    results = await asyncio.gather(*tasks)
 
-    pm_results = list(results)
+    async def _parts():
+        if not PARTS_EXTRACTION_ENABLED:
+            return [], "disabled", []
+        return await extract_parts_list(equipment_id, company_id, main_deadline, bedrock_semaphore)
 
-    ok_count    = sum(1 for _, _, _, status in pm_results if status == "ok")
-    empty_count = sum(1 for _, _, _, status in pm_results if status == "empty")
-    error_count = sum(1 for _, _, _, status in pm_results if status == "error")
-    log.info(
-        f"[company={company_id}] Generation complete for equipment {equipment_id}. "
-        f"{ok_count} ok / {empty_count} legitimately empty / {error_count} errored "
-        f"(of {len(PM_TYPES)} PM types)."
+    *pm_results, (parts, parts_status, parts_notes) = await asyncio.gather(*pm_coros, _parts())
+    pm_results = list(pm_results)
+    stage_status["Parts List"] = parts_status
+
+    # ── Post-processing ──
+    pm_results, duplicates_removed = dedupe_across_categories(pm_results)
+    spares = build_critical_spares(parts)
+    uncovered = find_uncovered_spares(pm_results, spares)
+    log.info(f"[company={company_id}] {len(spares)} spares ({sum(1 for s in spares if s['tier'] == 'A')} Tier A), "
+             f"{len(uncovered)} Tier A/B without a covering task, {duplicates_removed} duplicate tasks removed")
+
+    # ── Phase 3 ──
+    async def _recommended():
+        if not RECOMMENDED_TASKS_ENABLED:
+            return [], "disabled"
+        return await generate_recommended_tasks(pm_results, uncovered, setpoints_text, equipment_id, company_id,
+                                                deadline, bedrock_semaphore)
+
+    async def _review():
+        if not REVIEW_NOTES_ENABLED:
+            return [], "disabled"
+        return await generate_review_notes(pm_results, setpoints_text, equipment_id, company_id, deadline, bedrock_semaphore)
+
+    (recommended, rec_status), (llm_notes, review_status) = await asyncio.gather(_recommended(), _review())
+    stage_status["Recommended tasks"] = rec_status
+    stage_status["Review notes"] = review_status
+
+    by_code = defaultdict(list)
+    for t in recommended:
+        by_code[t.pop("pm_code")].append(t)
+    merged = []
+    for code, name, steps, status in pm_results:
+        steps = steps + by_code.get(code, [])
+        if code != "WP":
+            renumber_operations(steps)
+        if by_code.get(code):
+            attach_images_to_steps(by_code[code], manual_images)
+        merged.append((code, name, steps, status))
+    pm_results = merged
+
+    review_notes = list(parts_notes) + list(llm_notes) + deterministic_review_notes(
+        pm_results, setpoints, parts, duplicates_removed, stage_status
     )
-    if error_count:
-        log.warning(
-            f"[company={company_id}] {error_count} PM type(s) errored during generation for "
-            f"equipment {equipment_id} -- these are flagged in the output Excel, but this job "
-            f"should probably be retried or surfaced to the caller rather than treated as fully "
-            f"successful just because a file was produced."
-        )
+    if recommended:
+        review_notes.append({
+            "note_type": "clarification",
+            "detail": f"{len(recommended)} Recommended task(s) were added to close gaps the OEM manual leaves open. "
+                      "They are marked 'Source: Recommended' in the instruction text -- review and approve each before use.",
+            "affected": "PM Strategy", "source_ref": "system",
+        })
 
-    return build_excel(equipment_id, pm_results)
+    ok_count = sum(1 for _, _, _, st in pm_results if st == "ok")
+    empty_count = sum(1 for _, _, _, st in pm_results if st == "empty")
+    error_count = sum(1 for _, _, _, st in pm_results if st == "error")
+    log.info(
+        f"[company={company_id}] Generation complete for equipment {equipment_id} in {time.monotonic() - start:.0f}s. "
+        f"{ok_count} ok / {empty_count} empty / {error_count} errored (of {len(PM_TYPES)} PM types); "
+        f"stages: {stage_status}; {len(parts)} parts, {len(spares)} spares, {len(setpoints)} setpoints, "
+        f"{len(recommended)} recommended tasks, {len(review_notes)} review notes."
+    )
+    if error_count or any(v == "error" for v in stage_status.values()):
+        log.warning(f"[company={company_id}] Partial generation for equipment {equipment_id}; flagged in the output file.")
+
+    extras = {"setpoints": setpoints, "parts": parts, "spares": spares, "review_notes": review_notes}
+    return build_excel(equipment_id, pm_results, extras)
 
 
 async def generate_with_filename(equipment_id: str, company_id: str) -> tuple:
     """
-    Preferred entry point for API endpoints: does everything generate()
-    does, and also returns a real, human-readable filename alongside the
-    bytes -- e.g. "PM_Strategy_P185WJD_Compressor_1_A102_2026-08-05.xlsx"
-    instead of whatever generic name a browser falls back to when a
-    Content-Disposition header isn't set.
-
-    This exists so the filename can't be forgotten as a separate step --
-    generate() itself still returns bytes only and is unchanged, for
-    anything already calling it directly.
-
-    Returns: (excel_bytes: bytes, filename: str)
+    Preferred entry point for API endpoints: (excel_bytes, filename), e.g.
+    "PM_Strategy_P185WJD_Compressor_1_A102_2026-08-05.xlsx".
     """
     excel_bytes = await generate(equipment_id, company_id)
     equipment_info = fetch_equipment_info(equipment_id, company_id)
