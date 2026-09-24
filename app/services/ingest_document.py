@@ -8,6 +8,52 @@ equipment_manual_images, so PM strategy generation can reference the
 manual's OWN component images instead of a generic stock photo pulled
 from the open web.
 
+CHANGE LOG (2026-09-22 -- tables survive ingestion)
+---------------------------------------------------
+Found by reviewing a generated PM strategy (Next Gen 500E, job mlf001):
+21 of 38 lines of the OEM maintenance schedule came out with a wrong or
+missing frequency. That table marks frequency with an asterisk under a
+Daily / Weekly / Bi-Weekly / Monthly column. Two things in this file
+destroyed the column information before any model saw it:
+
+  1. _blocks_to_markdown() emitted LAYOUT_TABLE as plain paragraph text
+     (its LINE children joined), so "Check chain tension *" no longer said
+     which column the "*" sat under.
+  2. chunk_markdown() windowed each section with " ".join(words), which
+     flattened EVERY newline in every chunk -- tables, lists, parts-list
+     rows and all.
+
+Fixes:
+  - _textract_analyze_layout() now requests FeatureTypes=["LAYOUT",
+    "TABLES"] (TEXTRACT_FEATURE_TYPES). Same IAM actions as before
+    (StartDocumentAnalysis / GetDocumentAnalysis); TABLES is billed as an
+    additional feature per page, so check current Textract pricing.
+  - _blocks_to_markdown() renders every Textract TABLE as a real Markdown
+    table (header row + one row per table row, cells in their true
+    columns, selected checkboxes as "X"), placed where the table sits on
+    the page. Any LAYOUT block that lies inside a table's bounding box is
+    replaced by that table (Textract's layout pass sometimes splits a
+    table into several LAYOUT_TEXT blocks). No matching TABLE -> old
+    plain-text behavior, so nothing gets worse.
+  - chunk_markdown() now windows by LINES, not words: line breaks are
+    kept, windows never cut a table row, and a window that starts in the
+    middle of a table repeats that table's header row, so every chunk of
+    a long parts list or schedule still says what each column means.
+    Lines longer than CHUNK_SIZE words are still split by words.
+
+Only documents ingested (or re-ingested) after this ships benefit.
+Re-ingest manuals whose PM strategy shows the "schedule table lost its
+column layout" review note (generate_pm_strategy.flat_schedule_warning()).
+
+*** UNVERIFIED AGAINST A LIVE CALL *** -- the TABLE/CELL block handling
+follows Textract's documented response shape (TABLE -> CHILD -> CELL with
+RowIndex/ColumnIndex/RowSpan/ColumnSpan/EntityTypes; CELL -> CHILD ->
+WORD / SELECTION_ELEMENT) and was tested against synthetic blocks only.
+Smoke-test on the Next Gen 500E manual first and check that the Section 7
+schedule chunk shows its asterisks in the right columns. Textract may not
+detect a small "*" as a WORD on some scans; if cells come back empty, that
+is the thing to look at.
+
 *** IMAGE EXTRACTION IS CURRENTLY DISABLED (IMAGE_EXTRACTION_ENABLED = False) ***
 Per-image S3 uploads were adding meaningful latency to ingestion,
 especially on manuals with many embedded drawings. Turned off for now so
@@ -128,10 +174,10 @@ Key design decisions:
     docstring for the matching caveat. Note this regex is matched
     against extracted text, so on Textract'd pages its hit rate depends
     on Textract's read quality on that particular scan -- a bad match
-    is a safe no-op, not an error. (Textract also has a native table-
-    extraction mode that would read these rows as structured cells
-    instead of guessing at row shapes with a regex -- worth considering
-    for a future pass, not part of this change.)
+    is a safe no-op, not an error. (With the 2026-09-22 table change,
+    Textract-detected tables arrive as Markdown "| ... |" rows, which
+    this line-anchored regex does not match; that is a no-op, not an
+    error, and nothing consumes bom_items yet.)
 
 REQUIRES A DB MIGRATION before this will work -- see the
 equipment_manual_images table DDL in the module docstring below the
@@ -231,6 +277,11 @@ def url_to_uuid(file_url: str) -> str:
 TEXTRACT_ENABLED               = True   # requires the IAM permissions in the module docstring
 TEXTRACT_POLL_INTERVAL_SECONDS = 3      # how often to check job status while waiting
 TEXTRACT_MAX_WAIT_SECONDS      = 300    # give up waiting after this long (leaves headroom under the Lambda timeout for download/chunk/embed)
+
+# 2026-09-22: TABLES added so schedule tables and parts lists keep their
+# columns (see module changelog). Remove "TABLES" to fall back to the old
+# layout-only behavior; _blocks_to_markdown() handles both.
+TEXTRACT_FEATURE_TYPES = ["LAYOUT", "TABLES"]
 
 _S3_VIRTUAL_HOSTED_RE = re.compile(r"^(?P<bucket>[^.]+)\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
 _S3_PATH_STYLE_RE     = re.compile(r"^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$")
@@ -404,11 +455,12 @@ def _textract_analyze_layout(file_bytes: bytes, file_url: str) -> list:
     """
     Same async-job/S3-input/polling/pagination pattern as
     _textract_extract_document() above, but calls StartDocumentAnalysis
-    with FeatureTypes=["LAYOUT"] instead of StartDocumentTextDetection,
-    and returns the FULL raw Blocks list (LAYOUT_* blocks AND the
-    underlying LINE/WORD blocks they reference via CHILD relationships)
-    rather than a pre-reduced page->text dict, since _blocks_to_markdown()
-    below needs to resolve each LAYOUT block's children itself.
+    with FeatureTypes=TEXTRACT_FEATURE_TYPES (LAYOUT + TABLES) instead of
+    StartDocumentTextDetection, and returns the FULL raw Blocks list
+    (LAYOUT_*, TABLE/CELL, and the underlying LINE/WORD/SELECTION_ELEMENT
+    blocks they reference via CHILD relationships) rather than a
+    pre-reduced page->text dict, since _blocks_to_markdown() below needs
+    to resolve each block's children itself.
     """
     textract = _textract_client()
 
@@ -428,7 +480,7 @@ def _textract_analyze_layout(file_bytes: bytes, file_url: str) -> list:
     try:
         start_response = textract.start_document_analysis(
             DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
-            FeatureTypes=["LAYOUT"],
+            FeatureTypes=TEXTRACT_FEATURE_TYPES,
         )
         job_id = start_response["JobId"]
 
@@ -461,6 +513,8 @@ def _textract_analyze_layout(file_bytes: bytes, file_url: str) -> list:
             if not next_token:
                 break
 
+        n_tables = sum(1 for b in blocks if b.get("BlockType") == "TABLE")
+        log.info(f"Textract analysis returned {len(blocks)} blocks, {n_tables} table(s).")
         return blocks
     finally:
         if scratch_key:
@@ -491,6 +545,88 @@ def _resolve_block_text(block: dict, blocks_by_id: dict, join: str = " ") -> str
     return join.join(pieces).strip()
 
 
+# ── Tables (2026-09-22) ───────────────────────────────────────────────────────
+
+# A LAYOUT block counts as "inside" a table when at least this fraction of
+# its own area lies within the table's bounding box.
+TABLE_CONTAINMENT_THRESHOLD = 0.6
+
+
+def _bbox(block: dict) -> tuple:
+    g = (block.get("Geometry") or {}).get("BoundingBox") or {}
+    left, top = g.get("Left", 0.0), g.get("Top", 0.0)
+    return (left, top, left + g.get("Width", 0.0), top + g.get("Height", 0.0))
+
+
+def _fraction_inside(inner: tuple, outer: tuple) -> float:
+    """Fraction of `inner`'s area that lies inside `outer`."""
+    ix = max(0.0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+    iy = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+    area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return (ix * iy) / area if area > 0 else 0.0
+
+
+def _cell_text(cell: dict, blocks_by_id: dict) -> str:
+    """WORD children joined; a SELECTED checkbox renders as "X". Pipes escaped."""
+    parts = []
+    for rel in cell.get("Relationships", []) or []:
+        if rel.get("Type") != "CHILD":
+            continue
+        for child_id in rel.get("Ids", []):
+            child = blocks_by_id.get(child_id)
+            if not child:
+                continue
+            if child.get("BlockType") == "WORD" and child.get("Text"):
+                parts.append(child["Text"])
+            elif child.get("BlockType") == "SELECTION_ELEMENT" and child.get("SelectionStatus") == "SELECTED":
+                parts.append("X")
+    return " ".join(parts).replace("|", "/").strip()
+
+
+def _table_to_markdown(table: dict, blocks_by_id: dict) -> str:
+    """
+    Render one Textract TABLE block as a Markdown table. Cells are placed by
+    RowIndex/ColumnIndex, so a mark under the "Weekly" column stays under
+    "Weekly". A spanning cell's text goes in its top-left position only
+    (column positions of every other cell stay intact). Leading rows whose
+    cells carry EntityTypes COLUMN_HEADER are merged into one header line;
+    if none are flagged, row 1 is the header.
+    """
+    cells = []
+    for rel in table.get("Relationships", []) or []:
+        if rel.get("Type") != "CHILD":
+            continue
+        for child_id in rel.get("Ids", []):
+            child = blocks_by_id.get(child_id)
+            if child and child.get("BlockType") == "CELL":
+                cells.append(child)
+    if not cells:
+        return ""
+
+    n_rows = max(c.get("RowIndex", 1) + c.get("RowSpan", 1) - 1 for c in cells)
+    n_cols = max(c.get("ColumnIndex", 1) + c.get("ColumnSpan", 1) - 1 for c in cells)
+    grid = [[""] * n_cols for _ in range(n_rows)]
+    header_rows = set()
+    for c in cells:
+        r, col = c.get("RowIndex", 1) - 1, c.get("ColumnIndex", 1) - 1
+        if 0 <= r < n_rows and 0 <= col < n_cols:
+            grid[r][col] = _cell_text(c, blocks_by_id)
+        if "COLUMN_HEADER" in (c.get("EntityTypes") or []):
+            header_rows.add(r)
+
+    n_header = 0
+    while n_header in header_rows:
+        n_header += 1
+    n_header = max(n_header, 1)
+
+    header = [" ".join(grid[r][k] for r in range(n_header) if grid[r][k]).strip() for k in range(n_cols)]
+    lines = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * n_cols) + "|"]
+    for r in range(n_header, n_rows):
+        if any(grid[r]):
+            lines.append("| " + " | ".join(grid[r]) + " |")
+    return "\n".join(lines)
+
+
 def _blocks_to_markdown(blocks: list) -> str:
     """
     Walks Textract's LAYOUT blocks (see _textract_analyze_layout()) in
@@ -507,12 +643,16 @@ def _blocks_to_markdown(blocks: list) -> str:
     LAYOUT_HEADER/LAYOUT_FOOTER/LAYOUT_FIGURE are skipped from chunk
     CONTENT -- running page headers/footers aren't useful body text, and
     figures are handled by the separate (currently disabled) image-
-    extraction path, not text content. LAYOUT_TABLE is emitted as plain
-    paragraph text rather than a real Markdown table for now -- table
-    cell geometry parsing is a real gap, flagged rather than silently
-    done wrong; a garbled-but-present table beats a missing one, but
-    revisit if a manual with data-critical tables (specs, tolerances)
-    shows extraction quality problems here.
+    extraction path, not text content.
+
+    TABLES (2026-09-22): every Textract TABLE block is rendered as a real
+    Markdown table (_table_to_markdown) at the position of the first LAYOUT
+    block that lies inside it; every other LAYOUT block inside the same
+    table is skipped, so the table's text appears once, with its columns.
+    This covers both a clean LAYOUT_TABLE and a table the layout pass split
+    into several LAYOUT_TEXT pieces. A LAYOUT_TABLE with no matching TABLE
+    block (e.g. TABLES not requested) falls back to the old plain-text
+    rendering. Section headers are never swallowed by a table.
 
     LAYOUT_PAGE_NUMBER blocks are excluded from content the same way, but
     NOT thrown away -- their text is the manual's own PRINTED page label,
@@ -545,6 +685,21 @@ def _blocks_to_markdown(blocks: list) -> str:
 
     def _cited_page(raw_page):
         return printed_page_labels.get(raw_page, raw_page)
+
+    tables_by_page = {}
+    for b in blocks:
+        if b.get("BlockType") == "TABLE":
+            tables_by_page.setdefault(b.get("Page", 1), []).append(b)
+    emitted_tables = set()
+
+    def _containing_table(block):
+        box = _bbox(block)
+        best, best_frac = None, 0.0
+        for t in tables_by_page.get(block.get("Page", 1), []):
+            frac = _fraction_inside(box, _bbox(t))
+            if frac > best_frac:
+                best, best_frac = t, frac
+        return best if best_frac >= TABLE_CONTAINMENT_THRESHOLD else None
 
     layout_blocks = [b for b in blocks if str(b.get("BlockType", "")).startswith("LAYOUT_")]
     layout_blocks = [b for b in layout_blocks if b.get("BlockType") not in _LAYOUT_SKIP_TYPES]
@@ -585,6 +740,21 @@ def _blocks_to_markdown(blocks: list) -> str:
             lines.append("")
             continue
 
+        table = _containing_table(block)
+        if table is not None:
+            if table["Id"] in emitted_tables:
+                continue  # this table was already emitted at an earlier block's position
+            table_md = _table_to_markdown(table, blocks_by_id)
+            if table_md:
+                emitted_tables.add(table["Id"])
+                if page != last_marked_page:
+                    lines.append(f"<!-- page:{_cited_page(page)} -->")
+                    last_marked_page = page
+                lines.append(table_md)
+                lines.append("")
+                continue
+            # empty table render -> fall through to plain text for this block
+
         if page != last_marked_page:
             lines.append(f"<!-- page:{_cited_page(page)} -->")
             last_marked_page = page
@@ -602,14 +772,17 @@ def _blocks_to_markdown(blocks: list) -> str:
                         lines.append(f"- {child['Text']}")
 
         else:
-            # LAYOUT_TEXT, LAYOUT_TABLE, LAYOUT_KEY_VALUE, and anything
-            # else not explicitly handled above -- plain paragraph text.
+            # LAYOUT_TEXT, LAYOUT_TABLE without a TABLE block, LAYOUT_KEY_VALUE,
+            # and anything else not explicitly handled above -- plain text.
             text = _resolve_block_text(block, blocks_by_id, join="\n")
             if text:
                 lines.append(text)
 
         lines.append("")  # blank line between blocks -- standard Markdown paragraph separation
 
+    total_tables = sum(len(v) for v in tables_by_page.values())
+    if total_tables:
+        log.info(f"Rendered {len(emitted_tables)}/{total_tables} Textract table(s) as Markdown tables.")
     return "\n".join(lines)
 
 
@@ -729,6 +902,10 @@ def extract_markdown_from_docx(file_bytes: bytes) -> str:
     so no `<!-- page:N -->` markers are emitted here -- DOCX-sourced
     chunks legitimately have page_start/page_end = NULL, same as the
     migration comment documents.
+
+    NOTE (2026-09-22): Word tables (doc.tables) are still not extracted
+    here -- only paragraphs. A DOCX manual whose schedule or parts list is
+    a Word table loses it entirely. Not changed in this pass.
     """
     try:
         import docx
@@ -926,7 +1103,7 @@ def _encode_bom_items(bom_items: list) -> str:
 
 # ── Chunking: Markdown structural + page-range tagging ────────────────────────
 #
-# SUPERSEDES two prior versions of this section, in order:
+# SUPERSEDES three prior versions of this section, in order:
 #   1. Pure CHUNK_SIZE-word sliding-window chunking over the entire
 #      document as one flattened string -- no awareness of page breaks or
 #      section structure at all. Confirmed-in-production bug: a
@@ -942,35 +1119,31 @@ def _encode_bom_items(bom_items: list) -> str:
 #      (correctly) as not generalizing to a different manufacturer's
 #      Title Case or numbered headers, since it was never verified
 #      against more than one document.
+#   3. Markdown-header structural split (MarkdownHeaderTextSplitter) with
+#      CHUNK_SIZE-word windows inside each section. Fixed (2), but the
+#      windows were rebuilt with " ".join(words), which flattened every
+#      newline -- tables, lists and parts-list rows lost all structure.
 #
-# This version fixes the generalization problem: it splits on REAL
-# document structure (Markdown headings that extract_markdown_from_pdf()/
-# extract_markdown_from_docx() produce from Textract's LAYOUT-classified
-# blocks or Word's own heading styles -- see those functions) via
-# langchain_text_splitters.MarkdownHeaderTextSplitter, instead of guessing
-# at any one manual's formatting convention. A section this splitter
-# produces can still be long (e.g. a full "TROUBLE SHOOTING TIPS"
-# chapter), so the same CHUNK_SIZE/CHUNK_OVERLAP word-windowing as before
-# still runs WITHIN each header-bounded section -- it just never crosses a
-# section boundary anymore, and every resulting chunk is prefixed with its
-# full heading path (e.g. "TITLE > SEQUENCE OF OPERATION"), not just the
-# immediate header, reconstructed from the splitter's own metadata rather
-# than re-guessed.
+# This version (2026-09-22) keeps (3)'s structural split and heading-path
+# prefix, but windows each section by LINES (_window_section_lines):
+# newlines survive, a window never cuts a table row in half, and a window
+# that begins mid-table repeats that table's header row so the columns stay
+# meaningful in every chunk. Window size and overlap are still measured in
+# words (CHUNK_SIZE / CHUNK_OVERLAP), so chunk sizes stay comparable.
 #
-# ALSO NEW: extracts each chunk's page_start/page_end from the
+# Page ranges: each chunk's page_start/page_end come from the
 # `<!-- page:N -->` markers embedded in the Markdown (see
-# _blocks_to_markdown()), then strips them from the text before it's
-# embedded or shown to anyone -- bookkeeping, like the equipment_id/doc_id
-# content prefix, not content. save_chunks() persists these as real
+# _blocks_to_markdown()), which are stripped from the text before it's
+# embedded or shown to anyone. save_chunks() persists these as real
 # columns (migration_003_knowledge_embeddings_page_range.sql) so
 # retrieval.py can surface a real "Found on Page 243" citation.
 #
 # NOTE: this only changes chunking for documents ingested (or
 # re-ingested) AFTER this ships -- it does nothing for chunks already
-# sitting in knowledge_embeddings from a prior ingestion. Those keep
-# whatever the chunker in place at ingest time produced (flat-window text,
-# no page range) until that document is explicitly re-ingested.
+# sitting in knowledge_embeddings from a prior ingestion.
 _MARKDOWN_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")]
+_TABLE_ROW_RE = re.compile(r"^\s*\|")
+_TABLE_SEP_RE = re.compile(r"^\s*\|(\s*:?-{3,}:?\s*\|)+\s*$")
 
 
 def _extract_and_strip_page_range(text: str):
@@ -982,19 +1155,84 @@ def _extract_and_strip_page_range(text: str):
     """
     pages = [int(m) for m in _PAGE_MARKER_RE.findall(text)]
     clean = _PAGE_MARKER_RE.sub("", text)
+    clean = re.sub(r"[ \t]+\n", "\n", clean)   # MarkdownHeaderTextSplitter appends "  " to some lines
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
     if not pages:
         return clean, None, None
     return clean, min(pages), max(pages)
 
 
+def _section_units(text: str) -> list:
+    """
+    Split a section into windowing units: (line, table_header_lines_or_None).
+    Table rows remember their table's header (first row + separator) so a
+    window starting mid-table can repeat it. Non-table lines longer than
+    CHUNK_SIZE words are split into word pieces so no unit exceeds a window.
+    """
+    lines = text.split("\n")
+    units = []
+    header = None
+    for idx, line in enumerate(lines):
+        if _TABLE_ROW_RE.match(line):
+            if idx == 0 or not _TABLE_ROW_RE.match(lines[idx - 1]):
+                header = [line]
+                if idx + 1 < len(lines) and _TABLE_SEP_RE.match(lines[idx + 1]):
+                    header.append(lines[idx + 1])
+            units.append((line, header))
+            continue
+        header = None
+        words = line.split()
+        if len(words) > CHUNK_SIZE:
+            step = CHUNK_SIZE - CHUNK_OVERLAP
+            for k in range(0, len(words), step):
+                units.append((" ".join(words[k:k + CHUNK_SIZE]), None))
+                if k + CHUNK_SIZE >= len(words):
+                    break
+        else:
+            units.append((line, None))
+    return units
+
+
+def _window_section_lines(text: str) -> list:
+    """
+    Line-preserving windows of about CHUNK_SIZE words with about
+    CHUNK_OVERLAP words of trailing-line overlap. Always makes progress
+    (every window holds at least one unit; the next window starts strictly
+    after the previous window's start).
+    """
+    units = _section_units(text)
+    sizes = [len(u[0].split()) for u in units]
+    windows = []
+    start, n = 0, len(units)
+    while start < n:
+        end, count = start, 0
+        # count < CHUNK_OVERLAP: never close a window holding only a heading
+        # or page marker -- pull in the next unit even if it overshoots.
+        while end < n and (end == start or count < CHUNK_OVERLAP or count + sizes[end] <= CHUNK_SIZE):
+            count += sizes[end]
+            end += 1
+        body = [u[0] for u in units[start:end]]
+        hdr = units[start][1]
+        if hdr and units[start][0] not in hdr:
+            body = hdr + body  # repeat the table header for a window that starts mid-table
+        windows.append("\n".join(body))
+        if end >= n:
+            break
+        back, overlap = end, 0
+        while back - 1 > start and overlap + sizes[back - 1] <= CHUNK_OVERLAP:
+            back -= 1
+            overlap += sizes[back]
+        start = back
+    return windows
+
+
 def chunk_markdown(markdown_text: str) -> list:
     """
     Returns a list of {"text": str, "page_start": int|None, "page_end": int|None}
     dicts, ready for save_chunks() -- this is what _run_ingest() calls
-    now instead of chunk_text(). See the module comment above for the
-    two-pass design: structural split first (MarkdownHeaderTextSplitter),
-    then a size-bounded sub-split within each resulting section.
+    now instead of chunk_text(). Two-pass design: structural split first
+    (MarkdownHeaderTextSplitter), then line-preserving, size-bounded
+    windows within each resulting section (_window_section_lines).
     """
     from langchain_text_splitters import MarkdownHeaderTextSplitter
 
@@ -1010,16 +1248,11 @@ def chunk_markdown(markdown_text: str) -> list:
             if k in section.metadata
         )
 
-        words = section.page_content.split()
-        if not words:
+        if not section.page_content.strip():
             continue
 
-        start = 0
-        while start < len(words):
-            end         = min(start + CHUNK_SIZE, len(words))
-            window_text = " ".join(words[start:end])
+        for window_text in _window_section_lines(section.page_content):
             clean_text, page_start, page_end = _extract_and_strip_page_range(window_text)
-
             if clean_text:
                 full_text = f"{heading_path}\n{clean_text}" if heading_path else clean_text
                 results.append({
@@ -1027,10 +1260,6 @@ def chunk_markdown(markdown_text: str) -> list:
                     "page_start": page_start,
                     "page_end": page_end,
                 })
-
-            if end == len(words):
-                break
-            start = end - CHUNK_OVERLAP
 
     return results
 
@@ -1415,6 +1644,8 @@ def _run_ingest(file_url: str, equipment_id: str, company_id: str) -> dict:
     log.info(f"Created {len(chunks)} chunks.")
     with_pages = sum(1 for c in chunks if c.get("page_start") is not None)
     log.info(f"{with_pages}/{len(chunks)} chunks have a page range attached.")
+    with_tables = sum(1 for c in chunks if "\n|" in c["text"] or c["text"].startswith("|"))
+    log.info(f"{with_tables}/{len(chunks)} chunks contain a Markdown table.")
 
     # Image extraction is PDF-only, and gated behind IMAGE_EXTRACTION_ENABLED
     # (currently False -- see module docstring). Skipping this entirely
